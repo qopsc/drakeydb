@@ -1719,6 +1719,101 @@ TEST_F(MvccStoreTest, RenameOntoAnExistingDestSelfCorrectsToALiveStamp) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- EnsureMvcc (db_slice.cc) did not clear a
+// slot's tombstone flag when a deleted key was re-created: PostUpdate calls EnsureMvcc
+// synchronously, before Arm(), at the exact moment prime.size() grows back for the new value, but
+// (before this fix) the stale kTombstoneBit stayed set and mvcc_tombstones was not decremented
+// until the new write's own (possibly deferred) journal commit -- a window
+// OnCbFinishBlocking's O(1) DCHECK can observe for any auto-journaled command. Three
+// reproductions, matching the controller-supplied recipes exactly.
+//
+// Falsifying: reverting EnsureMvcc's tombstone-clearing branch (db_slice.cc) reproduces
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (0 vs. 1)`
+// on this test; see the report's fix-report addendum for the verbatim abort.
+TEST_F(MvccStoreTest, RecreateAfterExplicitDeleteClearsTheTombstone) {
+  Run({"set", "k", "v"});
+  Run({"del", "k"});
+  ASSERT_TRUE(StampOf("k")->IsTombstone());
+
+  Run({"lpush", "k", "a"});
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone()) << "a live re-create must clear the tombstone flag";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- same bug, via a container command emptying
+// (and so kExplicit-deleting, DeleteHw-style) and then immediately re-creating the SAME key,
+// rather than a standalone DEL.
+TEST_F(MvccStoreTest, RecreateAfterContainerEmptiedByCommandClearsTheTombstone) {
+  Run({"lpush", "q", "a"});
+  Run({"lpop", "q"});
+  ASSERT_TRUE(StampOf("q")->IsTombstone());
+
+  Run({"lpush", "q", "b"});
+
+  auto st = StampOf("q");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C1, Critical) -- the single-command variant: OpRestore
+// (generic_family.cc) deletes an existing key itself (DelMutable, default reason kExplicit, so it
+// tombstones) then re-adds the restored value, all inside ONE auto-journaled RESTORE command
+// (CO::JOURNALED, not NO_AUTOJOURNAL) -- so the eventual commit is deferred past
+// OnCbFinishBlocking's check exactly like a deferred/auto-journaled write, unlike DEL's own
+// explicit, synchronous RecordJournal.
+TEST_F(MvccStoreTest, RestoreReplaceRecreatesClearingTheTombstone) {
+  Run({"set", "k", "v1"});
+  std::string dump = Run({"dump", "k"}).GetString();
+  Run({"set", "k", "v2"});  // still live with a different value, so RESTORE below truly replaces
+
+  Run({"restore", "k", "0", dump, "REPLACE"});
+
+  auto st = StampOf("k");
+  ASSERT_TRUE(st.has_value());
+  EXPECT_FALSE(st->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-3 Task 2 review fix (C2, Critical) -- PerformDeletionAtomic's mvcc branch was not
+// namespace-gated, unlike PostUpdate's own F1 gate and the DCHECK it exists to keep true: a
+// non-default-namespace kExplicit DEL still tombstoned, and unlike Disarm/EraseMvcc (a harmless,
+// guaranteed no-op miss there, since nothing in that namespace is ever armed or EnsureMvcc'd),
+// SetTombstone's insert-tolerant Insert() call actually created a permanent, orphaned slot no
+// Commit() could ever reach (RecordEntry only ever targets the default namespace).
+//
+// Falsifying: reverting the ns_ == GetDefaultNamespace() gate on PerformDeletionAtomic's mvcc
+// block (db_slice.cc) reproduces mvcc_entries/mvcc_tombstones going 0->1 in ns1 on this test; see
+// the report's fix-report addendum for the verbatim measurement.
+TEST_F(MvccStoreTest, NonDefaultNamespaceDeleteLeavesNoOrphanedTombstone) {
+  Namespace& ns1 = namespaces->GetOrInsert("ns1-c2");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", "gone", "v"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"del", "gone"}).GetInt(), 1);
+
+  const ShardId sid = Shard("gone", shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  DbSlice::Stats slice_stats;
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = ns1.GetDbSlice(sid);
+    ns1_stamp = db_slice.GetMvcc(0, "gone");
+    slice_stats = db_slice.GetStats();
+  });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace delete must not create an orphaned tombstone slot -- no "
+         "journal commit can ever reach it to release it";
+  DbStats total;
+  for (const auto& db_stats : slice_stats.db_stats)
+    total += db_stats;
+  EXPECT_EQ(total.mvcc_entries, 0u);
+  EXPECT_EQ(total.mvcc_tombstones, 0u);
+}
+
 // drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
 // constructs its Renamer with do_copy=true, and FinalizeRename routes to DeserializeDest for
 // every COPY (the `!do_copy_ && shard_id == src_sid_` branch that sends RENAME's source through

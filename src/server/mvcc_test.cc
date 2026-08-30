@@ -210,6 +210,22 @@ MvccStamper* FreshStamper() {
   s->SetSelfUuid("6f1c4c3e-0000-4000-8000-00000000000a");
   return s;
 }
+
+// drakeydb: P4-3 Task 2 review fix (I3) -- EndOfWriteEpoch now requires an EraseFn (mvcc.h) so
+// every call site consciously handles rolling back an abandoned tombstone placeholder. Tests that
+// don't care about that (nothing armed via ArmTombstone) pass this no-op instead of a DbSlice.
+MvccStamper::EraseFn NoopErase() {
+  return [](DbIndex, std::string_view) {};
+}
+
+// Records what EndOfWriteEpoch's erase_fn was called with, so EndOfEpochRollsBack... below needs
+// no DbSlice either -- same reasoning as Recorder above, for Commit.
+struct EraseRecorder {
+  std::vector<std::pair<DbIndex, std::string>> erased;
+  MvccStamper::EraseFn Fn() {
+    return [this](DbIndex db, std::string_view key) { erased.emplace_back(db, std::string(key)); };
+  }
+};
 }  // namespace
 
 TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
@@ -250,13 +266,35 @@ TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
   MvccStamper* s = FreshStamper();
   Recorder rec;
   s->Arm(0, "orphan");
-  s->EndOfWriteEpoch();
+  s->EndOfWriteEpoch(NoopErase());
   s->Commit(1, 0, rec.Fn());
 
   EXPECT_TRUE(rec.writes.empty()) << "an arm with no journal entry must not be stamped";
   EXPECT_EQ(s->stats().unstamped_writes, 1u)
       << "and the drop must be counted -- this is the production canary for read paths "
          "that mutate without journaling";
+}
+
+// drakeydb: P4-3 Task 2 review fix (I3) -- the root fix for a stuck {kTombstoneBit, 0}
+// placeholder: PerformDeletionAtomic (db_slice.cc) writes that placeholder synchronously,
+// expecting the delete's own journal commit to overwrite it with a real stamp. When that commit
+// never happens, EndOfWriteEpoch must roll the placeholder back (erase_fn), not just drop the arm
+// silently -- and must do so ONLY for tombstone arms; a plain, uncommitted Arm() has no
+// placeholder of its own to undo (EnsureMvcc's zero-authority slot is a legitimate "write is
+// pending" marker, not an abandoned one, and is left for a later write or GC to resolve).
+TEST(MvccStamperTest, EndOfEpochRollsBackOnlyUncommittedTombstoneArms) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "live-orphan");
+  s->ArmTombstone(0, "dead-orphan");
+  EraseRecorder erase_rec;
+  s->EndOfWriteEpoch(erase_rec.Fn());
+
+  ASSERT_EQ(erase_rec.erased.size(), 1u)
+      << "only the tombstone arm is an abandoned placeholder that needs rolling back";
+  EXPECT_EQ(erase_rec.erased[0].first, 0u);
+  EXPECT_EQ(erase_rec.erased[0].second, "dead-orphan");
+  EXPECT_EQ(s->stats().unstamped_writes, 2u)
+      << "both arms still count toward the canary -- rollback doesn't hide that this happened";
 }
 
 TEST(MvccStamperTest, DisarmRemovesOnlyTheNamedKey) {
@@ -327,7 +365,7 @@ TEST(MvccStamperTest, HopStampIsStableWithinEpochAndAdvancesAfter) {
   for (int i = 0; i < 5; ++i)
     EXPECT_EQ(s->HopStamp(kNow), first) << "iteration " << i;
 
-  s->EndOfWriteEpoch();
+  s->EndOfWriteEpoch(NoopErase());
   EXPECT_GT(s->HopStamp(kNow), first);
 }
 

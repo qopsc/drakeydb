@@ -158,6 +158,19 @@ uint64_t NodeUuidHash(std::string_view uuid);
 class MvccStamper {
  public:
   using CommitFn = std::function<void(DbIndex, std::string_view, const MvccStamp&)>;
+  // drakeydb: P4-3 Task 2 review fix (I3) -- invoked by EndOfWriteEpoch below, once per arm that
+  // is STILL armed (uncommitted) at epoch end AND was armed via ArmTombstone (never a plain
+  // Arm()). PerformDeletionAtomic (db_slice.cc) writes a synchronous tombstone placeholder to
+  // keep the dense invariant intact the instant a key leaves `prime`, expecting the delete's own
+  // journal commit to overwrite that placeholder with a real, minted stamp -- but that commit can
+  // fail to happen (a non-default namespace, an auto-journaled command that returns non-OK, a
+  // NO_AUTOJOURNAL branch that never reaches its own RecordJournal, and others this type has no
+  // way to enumerate). Left alone, the abandoned placeholder ({kTombstoneBit, 0} -- Mvcc()==0,
+  // origin_hash==0, the strict minimum of operator<) stays in the table forever and can never win
+  // a future merge comparison: a silently-lost delete. erase_fn lets the caller (which owns the
+  // DbSlice this arm's db_index names) undo that placeholder generically, without this type
+  // needing to know anything about DbSlice or enumerate the paths that can orphan an arm.
+  using EraseFn = std::function<void(DbIndex, std::string_view)>;
 
   // Re-mint the hop stamp if the memo is older than this. A missed EndOfWriteEpoch then degrades
   // visibly (stats().stale_epoch) instead of silently reusing an ancient stamp.
@@ -224,7 +237,16 @@ class MvccStamper {
   // The fourth mutator of armed_/arena_ (Task 7 closes the gap: originally not DCHECK'd against
   // commit_depth_ like Arm()/Disarm()/Commit() above). See Commit()'s comment for why a CommitFn
   // calling this would corrupt Commit()'s own in-progress iteration.
-  void EndOfWriteEpoch();
+  //
+  // drakeydb: P4-3 Task 2 review fix (I3) -- calls erase_fn (see its own comment above) for every
+  // still-armed tombstone arm, BEFORE armed_/arena_ are cleared (so ArmedKey is still valid
+  // inside erase_fn), then clears armed_/arena_/hop_stamp_ exactly as before. No default: every
+  // call site must consciously supply a rollback, or a tombstone-earning delete on that path
+  // degrades from "no peer learns about this delete" (already the accepted, bounded-risk fallback
+  // at the cap) to "no peer ever CAN learn about this delete, permanently" -- worse, and silent.
+  // erase_fn must not call Arm()/Disarm()/Commit()/EndOfWriteEpoch(): this call is mid-iteration
+  // over armed_/arena_ for the same reason Commit()'s fn may not, above -- DCHECK'd the same way.
+  void EndOfWriteEpoch(const EraseFn& erase_fn);
 
   const Stats& stats() const {
     return stats_;

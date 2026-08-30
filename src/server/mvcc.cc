@@ -149,7 +149,7 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp);
 }
 
-void MvccStamper::EndOfWriteEpoch() {
+void MvccStamper::EndOfWriteEpoch(const EraseFn& erase_fn) {
   // The fourth mutator of armed_/arena_ (with Arm/Disarm/Commit, all DCHECK'd above): guards
   // against a CommitFn that calls back into EndOfWriteEpoch() while Commit() is mid-iteration,
   // which would clear armed_/arena_ out from under that loop exactly as a nested Arm()/Disarm()/
@@ -157,11 +157,24 @@ void MvccStamper::EndOfWriteEpoch() {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn ended the write epoch -- Commit() is mid-iteration "
                                  "over armed_/arena_, which this call would clear out from under "
                                  "it";
-  stats_.unstamped_writes += armed_.size();
-  armed_.clear();
-  arena_.clear();
-  hop_stamp_ = 0;
-  hop_started_ms_ = 0;
+  // drakeydb: P4-3 Task 2 review fix (I3) -- commit_depth_ guards this loop's own iteration over
+  // armed_/arena_ the same way Commit()'s loop guards itself: erase_fn must not call back into
+  // Arm()/Disarm()/Commit()/EndOfWriteEpoch(). RAII, not a bare decrement after the loop, so a
+  // throwing erase_fn (EraseMvcc touches a DashTable, which can in principle throw) still leaves
+  // commit_depth_ at 0 and armed_/arena_/hop_stamp_ cleared, exactly like Commit()'s own guard.
+  ++commit_depth_;
+  absl::Cleanup restore_depth = [this] {
+    --commit_depth_;
+    stats_.unstamped_writes += armed_.size();
+    armed_.clear();
+    arena_.clear();
+    hop_stamp_ = 0;
+    hop_started_ms_ = 0;
+  };
+  for (const Armed& a : armed_) {
+    if (a.tombstone)
+      erase_fn(a.db_index, ArmedKey(a));
+  }
 }
 
 void MvccStamper::TEST_Reset() {

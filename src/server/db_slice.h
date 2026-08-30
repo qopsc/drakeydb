@@ -366,19 +366,25 @@ class DbSlice {
   // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
   void EnsureMvcc(DbIndex db_ind, std::string_view key);
   // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
-  // must remain allocation-free; a missing slot is a fatal invariant violation -- except for a
-  // tombstone-flagged stamp, which this delegates to SetTombstone below (see that method's
-  // comment for why a tombstone tolerates an absent slot where a plain stamp does not).
+  // must remain allocation-free; a missing slot is a fatal invariant violation -- CHECK-fails,
+  // deliberately, even for a tombstone-flagged stamp (review fix I5: an earlier version of this
+  // method delegated the tombstone case to SetTombstone below, which silently inserts a slot if
+  // one is missing -- exactly the "prepared before commit" bug this CHECK exists to catch loudly,
+  // e.g. the expiry follow-up task's likeliest mistake: arming a tombstone for a key whose slot
+  // was never synchronously prepared first). SetTombstone remains the insert-tolerant primitive
+  // for callers that genuinely need it -- PerformDeletionAtomic's own synchronous placeholder
+  // write, and a later task's RDB tombstone-section apply -- this method just no longer routes
+  // through it.
   void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   // drakeydb: P4-3 Task 2 -- writes a tombstone slot, maintaining mvcc_entries, mvcc_tombstones,
   // and mvcc_key_dup_bytes (the same three SetMvcc maintains, plus mvcc_tombstones, which SetMvcc
-  // never touches). Called from SetExistingMvcc above whenever the committed stamp IsTombstone()
-  // -- the live kExplicit/kExpired delete path, where the slot always already exists (the dense
-  // invariant guarantees every live prime key owns one, and PerformDeletionAtomic only
-  // ArmTombstone's a key it is deleting, which by definition still has a live prime entry at that
-  // point) -- and reserved for a later task's RDB tombstone-section apply, which is why, unlike
-  // SetExistingMvcc, this tolerates an absent slot by inserting one (mirroring SetMvcc's
-  // insert-or-overwrite shape) rather than CHECK-failing.
+  // never touches). Callers: PerformDeletionAtomic's synchronous placeholder write (db_slice.cc)
+  // -- the slot there always already exists, so the insert branch never actually triggers, but
+  // the caller doesn't need to know that -- and reserved for a later task's RDB tombstone-section
+  // apply, which DOES need to create brand-new slots for keys this node never held live (a
+  // tombstone loaded from a peer's RDB). Tolerates an absent slot by inserting one (mirroring
+  // SetMvcc's insert-or-overwrite shape) rather than CHECK-failing -- unlike SetExistingMvcc
+  // above, which no longer delegates here (review fix I5).
   void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
@@ -386,6 +392,17 @@ class DbSlice {
   // PerformDeletionAtomic already holds a free string_view (the iterator's del_it.key()) one line
   // above its EraseMvcc call, in the Disarm() call. See db_slice.cc.
   void EraseMvcc(DbIndex db_ind, std::string_view key);
+  // drakeydb: P4-3 Task 2 review fix (I3) -- the MvccStamper::EraseFn every EndOfWriteEpoch call
+  // site (db_slice.cc, transaction.cc) supplies. Erases `key`'s mvcc slot ONLY if it is still
+  // tombstone-flagged at the moment this runs: PerformDeletionAtomic's synchronous placeholder
+  // write is what this rolls back when the delete's own journal commit never lands (a non-default
+  // namespace, a failed auto-journaled command, a NO_AUTOJOURNAL branch that skips its own
+  // RecordJournal, ...) -- but if the SAME key was re-created within the SAME epoch (EnsureMvcc's
+  // own tombstone-clearing branch, review fix C1), the slot is a legitimate live entry by the
+  // time this runs, and erasing it unconditionally would remove real data instead of an abandoned
+  // placeholder. Public (not private): called from Transaction::RunCallback/RunSquashedMultiCb
+  // (transaction.cc), not just from within this class.
+  void RollbackUncommittedTombstone(DbIndex db_ind, std::string_view key);
 
   // drakeydb: P4-1 Task 5, fix round 1 -- computed on demand (sums DbTable::mvcc_table_memory()
   // over db_arr_) rather than maintained as a running accumulator. table_memory_'s accumulator

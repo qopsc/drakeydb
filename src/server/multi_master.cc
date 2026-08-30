@@ -26,16 +26,21 @@ ABSL_FLAG(bool, multi_master, false,
 // (MvccStamp::DeadlineMs) takes ms, so callers convert.
 ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
           "drakeydb: seconds a tombstone (a deleted key's stamp, kept instead of erased) is "
-          "retained before GC reclaims it. 0 disables tombstoning entirely: every delete erases "
-          "its slot immediately, same as kEvicted/kSlotFlush.");
+          "meant to be retained before a GC reclaims it -- that GC is not implemented yet (a "
+          "later task), so today this value only gates TombstonesEnabled(): a tombstone is kept "
+          "indefinitely (bounded only by --multi_master_max_tombstones) until that task lands. "
+          "0 disables tombstoning entirely: every delete erases its slot immediately, same as "
+          "kEvicted/kSlotFlush.");
 ABSL_FLAG(uint64_t, multi_master_max_tombstones, 1000000,
           "drakeydb: per-shard cap on live tombstones. A delete that would push a shard's "
           "tombstone count past this degrades to an erase instead (counted in "
           "mvcc_tombstones_dropped), trading resurrection risk for bounded memory on a shard "
           "that never gets an idle moment for GC to catch up.");
 ABSL_FLAG(uint32_t, multi_master_tombstone_gc_budget, 64,
-          "drakeydb: mvcc side-table buckets visited per idle-task GC tick when reclaiming "
-          "tombstones older than --multi_master_tombstone_ttl.");
+          "drakeydb: mvcc side-table buckets meant to be visited per idle-task GC tick when "
+          "reclaiming tombstones older than --multi_master_tombstone_ttl. Not consumed yet: no "
+          "such GC task exists in this build (a later task adds it); this flag is defined now "
+          "so that task lands without a second round of flag plumbing.");
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
