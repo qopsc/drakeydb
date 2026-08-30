@@ -1501,7 +1501,17 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
 // The IsTombstone() guard is load-bearing, not defensive filler: a key re-created within the same
 // epoch (EnsureMvcc's tombstone-clearing branch above) already turned this slot back into a live
 // entry, and this must not undo that.
+//
+// review fix round 2 -- same IsDbValid guard TEST_VerifyMvccTable takes above, for the same
+// reason: GetMvcc/EraseMvcc below both dereference db_arr_[db_ind] unchecked. Not reachable
+// today (every production caller passes the arm's own db_index, itself only ever set by
+// PostUpdate/PerformDeletionAtomic from an already-valid Context on an already-activated db), but
+// EndOfWriteEpoch never touched db_arr_ at all before this method existed, and db_arr_ grows
+// lazily per namespace (ActivateDb, above in this file) -- a future caller reordering when this
+// runs relative to ActivateDb should get an early return here, not an out-of-bounds access.
 void DbSlice::RollbackUncommittedTombstone(DbIndex db_ind, string_view key) {
+  if (!IsDbValid(db_ind))
+    return;
   std::optional<MvccStamp> stamp = GetMvcc(db_ind, key);
   if (stamp && stamp->IsTombstone())
     EraseMvcc(db_ind, key);
@@ -2809,10 +2819,21 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
   // miss the same way: unlike EraseMvcc's "Find, maybe no-op", SetTombstone INSERTS a slot if one
   // is missing -- reachable live: a non-default-namespace kExplicit DEL created a permanent
   // {kTombstoneBit, 0} slot (measured mvcc_entries 0->1, mvcc_tombstones 0->1) that no Commit()
-  // could ever reach (RecordEntry only ever targets the default namespace, journal.cc), and
-  // EndOfWriteEpoch's own rollback (review fix I3, below) never got a chance to clean it up either
-  // since nothing in this namespace ever calls EndOfWriteEpoch with this arm still pending. This
-  // gate closes that at the source instead of relying on I3 to clean up after it.
+  // could ever reach (RecordEntry only ever targets the default namespace, journal.cc).
+  //
+  // review fix round 2 (accuracy) -- an earlier version of this comment claimed "nothing in this
+  // namespace ever calls EndOfWriteEpoch with this arm still pending", as if that were why the
+  // gate mattered. False, and precisely why the first attempt at falsifying this gate alone was a
+  // false negative (task-2-report.md): Transaction::RunCallback calls EndOfWriteEpoch for EVERY
+  // namespace's callback, unconditionally, since mvcc_enabled_ carries no namespace either --
+  // review fix I3's rollback (below) DOES reach and erase this exact orphaned placeholder, every
+  // time, on its own. This gate is not needed to avoid a stuck slot; it is needed so the slot,
+  // and the arm, are never created in the first place: without it, every non-default-namespace
+  // kExplicit DEL pays a wasted Insert (SetTombstone) immediately undone by an Erase (I3's
+  // rollback) one epoch later, and -- worse than wasteful -- ArmTombstone's arm is real, so
+  // EndOfWriteEpoch finds it still pending and folds it into mvcc_unstamped_writes, the
+  // "a read-mutation path is over-arming" canary (server_family.cc:3143-3150) operators watch
+  // expecting it to stay 0 in healthy operation. This gate closes both at the source.
   //
   // drakeydb: P4-3 Task 2 -- any arm this key already has describes the value we are removing
   // (e.g. HDEL's PostUpdate armed it just before DeleteIfEmpty got here), so drop those first --

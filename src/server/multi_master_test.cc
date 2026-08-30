@@ -38,6 +38,10 @@
 #include "server/server_family.h"
 #include "server/snapshot.h"
 #include "server/test_utils.h"
+extern "C" {
+#include "redis/crc64.h"
+}
+
 #include "util/fibers/fibers.h"
 #include "util/fibers/pool.h"
 
@@ -1719,6 +1723,59 @@ TEST_F(MvccStoreTest, RenameOntoAnExistingDestSelfCorrectsToALiveStamp) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: second-round review fix (Important #1) -- builds a RESTORE payload that PASSES
+// GetRdbVersion's version+crc64 footer check (generic_family.cc), which runs at the COMMAND
+// level before the transaction is even scheduled, but fails RdbRestoreValue::Add's actual RDB
+// body deserialization once OpRestore (generic_family.cc) is running -- letting
+// RestoreReplaceFailureRollsBackTheOrphanedTombstone below reach OpRestore's own
+// DelMutable-then-fail sequence for real, rather than being rejected before ever touching the
+// existing key. \xFF is not a valid RDB object-type tag; the footer's version+crc64 are computed
+// correctly for that one invalid byte, exactly as GetRdbVersion expects: version (2 bytes LE)
+// then crc64 of (body + version) (8 bytes LE) -- see GetRdbVersion's own comment for the layout.
+std::string InvalidRestorePayloadWithValidFooter() {
+  std::string prefix(1, '\xFF');
+  constexpr uint16_t kVersion = 2;  // comfortably under RDB_VERSION; any accepted value works
+  prefix.push_back(static_cast<char>(kVersion & 0xFF));
+  prefix.push_back(static_cast<char>((kVersion >> 8) & 0xFF));
+  uint64_t crc = crc64(0, reinterpret_cast<const unsigned char*>(prefix.data()), prefix.size());
+  std::string payload = prefix;
+  for (int i = 0; i < 8; ++i)
+    payload.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF));
+  return payload;
+}
+
+// drakeydb: second-round review fix (Important #1) -- I3's PRODUCTION half
+// (DbSlice::RollbackUncommittedTombstone, db_slice.cc) had no coverage: the only committed I3
+// test (mvcc_test.cc) drives MvccStamper::EndOfWriteEpoch directly with a mock EraseFn, so
+// neither RollbackUncommittedTombstone itself nor any of the eight real call-site wirings
+// (transaction.cc x2, db_slice.cc x6) was exercised -- gutting RollbackUncommittedTombstone to a
+// no-op left mvcc_test 30/30 and multi_master_test green. This drives a real, unmocked
+// never-commits path end to end: RESTORE key 0 <payload> REPLACE on an existing key runs
+// OpRestore (generic_family.cc), which DelMutable's the existing value (default reason
+// kExplicit, so it ArmTombstones under this task's own gate) BEFORE attempting
+// RdbRestoreValue::Add on the caller-supplied payload -- when that Add fails, OpRestore returns
+// the error status directly, RESTORE being CO::JOURNALED (auto-journal, not NO_AUTOJOURNAL) means
+// Transaction::LogAutoJournalOnShard's `if (result.status != OpStatus::OK) return;`
+// (transaction.cc) skips journaling entirely, so no Commit() ever consumes the tombstone arm --
+// exactly the "auto-journaled command returning non-OK" class of orphaning path I3 exists for.
+TEST_F(MvccStoreTest, RestoreReplaceFailureRollsBackTheOrphanedTombstone) {
+  Run({"set", "k", "v1"});
+  ASSERT_TRUE(StampOf("k").has_value());
+
+  auto res = Run({"restore", "k", "0", InvalidRestorePayloadWithValidFooter(), "REPLACE"});
+  ASSERT_THAT(res, ArgType(RespExpr::ERROR))
+      << "sanity: an invalid RDB body must fail, or this test proves nothing about the "
+         "never-commits path";
+
+  auto st = StampOf("k");
+  EXPECT_FALSE(st.has_value())
+      << "RollbackUncommittedTombstone (db_slice.cc), wired for real through "
+         "MvccStamper::EndOfWriteEpoch and Transaction::RunCallback's epoch_end cleanup, must "
+         "erase the orphaned placeholder OpRestore's failed commit left behind";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 // drakeydb: P4-3 Task 2 review fix (C1, Critical) -- EnsureMvcc (db_slice.cc) did not clear a
 // slot's tombstone flag when a deleted key was re-created: PostUpdate calls EnsureMvcc
 // synchronously, before Arm(), at the exact moment prime.size() grows back for the new value, but
@@ -1788,9 +1845,24 @@ TEST_F(MvccStoreTest, RestoreReplaceRecreatesClearingTheTombstone) {
 // SetTombstone's insert-tolerant Insert() call actually created a permanent, orphaned slot no
 // Commit() could ever reach (RecordEntry only ever targets the default namespace).
 //
+// drakeydb: second-round review fix -- the slot-state assertions below (ns1_stamp/mvcc_entries/
+// mvcc_tombstones) do NOT isolate this fix on their own: I3's EndOfWriteEpoch rollback (below in
+// this file) independently cleans up the very same orphaned placeholder at the end of THIS
+// command's own RunCallback, since EndOfWriteEpoch always fires regardless of namespace
+// (mvcc_enabled_ is DbSlice-wide). Reverting only the C2 gate still passes those assertions.
+// mvcc_unstamped_writes is the assertion that actually isolates C2: I3's rollback erases the
+// stale SLOT, but it cannot undo the fact that ArmTombstone was called at all -- without the
+// gate, PostUpdate never arms a non-default-namespace key (its own F1 gate), but
+// PerformDeletionAtomic's ArmTombstone call did, unconditionally, adding one entry to armed_ that
+// EndOfWriteEpoch then finds still pending (nothing in this namespace ever commits it) and counts
+// toward unstamped_writes -- the "a read-mutation path is over-arming" canary
+// (server_family.cc:3143-3150) that healthy operation keeps at 0. With the gate in place, that
+// ArmTombstone call never happens, so the counter never moves.
+//
 // Falsifying: reverting the ns_ == GetDefaultNamespace() gate on PerformDeletionAtomic's mvcc
-// block (db_slice.cc) reproduces mvcc_entries/mvcc_tombstones going 0->1 in ns1 on this test; see
-// the report's fix-report addendum for the verbatim measurement.
+// block (db_slice.cc) reproduces mvcc_entries/mvcc_tombstones going 0->1 AND
+// mvcc_unstamped_writes going 0->1 (1 vs. 0) on this test; see the report's fix-report addendum
+// for the verbatim measurements.
 TEST_F(MvccStoreTest, NonDefaultNamespaceDeleteLeavesNoOrphanedTombstone) {
   Namespace& ns1 = namespaces->GetOrInsert("ns1-c2");
   ASSERT_EQ(RunViaNamespace(&ns1, {"set", "gone", "v"}), "OK");
@@ -1812,6 +1884,16 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceDeleteLeavesNoOrphanedTombstone) {
     total += db_stats;
   EXPECT_EQ(total.mvcc_entries, 0u);
   EXPECT_EQ(total.mvcc_tombstones, 0u);
+
+  // Summed across every shard, matching PureWriteWorkloadLeavesNoUnstampedWrites' established
+  // convention (this file) -- the specific shard "gone" hashes to is enough to prove the point,
+  // but summing costs nothing and rules out a wrong-shard assumption.
+  std::atomic<uint64_t> unstamped{0};
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { unstamped += MvccStamper::tlocal()->stats().unstamped_writes; });
+  EXPECT_EQ(unstamped.load(), 0u)
+      << "a non-default-namespace delete must never call ArmTombstone at all -- I3's rollback "
+         "erasing the resulting slot afterward is not the same as this never having armed";
 }
 
 // drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
