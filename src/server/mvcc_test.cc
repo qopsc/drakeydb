@@ -141,14 +141,27 @@ TEST(MvccStamp, MergeAcceptsFavoursTheStoredSideOnATie) {
   EXPECT_TRUE(MergeAccepts(a, MvccStamp{0x1000, 0xBBBB}));  // equal mvcc, higher origin wins
 }
 
+// drakeydb: P4-3 Task 1 review fix -- the original version of this test used tiny counter-only
+// literals (0x2000/0x3000/0x4000, all < 1<<20) for the mvcc, so MsPart() == 0 for every one of
+// them: DeadlineMs(ttl) == ttl regardless of whether MsPart() is added at all, and a mutant
+// `DeadlineMs() { return ttl_ms; }` still passed. It also never asserted origin_hash on the
+// tombstone, so a mutant AsTombstone() that dropped origin_hash still passed too. Both mutations
+// are falsified in the fix report. See task-1-report.md for the verbatim before/after.
 TEST(MvccStamp, ATombstoneComparesByItsStampNotItsBit) {
-  const MvccStamp live{0x2000, 0xAAAA};
-  const MvccStamp tomb = MvccStamp{0x3000, 0xAAAA}.AsTombstone();
+  constexpr uint64_t kLiveMs = 2'000;
+  constexpr uint64_t kTombMs = 4'321;  // deliberately not round, and not zero after >> kCounterBits
+  constexpr uint64_t kLaterMs = 9'000;
+  constexpr uint64_t kTombOrigin = 0xDDDDu;  // distinct from every other origin used in this test
+  const MvccStamp live{kLiveMs << MvccClock::kCounterBits, 0xAAAA};
+  const MvccStamp later{kLaterMs << MvccClock::kCounterBits, 0xAAAA};
+  const MvccStamp tomb = MvccStamp{kTombMs << MvccClock::kCounterBits, kTombOrigin}.AsTombstone();
+
   EXPECT_TRUE(tomb.IsTombstone());
-  EXPECT_EQ(tomb.Mvcc(), 0x3000u);         // bit 63 masked out of the comparison value
+  EXPECT_EQ(tomb.Mvcc(), kTombMs << MvccClock::kCounterBits);  // bit 63 masked out of the value
+  EXPECT_EQ(tomb.origin_hash, kTombOrigin) << "AsTombstone must carry origin_hash through as-is";
   EXPECT_FALSE(MergeAccepts(tomb, live));  // newer tombstone beats an older resurrection
-  EXPECT_TRUE(MergeAccepts(tomb, MvccStamp{0x4000, 0xAAAA}));  // a later write beats the tombstone
-  EXPECT_EQ(tomb.DeadlineMs(600'000), (0x3000u >> MvccClock::kCounterBits) + 600'000);
+  EXPECT_TRUE(MergeAccepts(tomb, later));  // a later write beats the tombstone
+  EXPECT_EQ(tomb.DeadlineMs(600'000), kTombMs + 600'000);
 }
 
 TEST(NodeUuidHashTest, StableAndDistinct) {

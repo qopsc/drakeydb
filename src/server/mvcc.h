@@ -86,6 +86,13 @@ struct MvccStamp {
   // The live delete path sets the bit inside MvccStamper::Commit instead (drakeydb P4-3 Task 2);
   // that is a second call site by necessity (Commit mints/forwards the stamp, this method does
   // not), not a duplication of this logic.
+  //
+  // PRECONDITION, load-bearing for Task 2: `this` must already be strictly greater than the stamp
+  // of the value being deleted, never that value's own stamp reused verbatim -- operator< masks
+  // bit 63 (see the INVARIANT comment below), so a reused stamp is order-equivalent to the value
+  // it replaces, MergeAccepts ties on it, and ties favor the stored side: the delete then silently
+  // never applies on a peer that still holds the live value. Task 2 must mint delete stamps
+  // strictly greater than the value's, never call this on the value's own stamp unmodified.
   MvccStamp AsTombstone() const {
     return MvccStamp{packed | MvccClock::kTombstoneBit, origin_hash};
   }
