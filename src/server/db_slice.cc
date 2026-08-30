@@ -2716,7 +2716,8 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // (mvcc->size() - mvcc_tombstones == prime.size(), OnCbFinishBlocking below in this file).
 // Reproduced verbatim via MvccStoreTest.ExpiryErasesTheStamp (multi_master_test.cc) with kExpired
 // temporarily added to the condition below:
-// `F... Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs. 0)`
+// `F... Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs.
+// 0)`
 // -- see task-2-report.md for the full trace and verbatim output.
 //
 // Three OTHER kExpired call sites (HSetFamily::DeleteIfEmpty, SetFamily::DeleteSetIfEmpty,

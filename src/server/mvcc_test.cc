@@ -7,6 +7,7 @@
 #include <gmock/gmock.h>
 #include <xxhash.h>
 
+#include <map>
 #include <optional>
 
 #include "base/gtest.h"
@@ -224,6 +225,25 @@ TEST(MvccStamperTest, CommitStampsEveryArmedKey) {
   EXPECT_EQ(rec.writes[0].stamp.Mvcc(), 4242u);
   EXPECT_EQ(rec.writes[0].stamp.origin_hash, rec.writes[1].stamp.origin_hash);
   EXPECT_EQ(s->stats().unstamped_writes, 0u);
+}
+
+// drakeydb: P4-3 Task 2 -- Commit() ORs kTombstoneBit into the stamp handed to an ArmTombstone'd
+// key's CommitFn call, and ONLY that arm's: a plain Arm() of a different key committed in the
+// same call must come out bare. Both share the exact same (mvcc, origin_hash) -- Commit has no
+// clock of its own and mints nothing itself, so a tombstone arm's stamp differs from a plain arm
+// committed in the same call by that one bit alone.
+TEST(MvccStamperTest, CommitMarksOnlyTombstoneArms) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "live");
+  s->ArmTombstone(0, "dead");
+  std::map<std::string, MvccStamp> got;
+  s->Commit(0x5000, 0,
+            [&](DbIndex, std::string_view k, const MvccStamp& st) { got[std::string(k)] = st; });
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_FALSE(got["live"].IsTombstone());
+  EXPECT_TRUE(got["dead"].IsTombstone());
+  EXPECT_EQ(got["live"].Mvcc(), got["dead"].Mvcc());  // same epoch stamp, one bit apart
+  EXPECT_EQ(got["live"].origin_hash, got["dead"].origin_hash);
 }
 
 TEST(MvccStamperTest, EndOfEpochDropsUncommittedArms) {
