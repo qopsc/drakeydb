@@ -532,3 +532,57 @@ Create `docs/multi-master.md`; Modify `docs/differences.md`, `docs/PLAN.md`,
 - [ ] Memory: record `mvcc_table_bytes` and `used_memory` for a delete-heavy workload and confirm
   the tombstone cap holds the side table under the D-10 bound (~41 MB/shard at the default cap).
 - [ ] Every falsification recorded verbatim in the ledger; `pre-commit` clean across the branch.
+
+---
+
+### Task 11: Expiry deletes earn tombstones (added 2026-08-30 by controller ruling; run after Task 3)
+
+Task 2 established, and its review independently confirmed, that `kExpired` cannot tombstone today:
+two of its five call sites journal **before** they delete, so the tombstone's arm is orphaned and no
+`Commit` ever lands its stamp. Spec D-10 requires expiry tombstones ("a peer whose copy has not yet
+expired and which then legitimately writes the key *later* still wins"), so this closes that gap in
+its own reviewable unit rather than as a hunk inside Task 2.
+
+**Files:** Modify `src/server/db_slice.cc`; Test `src/server/multi_master_test.cc`,
+`src/server/journal/journal_test.cc`, `tests/dragonfly/replication_test.py`
+
+**Interfaces:** Consumes Task 2's `ArmTombstone`, the rollback in `EndOfWriteEpoch`, and
+`SetExistingMvcc`'s restored missing-slot-is-fatal `CHECK` — that `CHECK` is the net for this task's
+likeliest mistake, so do not weaken it.
+
+**The two unsafe sites, both confirmed twice:**
+- `DbSlice::ExpireIfNeeded` — `RecordExpiryBlocking(cntx, key)` at `db_slice.cc:1825` runs before
+  `Del(...)` at `:1840`.
+- `DbSlice::DeleteReapedContainer` — `RecordDerivedDelete(cntx, key)` at `:2283` before `Del(...)`
+  at `:2284`.
+
+The three other `kExpired` sites already delete before journaling and need no change:
+`HSetFamily::DeleteIfEmpty` (`hset_family.cc:1648-1677`), `SetFamily::DeleteSetIfEmpty`
+(`set_family.cc:1663-1683`), and `UpdateExpire`'s negative-TTL branch (`db_slice.cc:1617-1624`).
+
+- [ ] **Step 1: Write the failing test.** On `MvccStoreTest`: set a key with a short TTL, let it
+  expire through the lazy-expiry read path, and assert the side table holds a **tombstone with a
+  non-zero stamp and the self origin** — not an absent slot and not `{0,0}`. Add the reaped-container
+  equivalent for `DeleteReapedContainer`. Both must fail today (`kExpired` does not tombstone).
+
+- [ ] **Step 2: Run, observe failure.**
+
+- [ ] **Step 3: Reorder the two sites so the delete precedes the journal record**, matching every
+  `kExplicit` site and matching the six journal-before-arm reorderings P4-1 already landed for this
+  exact defect class. Then add `kExpired` to Task 2's `earns_tombstone` condition. Keep the journal
+  entry's content identical — only its position within the callback moves.
+
+- [ ] **Step 4: Prove the wire did not change for non-active nodes.** This is the constraint that
+  makes this task risky: the reorder touches a path shared with plain replication. Run the P3
+  golden-buffer journal test with `--active_replica` off, `journal_test` in full, and
+  `replication_test.py`; then specifically verify that an expiry's journal entry still reaches the
+  replica with the same content and in an order that keeps the key's baseline before its mutation.
+  **STOP and report** if the reorder changes what a non-active replica observes — a correctness fix
+  for active mode must not perturb plain replication.
+
+- [ ] **Step 5: Falsify** (revert the reorder, observe the orphaned-arm symptom from Task 2's
+  report — a stuck `{kTombstoneBit, 0}` or a rolled-back slot where the test expects a real stamp —
+  restore, record verbatim).
+
+- [ ] **Step 6:** Run `ctest -L DFLY`, `multi_master_test`, `mvcc_test`. pre-commit; commit
+  `fix: journal expiry after the delete so expired keys earn tombstones (P4)`.
