@@ -590,6 +590,16 @@ size_t DbSlice::mvcc_table_memory() const {
 // "live key with no stamp" mismatch for every key it ever writes. That is a property of where
 // this namespace's writes are (never) armed, not a leak -- do not "fix" it by removing the scope.
 // See OnCbFinishBlocking for the O(1) production-path DCHECK this from-scratch check justifies.
+//
+// drakeydb: P4-3 Task 2 -- since tombstones, "every mvcc stamp has exactly one live prime key" is
+// no longer quite right: a tombstone stamp legitimately has NONE (that is what a tombstone is).
+// The second loop below excludes tombstones from that check and instead tallies them, comparing
+// the tally against the maintained mvcc_tombstones counter -- so an accounting bug in whichever
+// of SetMvcc/SetExistingMvcc/SetTombstone/EraseMvcc flips a slot into or out of tombstone state
+// is still caught here even in a case that leaves mvcc->size()/prime->size() themselves
+// consistent (a resurrected key -- SET after a DEL of the same key -- is exactly such a case: it
+// restores 1:1 key/stamp density on its own, so only the tombstone tally below distinguishes
+// "resurrected cleanly" from "resurrected without releasing the old tombstone credit").
 size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
   // drakeydb: fix round 1 (Minor) -- guard against an out-of-range/never-activated db_ind, the
   // same check every other public entry point taking a bare DbIndex relies on (e.g.
@@ -621,15 +631,27 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
     });
   } while (prime_cursor);
 
+  size_t tombstones_found = 0;
   detail::DashCursor mvcc_cursor;
   do {
     mvcc_cursor = db.mvcc->Traverse(mvcc_cursor, [&](auto it) {
+      if (it->second.IsTombstone()) {
+        ++tombstones_found;
+        return;
+      }
       if (db.prime.Find(it->first.GetSlice(&scratch)).is_done()) {
         LOG(ERROR) << "mvcc: stamp with no live key: " << it->first.ToString();
         ++mismatches;
       }
     });
   } while (mvcc_cursor);
+
+  if (tombstones_found != db.stats.mvcc_tombstones) {
+    LOG(ERROR) << "mvcc: mvcc_tombstones stat (" << db.stats.mvcc_tombstones
+               << ") does not match tombstones actually found in the table (" << tombstones_found
+               << ")";
+    ++mismatches;
+  }
 
   return mismatches;
 }
@@ -1364,6 +1386,13 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   if (!db.mvcc)
     return;
   auto [it, inserted] = db.mvcc->Insert(key, stamp);
+  // drakeydb: P4-3 Task 2 -- a fresh value overwriting a tombstoned slot (a key deleted, then
+  // re-created -- an ordinary SET-after-DEL, not an edge case) must release that slot's
+  // mvcc_tombstones credit, or the dense invariant (mvcc->size() - mvcc_tombstones ==
+  // prime.size(), db_slice.cc) drifts permanently stale the first time any workload re-creates a
+  // key it previously deleted. Read before the overwrite below, symmetrically with was_tombstone
+  // in SetTombstone further down.
+  const bool was_tombstone = !inserted && it->second.IsTombstone();
   it->second = stamp;
   if (inserted) {
     ++db.stats.mvcc_entries;
@@ -1375,6 +1404,8 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
     // and must not double-count it here.
     db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
   }
+  if (was_tombstone && !stamp.IsTombstone())
+    --db.stats.mvcc_tombstones;
 }
 
 void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
@@ -1391,12 +1422,54 @@ void DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
 }
 
 void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  // drakeydb: P4-3 Task 2 -- a tombstone-flagged commit (Commit ORs kTombstoneBit in for an
+  // ArmTombstone'd key, mvcc.cc) must also account mvcc_tombstones, which a plain stamp overwrite
+  // never touches. SetTombstone below is the one place that maintains it, so route there instead
+  // of duplicating that bookkeeping here -- journal.cc's Commit callback stays a single, thin
+  // dispatch to this method regardless of which kind of stamp it is committing.
+  if (stamp.IsTombstone()) {
+    SetTombstone(db_ind, key, stamp);
+    return;
+  }
   auto& db = *db_arr_[db_ind];
   CHECK(db.mvcc != nullptr);
   auto it = db.mvcc->Find(key);
   CHECK(!it.is_done()) << "MVCC slot must be prepared before journal commit: db=" << db_ind
                        << " key=" << key;
+  // drakeydb: P4-3 Task 2 -- same resurrection fix as SetMvcc above, for the journal-commit path:
+  // a key deleted (tombstoned) and re-created within one write epoch, or a later one, is armed
+  // via the plain Arm() (not ArmTombstone) its new write uses, so this is a PLAIN commit landing
+  // on a slot EnsureMvcc found already occupied by the old tombstone -- release its
+  // mvcc_tombstones credit before overwriting.
+  if (it->second.IsTombstone())
+    --db.stats.mvcc_tombstones;
   it->second = stamp;
+}
+
+// drakeydb: P4-3 Task 2 -- see the declaration (db_slice.h) for the full contract. Mirrors
+// SetMvcc's Insert-or-overwrite shape (same three accounted fields) plus mvcc_tombstones, which
+// SetMvcc never touches: SetMvcc is a plain-value overwrite (RDB load, replicated write, ...) and
+// must never miscount a live value's slot as a tombstone. was_tombstone guards mvcc_tombstones
+// against double-counting if this is ever called twice on the same already-tombstoned slot (not
+// reachable from Task 2's own call site -- PerformDeletionAtomic only ArmTombstones a key with a
+// live prime entry, so SetExistingMvcc's delegation above always finds a fresh, non-tombstone
+// slot here -- but SetTombstone is also the landing spot for a later task's RDB tombstone-section
+// apply, which has no such guarantee).
+void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  auto [it, inserted] = db.mvcc->Insert(key, stamp);
+  const bool was_tombstone = !inserted && it->second.IsTombstone();
+  it->second = stamp;
+  if (inserted) {
+    ++db.stats.mvcc_entries;
+    // drakeydb: P4-2 Task 4 -- accounts the second, independent heap copy of `key` this Insert may
+    // have just made, same as SetMvcc's insert branch above.
+    db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
+  }
+  if (inserted || !was_tombstone)
+    ++db.stats.mvcc_tombstones;
 }
 
 optional<MvccStamp> DbSlice::GetMvcc(DbIndex db_ind, string_view key) const {
@@ -1437,6 +1510,14 @@ void DbSlice::EraseMvcc(DbIndex db_ind, string_view key) {
     // key (MallocUsed() == 0), permanently over-reporting mvcc_table_bytes by the un-subtracted
     // duplicated-key bytes on every delete of a non-inline key.
     db.stats.mvcc_key_dup_bytes -= it->first.MallocUsed();
+    // drakeydb: P4-3 Task 2 -- release this slot's mvcc_tombstones credit if it is one, so a
+    // future GC sweep (--multi_master_tombstone_gc_budget) reclaiming an expired tombstone
+    // through this same method keeps the dense invariant intact. Not reachable from
+    // PerformDeletionAtomic's own EraseMvcc call today: del_it there is always a live prime
+    // iterator, and a tombstone by definition has none, so that caller never erases an
+    // already-tombstoned slot.
+    if (it->second.IsTombstone())
+      --db.stats.mvcc_tombstones;
     db.mvcc->Erase(it);
     --db.stats.mvcc_entries;
   }
@@ -2615,18 +2696,39 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 
 // drakeydb: Phase 4, P4-1 Task 8 -- `reason` is threaded through Del/PerformDeletionAtomic and
 // every non-default call site already passes its real reason (see the DeleteReason comment,
-// db_slice.h), but P4-1 does not yet branch on it below: every reason erases the stamp, full
-// stop -- tombstones are P4-5's job. Landing the parameter now, unused, means P4-5 adds its
-// kExplicit/kExpired-vs-kEvicted/kSlotFlush branch without having to touch these same call sites
-// a second time. [[maybe_unused]] is not load-bearing for the build here -- confirmed by
-// compiling this translation unit both with and without it (task-8-report.md): the project
-// disables -Wunused-parameter project-wide (helio/cmake/internal.cmake's unconditional
-// `-Wno-unused-parameter`, positioned after `-Wextra` on the actual compile_commands.json command
-// line for this file, so it wins), and this build has no active -Werror regardless. Kept anyway
-// for the same self-documenting reason rdb_save.cc's CollectSearchIndices uses it -- flags an
-// intentionally-unused parameter to a reader -- not to satisfy the compiler.
+// db_slice.h). P4-1 landed the parameter unused (every reason erased the stamp, full stop); P4-3
+// Task 2 below is what actually branches on it.
+//
+// drakeydb: P4-3 Task 2, STOP finding (see task-2-report.md) -- the plan/Global Constraints say
+// kExplicit AND kExpired both earn a tombstone. Only kExplicit does, below, for now:
+// PerformDeletionAtomic only decides WHETHER to tombstone; WHETHER that tombstone actually gets
+// written depends on this key's ArmTombstone() surviving until a LATER journal::RecordEntry ->
+// Commit() call visits it (Commit is what OR's the bit in and hands the stamp to
+// SetTombstone/SetExistingMvcc -- see mvcc.cc). That holds for every kExplicit site (OpDelV2 arms
+// via post_updater.Run() / this function, then journals after) but NOT for two real kExpired
+// sites that journal BEFORE calling Del(): DbSlice::ExpireIfNeeded (RecordExpiryBlocking then
+// Del(), db_slice.cc) and DbSlice::DeleteReapedContainer (RecordDerivedDelete then Del(),
+// db_slice.cc). For those, this function's ArmTombstone() call happens AFTER the one Commit()
+// that could have consumed it, so the arm is orphaned: EndOfWriteEpoch() silently discards it as
+// unstamped (or, in a multi-key sweep, a LATER sibling key's Commit() mis-captures it with the
+// wrong stamp) -- either way the tombstone bit never actually lands in the side table, while
+// prime still loses the key, breaking the dense invariant
+// (mvcc->size() - mvcc_tombstones == prime.size(), OnCbFinishBlocking below in this file).
+// Reproduced verbatim via MvccStoreTest.ExpiryErasesTheStamp (multi_master_test.cc) with kExpired
+// temporarily added to the condition below:
+// `F... Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (1 vs. 0)`
+// -- see task-2-report.md for the full trace and verbatim output.
+//
+// Three OTHER kExpired call sites (HSetFamily::DeleteIfEmpty, SetFamily::DeleteSetIfEmpty,
+// DbSlice::UpdateExpire's EXPIRE-with-negative-ttl branch) all arm/delete BEFORE journaling, so
+// they do NOT have this hazard -- but DeleteReason alone cannot distinguish a safe kExpired call
+// site from an unsafe one here, and reordering the two unsafe sites (or splitting kExpired into
+// two reasons) is a design change beyond this task's scope. Excluding kExpired entirely is the
+// conservative, crash-free default: reverting to kExplicit-only again matches every reason's
+// pre-Task-2 behavior for kExpired specifically, at the cost of also not tombstoning the three
+// safe sites above until a controller decision re-enables (some of) kExpired.
 void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async,
-                                    [[maybe_unused]] DeleteReason reason) {
+                                    DeleteReason reason) {
   FiberAtomicGuard guard;
   size_t table_before = table->table_memory();
 
@@ -2648,9 +2750,57 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
   // carries no namespace, and the armed-key state lives only in the namespace-blind, thread-local
   // MvccStamper, not on the key itself. del_it.key() is the iterator's already-laundered
   // string_view (StringOrView) -- free, unlike the PrimeKey overloads' GetSlice() scratch-copy.
+  //
+  // drakeydb: P4-3 Task 2 -- any arm this key already has describes the value we are removing
+  // (e.g. HDEL's PostUpdate armed it just before DeleteIfEmpty got here), so drop those first --
+  // P4-1 made Disarm erase every matching arm for exactly this reason -- then re-arm as a
+  // tombstone when the reason earns one. Eviction and slot flush are capacity/topology decisions,
+  // not deletions: a peer's copy is authoritative and resurrection is desirable there, so they
+  // erase outright, same as every reason did before this task. The cap check
+  // (table->stats.mvcc_tombstones < max) is O(1) and inline on purpose: an idle-task GC never
+  // runs on a saturated server, which is exactly when tombstones accumulate, so degrading to
+  // today's resurrection-on-full-sync behavior beats an unbounded OOM -- and
+  // mvcc_tombstones_dropped makes the degradation visible instead of silent.
+  //
+  // Tombstone application (a later task) is itself LWW-guarded, which is why no ordering
+  // constraint is needed here between this side-table write, the key stream, and a concurrent
+  // journal blob from another peer link on this same shard thread.
   if (mvcc_enabled_) {
     MvccStamper::tlocal()->Disarm(table->index, del_it.key());
-    EraseMvcc(table->index, del_it.key());
+    // kExpired excluded for now -- see the STOP-finding comment above this function.
+    const bool earns_tombstone = TombstonesEnabled() && reason == DeleteReason::kExplicit;
+    if (earns_tombstone &&
+        table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+      // drakeydb: P4-3 Task 2, second STOP-finding fold-in (see task-2-report.md) -- write a
+      // zero-authority tombstone placeholder SYNCHRONOUSLY, mirroring EnsureMvcc's placeholder
+      // for a plain write (PostUpdate, below in this file). Reproduced verbatim without this:
+      // OnCbFinishBlocking's O(1) dense-invariant DCHECK runs BEFORE a command's journal commit
+      // for every command that relies on the DEFERRED auto-journal mechanism (Transaction::
+      // RunCallback calls db_slice.OnCbFinishBlocking() before LogAutoJournalOnShard --
+      // transaction.cc) -- unlike DEL, whose OpDelV2 calls RecordJournal (and so Commit()) INSIDE
+      // its own callback, before OnCbFinishBlocking ever runs. RENAME's same-shard OpRen
+      // (generic_family.cc, CO::NO_AUTOJOURNAL + ReviveAutoJournal()) is exactly such a deferred
+      // command: `SET k v` then `RENAME k r` (same shard) aborted with
+      // `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size()
+      // (2 vs. 1)` before this fix -- prime had already lost the old key, but the slot still held
+      // its live (non-tombstone) stamp and mvcc_tombstones was not yet incremented, because
+      // ArmTombstone alone (unlike EnsureMvcc) touches only the thread-local arm list, never
+      // db.mvcc itself. See task-2-report.md for the full trace and verbatim output.
+      //
+      // SetTombstone's was_tombstone guard (db_slice.cc) is what keeps this correct once the
+      // eventual Commit() overwrites this placeholder's VALUE with the entry's real, minted
+      // stamp: that second SetTombstone call finds an already-tombstoned slot and does not
+      // re-increment mvcc_tombstones. Not AsTombstone() (mvcc.h): that method's precondition is a
+      // stamp already strictly greater than the value it replaces, which a zero placeholder is
+      // not and is not trying to be -- this is a bookkeeping marker, exactly as MvccStamp{} is
+      // for EnsureMvcc's plain-write placeholder, not a delete stamp.
+      SetTombstone(table->index, del_it.key(), MvccStamp{MvccClock::kTombstoneBit, 0});
+      MvccStamper::tlocal()->ArmTombstone(table->index, del_it.key());
+    } else {
+      if (earns_tombstone)
+        ++table->stats.mvcc_tombstones_dropped;  // at the cap: degrade to erase, visibly
+      EraseMvcc(table->index, del_it.key());
+    }
   }
 
   DbTableStats& stats = table->stats;
@@ -2761,8 +2911,8 @@ void DbSlice::OnCbFinishBlocking() {
   // exactly one entry per live prime key (TEST_VerifyMvccTable, above in this file, is the O(size)
   // from-scratch proof this is derived from -- falsify by commenting out EraseMvcc in
   // PerformDeletionAtomic, below in this file; see task-10-report.md for the observed failure).
-  // mvcc_tombstones stays 0 until P4-5 gives kExplicit/kExpired deletes a tombstone instead of an
-  // erase.
+  // Since P4-3 Task 2, mvcc_tombstones counts kExplicit/kExpired deletes that got a tombstone
+  // instead of an erase; a tombstone slot has no live prime counterpart, hence the subtraction.
   //
   // PostUpdate now prepares a zero-authority side-table slot before arming a key, so density is
   // already established in the arm-before-journal window. The journal commit later changes only

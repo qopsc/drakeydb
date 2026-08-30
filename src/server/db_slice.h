@@ -366,8 +366,20 @@ class DbSlice {
   // an existing stamp. This is the only allocation-capable half of journal-driven stamping.
   void EnsureMvcc(DbIndex db_ind, std::string_view key);
   // Updates a slot prepared by EnsureMvcc. This is called only after AddLogRecord and therefore
-  // must remain allocation-free; a missing slot is a fatal invariant violation.
+  // must remain allocation-free; a missing slot is a fatal invariant violation -- except for a
+  // tombstone-flagged stamp, which this delegates to SetTombstone below (see that method's
+  // comment for why a tombstone tolerates an absent slot where a plain stamp does not).
   void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  // drakeydb: P4-3 Task 2 -- writes a tombstone slot, maintaining mvcc_entries, mvcc_tombstones,
+  // and mvcc_key_dup_bytes (the same three SetMvcc maintains, plus mvcc_tombstones, which SetMvcc
+  // never touches). Called from SetExistingMvcc above whenever the committed stamp IsTombstone()
+  // -- the live kExplicit/kExpired delete path, where the slot always already exists (the dense
+  // invariant guarantees every live prime key owns one, and PerformDeletionAtomic only
+  // ArmTombstone's a key it is deleting, which by definition still has a live prime entry at that
+  // point) -- and reserved for a later task's RDB tombstone-section apply, which is why, unlike
+  // SetExistingMvcc, this tolerates an absent slot by inserting one (mirroring SetMvcc's
+  // insert-or-overwrite shape) rather than CHECK-failing.
+  void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
   // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
@@ -395,10 +407,17 @@ class DbSlice {
   // Creates a database with index `db_ind`. If such database exists does nothing.
   void ActivateDb(DbIndex db_ind);
 
-  // drakeydb: Phase 4 -- why a key is being removed. In P4-1 every reason erases the stamp; P4-5
-  // gives kExplicit and kExpired a tombstone while kEvicted and kSlotFlush keep erasing.
-  // Eviction deliberately gets no tombstone: it is a local capacity decision, so resurrection from
-  // a peer is desirable -- the peer's copy is authoritative.
+  // drakeydb: Phase 4 -- why a key is being removed. P4-1 landed every reason erasing the stamp;
+  // P4-3 Task 2 gives kExplicit a tombstone (PerformDeletionAtomic, db_slice.cc) while kEvicted
+  // and kSlotFlush keep erasing. Eviction deliberately gets no tombstone: it is a local capacity
+  // decision, so resurrection from a peer is desirable -- the peer's copy is authoritative.
+  //
+  // kExpired is a STOP finding, not an oversight: the plan says it should tombstone too, but two
+  // real call sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journal the DEL
+  // BEFORE calling Del()/PerformDeletionAtomic, so the tombstone arm this reason would need is
+  // created too late for any Commit() to consume it -- reproduced as a dense-invariant abort, see
+  // PerformDeletionAtomic's own comment and task-2-report.md. kExpired erases, same as
+  // kEvicted/kSlotFlush, until a controller decision resolves that ordering conflict.
   enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
 
   // Deletes the iterator. The iterator must be valid.

@@ -1117,7 +1117,15 @@ TEST_F(MvccStoreTest, TableBytesAccountsForDuplicatedKeyHeapBytes) {
 // Falsification (task-4-report.md, fix round 1): moving the `-=` after Erase() makes the final
 // EXPECT_EQ below fail with mvcc_table_bytes stuck above baseline by the total un-subtracted
 // duplicated-key bytes.
+// drakeydb: P4-3 Task 2 -- since Task 2, a plain DEL tombstones (keeps the slot, and so its
+// duplicated-key heap bytes) instead of erasing. This test is about EraseMvcc's own accounting
+// specifically ("on a REAL delete", per its name), which tombstoning-by-default would defeat --
+// --multi_master_tombstone_ttl=0 opts back into the pre-Task-2 always-erase behavior for exactly
+// that purpose (see TombstonesEnabled(), multi_master.h).
 TEST_F(MvccStoreTest, EraseAccountsForDuplicatedKeyHeapBytesOnRealDelete) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 0);
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
   Run({"set", "k", "v"});
   size_t baseline = GetMetrics().db_stats[0].mvcc_table_bytes;
 
@@ -1463,28 +1471,39 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
          "unguarded arm would stamp this unrelated, never-written key instead";
 }
 
-// drakeydb: P4-1 Task 8 -- PerformDeletionAtomic must disarm and erase on every delete path, or a
-// pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp case
-// below) and the mvcc side table leaks an entry for a dead key.
-TEST_F(MvccStoreTest, DeleteErasesTheStamp) {
+// drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- PerformDeletionAtomic must disarm on every delete
+// path, or a pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp
+// case below). Before Task 2 this meant an erase and an absent stamp; since Task 2 a plain DEL
+// (kExplicit) tombstones instead -- see ExplicitAndExpiredDeletesLeaveTombstonesEvictionDoesNot
+// below for the full delete-reason matrix this is one slice of.
+TEST_F(MvccStoreTest, DeleteTombstonesTheStamp) {
   Run({"set", "k", "v"});
   ASSERT_TRUE(StampOf("k").has_value());
   Run({"del", "k"});
-  EXPECT_FALSE(StampOf("k").has_value()) << "a deleted key must not leave a stamp behind";
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value()) << "a deleted key must keep its slot, as a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
 }
 
 // OpDelV2 arms the key (post_updater.Run()) before deleting and journals after. Without the
-// disarm, Commit writes a stamp for a key that is already gone.
+// disarm, Commit would write the DEL's own stamp onto BOTH the live pre-delete arm and the
+// tombstone arm -- harmless numerically (same mvcc either way, see MvccStamperTest.
+// CommitMarksOnlyTombstoneArms in mvcc_test.cc), but Disarm existing first is still what keeps a
+// key armed twice before deletion (e.g. HDEL emptying a hash, see HdelEmptyingHashDoesNotResurrect
+// AStamp below) from leaving a stray, un-tombstoned arm for Commit to mis-stamp.
 TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
   Run({"set", "k", "v"});
   // drakeydb: review fix round 1 (minor) -- guard the precondition. Without this, a total
   // stamping failure (e.g. Arm/Commit wired wrong) would leave "k" unstamped from the SET
-  // already, and the EXPECT_FALSE below would pass for the wrong reason.
+  // already, and the assertions below would pass for the wrong reason.
   ASSERT_TRUE(StampOf("k").has_value());
   Run({"del", "k"});
-  EXPECT_FALSE(StampOf("k").has_value())
-      << "the DEL's own journal entry must not re-stamp the key it just removed";
-  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 0u);
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value())
+      << "the DEL's own journal entry must stamp the tombstone it armed, not leave the key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_entries, 1u)
+      << "the tombstone still occupies one mvcc_entries slot -- it is not erased";
 }
 
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
@@ -1500,13 +1519,55 @@ TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
 // bug, which made the suite green without the bug being fixed -- exactly the "test routes around
 // a known failure" pattern this fork's review process exists to catch. Restored to "a"/"b" so
 // this test proves the fix instead of avoiding what it was meant to cover.
+// drakeydb: P4-3 Task 2 -- RENAME's source removal goes through DelSrc/OpRen's default
+// DeleteReason::kExplicit, same as a plain DEL, so since Task 2 the source is left as a
+// tombstone rather than erased.
 TEST_F(MvccStoreTest, RenameMovesTheStampByRecreatingIt) {
   Run({"set", "a", "v"});
   ASSERT_TRUE(StampOf("a").has_value());
   Run({"rename", "a", "b"});
-  EXPECT_FALSE(StampOf("a").has_value());
+  auto src_tomb = StampOf("a");
+  ASSERT_TRUE(src_tomb.has_value()) << "the source key keeps its slot, as a tombstone";
+  EXPECT_TRUE(src_tomb->IsTombstone());
   ASSERT_TRUE(StampOf("b").has_value()) << "the destination is armed and committed by RENAME's "
                                            "own journal entry";
+  EXPECT_FALSE(StampOf("b")->IsTombstone());
+}
+
+// drakeydb: P4-3 Task 2 -- the same-shard fast path (OpRen, generic_family.cc) relies on the
+// DEFERRED auto-journal mechanism (CO::NO_AUTOJOURNAL + ReviveAutoJournal()): RENAME's own
+// journal entry is written by Transaction::LogAutoJournalOnShard AFTER OpRen's callback returns,
+// which is AFTER DbSlice::OnCbFinishBlocking's O(1) dense-invariant DCHECK already ran
+// (Transaction::RunCallback calls OnCbFinishBlocking before LogAutoJournalOnShard --
+// transaction.cc). ArmTombstone alone only touches the thread-local arm list, not db.mvcc, so
+// without PerformDeletionAtomic's synchronous placeholder write (db_slice.cc, mirroring
+// EnsureMvcc's placeholder for a plain write) the source key's slot still looked like a live,
+// non-tombstone stamp with no prime key at that checkpoint.
+//
+// Falsifying: commenting out the `SetTombstone(table->index, del_it.key(), MvccStamp{
+// MvccClock::kTombstoneBit, 0})` call in PerformDeletionAtomic (db_slice.cc) reproduces
+// `Check failed: dbp->mvcc->size() - dbp->stats.mvcc_tombstones == dbp->prime.size() (2 vs. 1)`
+// here -- see task-2-report.md for the verbatim abort.
+TEST_F(MvccStoreTest, SameShardRenameToFreshDestKeepsTheInvariant) {
+  unsigned n = shard_set->size();
+  std::string k, r;
+  for (int i = 0;; ++i) {
+    k = absl::StrCat("k", i);
+    r = absl::StrCat("r", i);
+    if (Shard(k, n) == Shard(r, n))
+      break;
+    CHECK_LT(i, 10000) << "could not find a same-shard k/r pair";
+  }
+  Run({"set", k, "v"});
+  Run({"rename", k, r});
+
+  auto src_tomb = StampOf(k);
+  ASSERT_TRUE(src_tomb.has_value());
+  EXPECT_TRUE(src_tomb->IsTombstone());
+  auto dest = StampOf(r);
+  ASSERT_TRUE(dest.has_value());
+  EXPECT_FALSE(dest->IsTombstone());
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: review fix round 2 -- the reviewer's bonus finding: GenericFamily::Copy always
@@ -1863,6 +1924,31 @@ size_t SumMvccMismatchesAcrossShards() {
 // Falsifying: see task-10-report.md for the verbatim run -- commenting out the EraseMvcc call in
 // PerformDeletionAtomic (db_slice.cc) makes this fail with a non-zero mismatch count and
 // "mvcc: stamp with no live key" LOG(ERROR) lines, one per deleted key.
+TEST_F(MvccStoreTest, DIAGNOSTIC_SameShardRenameToFreshDest) {
+  unsigned n = shard_set->size();
+  std::string k, r;
+  for (int i = 0;; ++i) {
+    k = absl::StrCat("k", i);
+    r = absl::StrCat("r", i);
+    if (Shard(k, n) == Shard(r, n)) break;
+    CHECK_LT(i, 10000);
+  }
+  std::cerr << "DIAG: k=" << k << " r=" << r << " shard=" << Shard(k, n) << std::endl;
+  Run({"set", k, "v"});
+  auto k_after_set = StampOf(k);
+  std::cerr << "DIAG: after SET, StampOf(k).has_value()=" << k_after_set.has_value() << std::endl;
+  Run({"rename", k, r});
+  auto k_after_rename = StampOf(k);
+  auto r_after_rename = StampOf(r);
+  std::cerr << "DIAG: after RENAME, StampOf(k)=" << k_after_rename.has_value()
+            << " tombstone=" << (k_after_rename ? k_after_rename->IsTombstone() : false)
+            << " StampOf(r)=" << r_after_rename.has_value()
+            << " tombstone=" << (r_after_rename ? r_after_rename->IsTombstone() : false)
+            << " mvcc_entries=" << GetMetrics().db_stats[0].mvcc_entries
+            << " mvcc_tombstones=" << GetMetrics().db_stats[0].mvcc_tombstones << std::endl;
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 TEST_F(MvccStoreTest, TableMatchesPrimeAfterMixedWorkload) {
   for (int i = 0; i < 200; ++i) {
     Run({"set", absl::StrCat("k", i), "v"});

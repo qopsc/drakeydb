@@ -4,6 +4,7 @@
 #pragma once
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/flags/declare.h>
 
 #include <cstdint>
 #include <nonstd/expected.hpp>
@@ -16,6 +17,14 @@
 #include "server/replica_types.h"
 #include "util/fibers/synchronization.h"
 
+// drakeydb: P4-3 Task 2 -- absl flags live at global scope (matching every ABSL_FLAG definition
+// in multi_master.cc, all of which sit above its `namespace dfly {`); declared here so
+// DbSlice::PerformDeletionAtomic (db_slice.cc) can read multi_master_max_tombstones directly via
+// absl::GetFlag, the same way engine_shard_set.cc's cache_mode flag is consumed elsewhere.
+ABSL_DECLARE_FLAG(uint64_t, multi_master_tombstone_ttl);
+ABSL_DECLARE_FLAG(uint64_t, multi_master_max_tombstones);
+ABSL_DECLARE_FLAG(uint32_t, multi_master_tombstone_gc_budget);
+
 namespace dfly {
 
 // --active_replica / --multi_master accessors (boot-only flags, declared in multi_master.cc).
@@ -27,6 +36,15 @@ bool IsMultiMaster();
 // --experimental_cascaded_partial_sync. Logs and returns false on a bad combination. Called from
 // main() before the proactor pool starts (see dfly_main.cc), like the TLS/snapshot validators.
 bool ValidateMultiMasterFlags();
+
+// drakeydb: P4-3 Task 2 -- true unless --multi_master_tombstone_ttl=0, an explicit operator
+// opt-out: every delete erases its side-table slot, exactly like pre-Task-2 behavior, and
+// --multi_master_max_tombstones/--multi_master_tombstone_gc_budget go unused. The ttl value
+// itself is not consumed by this task -- Task 2 only bounds tombstones by COUNT (see
+// --multi_master_max_tombstones above); the time-based GC sweep that reads the ttl is a later
+// task's job. Declared here (not a bare FLAGS_multi_master_tombstone_ttl != 0 at each call site)
+// because "is tombstoning enabled at all" is a derived condition, not a 1:1 flag read.
+bool TombstonesEnabled();
 
 struct PeerReplicaOfCmd {
   enum class Kind : uint8_t { kAdd, kRemove, kNoOne };

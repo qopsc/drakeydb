@@ -61,6 +61,20 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key) {
   armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size())});
 }
 
+// drakeydb: P4-3 Task 2 -- see the declaration (mvcc.h) for the contract. Identical to Arm()
+// above except for the tombstone flag; kept as a separate function (not an Arm(..., bool) overload
+// with a default) so every existing Arm() call site -- and its "arms a LIVE key" reading -- stays
+// unambiguous at the call site, matching ArmTombstone's own single caller being the one place that
+// actually means "arm a deletion".
+void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn armed a tombstone -- Commit() is mid-iteration over "
+                                 "armed_/arena_, both of which this call can reallocate, "
+                                 "corrupting that iteration";
+  const uint32_t off = static_cast<uint32_t>(arena_.size());
+  arena_.append(key);
+  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true});
+}
+
 // drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
 // not just the first. A key can be armed more than once before it is deleted: e.g. HDEL emptying
 // a hash arms it via ExecuteW's own it_res->post_updater.Run() (hset_family.cc), then DeleteHw
@@ -113,6 +127,13 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   DCHECK(mvcc != 0);
 
   const MvccStamp stamp{mvcc, OriginHash(origin_idx)};
+  // drakeydb: P4-3 Task 2 -- the tombstone-flagged sibling of `stamp` above, sharing the same
+  // mvcc/origin_hash and differing only in kTombstoneBit. Computed once per Commit() call (not
+  // per-arm) since every tombstone arm in this call shares the same committed mvcc/origin_idx --
+  // identical in spirit to `stamp` itself. mvcc is never re-derived or re-minted here: Commit has
+  // no clock of its own (see the DCHECK above), so a tombstone arm gets exactly the same mvcc as
+  // a plain arm in the same call would, with only the bit differing.
+  const MvccStamp tomb_stamp{mvcc | MvccClock::kTombstoneBit, stamp.origin_hash};
   ++commit_depth_;
   // RAII, not bare statements after the loop: Commit is a generic primitive and its callback may
   // throw (the unit suite exercises that contract), even though journal::RecordEntry now supplies
@@ -125,7 +146,7 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     arena_.clear();  // keeps capacity
   };
   for (const Armed& a : armed_)
-    fn(a.db_index, ArmedKey(a), stamp);
+    fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp);
 }
 
 void MvccStamper::EndOfWriteEpoch() {

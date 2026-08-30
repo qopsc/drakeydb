@@ -187,13 +187,28 @@ class MvccStamper {
   // DeleteHw, DelMutable's other callers). Duplicates are harmless: Commit() below just calls its
   // CommitFn once per arm with the same stamp.
   void Arm(DbIndex db_index, std::string_view key);
+  // drakeydb: P4-3 Task 2 -- identical bookkeeping to Arm above, except the recorded Armed entry
+  // carries tombstone=true, so Commit() ORs kTombstoneBit into the stamp it hands this key's
+  // CommitFn (only for this arm; a plain Arm() of a different key in the same Commit() call is
+  // unaffected). PerformDeletionAtomic (db_slice.cc) is the only caller: today, only a kExplicit
+  // delete re-arms the key it just Disarm()'d as a tombstone instead of erasing its side-table
+  // slot outright -- kExpired is excluded for now (see DeleteReason's comment, db_slice.h, for
+  // why). Unlike Arm(), never needs a preceding EnsureMvcc: the dense invariant (mvcc->size() -
+  // mvcc_tombstones == prime.size(), db_slice.cc) guarantees a live prime key -- the only kind
+  // PerformDeletionAtomic ever deletes -- already owns an mvcc slot.
+  void ArmTombstone(DbIndex db_index, std::string_view key);
   // Erases EVERY arm matching (db_index, key), not just the first -- see the .cc for why a
   // single-match version corrupted the mvcc side table (review wave 2, F1, CRITICAL).
   void Disarm(DbIndex db_index, std::string_view key);
 
   // The caller always supplies a non-zero stamp: the author's freshly minted HopStamp(now_ms), or
   // an applied write's verbatim author stamp -- both under the same MvccEnabled() && COMMAND gate,
-  // so Commit itself never mints (DCHECK'd in the .cc). Clears the arm list -- unconditionally,
+  // so Commit itself never mints (DCHECK'd in the .cc). For an ArmTombstone'd key, the stamp
+  // handed to that key's CommitFn call has kTombstoneBit OR'd in (mvcc itself is untouched, so a
+  // plain Arm() of a different key in the same call still gets the bare value) -- this is the
+  // ONLY place the live delete path sets that bit; see AsTombstone()'s comment above for why the
+  // RDB load path (a later task) uses a separate method instead of this one setting it twice.
+  // Clears the arm list -- unconditionally,
   // even if fn throws (RAII in the .cc): a surviving armed_ after a partial failure would either
   // let EndOfWriteEpoch() over-count already-attempted keys as unstamped, or, worse, let a LATER
   // Commit() in the same epoch (e.g. a second RecordEntry from one Lua script) stamp these
@@ -225,6 +240,10 @@ class MvccStamper {
     DbIndex db_index;
     uint32_t off;
     uint32_t len;
+    // drakeydb: P4-3 Task 2 -- true for an ArmTombstone()'d entry; Commit() ORs kTombstoneBit
+    // into the stamp it hands this arm's CommitFn call, and only this arm's. Defaulted so every
+    // existing Armed{db_index, off, len} aggregate-init (Arm(), mvcc.cc) keeps compiling unchanged.
+    bool tombstone = false;
   };
 
   std::string_view ArmedKey(const Armed& a) const {

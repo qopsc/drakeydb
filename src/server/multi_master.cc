@@ -17,9 +17,29 @@ ABSL_FLAG(bool, active_replica, false,
 ABSL_FLAG(bool, multi_master, false,
           "drakeydb: let REPLICAOF attach several masters at once (fan-in). Requires "
           "--active_replica (KeyDB multi-master). Boot-only.");
+// drakeydb: P4-3 Task 2 -- an explicit DEL keeps its mvcc side-table slot (with kTombstoneBit
+// set) instead of erasing it, so a peer's stale snapshot cannot resurrect a key we deleted.
+// kEvicted/kSlotFlush are unaffected: they always erase (see PerformDeletionAtomic, db_slice.cc).
+// kExpired is a known gap, not a design choice -- see the STOP-finding comment on
+// PerformDeletionAtomic (db_slice.cc) and DeleteReason (db_slice.h). Seconds, not ms, to match
+// --tombstone_ttl-style operator-facing flags elsewhere; a tombstone's own GC deadline math
+// (MvccStamp::DeadlineMs) takes ms, so callers convert.
+ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
+          "drakeydb: seconds a tombstone (a deleted key's stamp, kept instead of erased) is "
+          "retained before GC reclaims it. 0 disables tombstoning entirely: every delete erases "
+          "its slot immediately, same as kEvicted/kSlotFlush.");
+ABSL_FLAG(uint64_t, multi_master_max_tombstones, 1000000,
+          "drakeydb: per-shard cap on live tombstones. A delete that would push a shard's "
+          "tombstone count past this degrades to an erase instead (counted in "
+          "mvcc_tombstones_dropped), trading resurrection risk for bounded memory on a shard "
+          "that never gets an idle moment for GC to catch up.");
+ABSL_FLAG(uint32_t, multi_master_tombstone_gc_budget, 64,
+          "drakeydb: mvcc side-table buckets visited per idle-task GC tick when reclaiming "
+          "tombstones older than --multi_master_tombstone_ttl.");
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
+ABSL_DECLARE_FLAG(bool, cache_mode);
 
 namespace dfly {
 
@@ -29,6 +49,10 @@ bool IsActiveReplica() {
 
 bool IsMultiMaster() {
   return absl::GetFlag(FLAGS_multi_master);
+}
+
+bool TombstonesEnabled() {
+  return absl::GetFlag(FLAGS_multi_master_tombstone_ttl) != 0;
 }
 
 bool ValidateMultiMasterFlags() {
@@ -50,6 +74,20 @@ bool ValidateMultiMasterFlags() {
   if (absl::GetFlag(FLAGS_experimental_cascaded_partial_sync)) {
     LOG(ERROR) << "--active_replica is incompatible with --experimental_cascaded_partial_sync";
     return false;
+  }
+  // drakeydb: P4-3 Task 2 -- not a validation failure (both flags are independently legal), but a
+  // resurrection-semantics gotcha worth surfacing at boot: --cache_mode evicts under memory
+  // pressure, and eviction (kEvicted, PerformDeletionAtomic) deliberately writes no tombstone --
+  // the peer's copy is authoritative, so resurrection on that peer's next full sync is the whole
+  // point. An explicit DEL on the SAME key still tombstones normally (kExpired does not yet
+  // either, a separate, tracked gap -- see DeleteReason's comment, db_slice.h); only the
+  // memory-pressure-evicted keys are a deliberate design choice rather than a gap.
+  if (TombstonesEnabled() && absl::GetFlag(FLAGS_cache_mode)) {
+    LOG(WARNING) << "--active_replica with --cache_mode: eviction cannot free tombstones and "
+                    "evicted keys deliberately get none (kEvicted is a capacity decision, not a "
+                    "deletion), so a key evicted here for memory pressure can be resurrected by a "
+                    "peer's full sync -- an explicit DEL on this node still tombstones and is "
+                    "immune to that";
   }
   LOG(WARNING) << "--active_replica: known limitations -- a local read (e.g. HTTL) can lazily "
                   "expire and delete a peer's not-yet-expired key under clock skew, and full-sync "
