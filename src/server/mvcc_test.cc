@@ -7,6 +7,8 @@
 #include <gmock/gmock.h>
 #include <xxhash.h>
 
+#include <optional>
+
 #include "base/gtest.h"
 #include "server/table.h"
 
@@ -125,6 +127,28 @@ TEST(MvccStampTest, EqualityDistinguishesTombstoneAtEqualMvcc) {
 TEST(MvccStampTest, MsPartIgnoresTombstoneBit) {
   const MvccStamp t{(uint64_t(9'999) << MvccClock::kCounterBits) | MvccClock::kTombstoneBit, 0};
   EXPECT_EQ(t.MsPart(), 9'999u);
+}
+
+// drakeydb: P4-3 Task 1 -- the merge-LWW decision, pinned before anything in the phase calls it.
+// Owner decision, 2026-08-30: ties are won by the STORED side.
+TEST(MvccStamp, MergeAcceptsFavoursTheStoredSideOnATie) {
+  const MvccStamp a{0x1000, 0xAAAA};
+  EXPECT_FALSE(MergeAccepts(a, a));                         // exact tie -> keep stored
+  EXPECT_FALSE(MergeAccepts(MvccStamp{}, MvccStamp{}));     // {0,0} vs {0,0} -> keep stored
+  EXPECT_TRUE(MergeAccepts(std::nullopt, MvccStamp{}));     // nothing stored -> write
+  EXPECT_TRUE(MergeAccepts(MvccStamp{}, a));                // unversioned loses to stamped
+  EXPECT_FALSE(MergeAccepts(a, MvccStamp{}));               // stamped beats unversioned
+  EXPECT_TRUE(MergeAccepts(a, MvccStamp{0x1000, 0xBBBB}));  // equal mvcc, higher origin wins
+}
+
+TEST(MvccStamp, ATombstoneComparesByItsStampNotItsBit) {
+  const MvccStamp live{0x2000, 0xAAAA};
+  const MvccStamp tomb = MvccStamp{0x3000, 0xAAAA}.AsTombstone();
+  EXPECT_TRUE(tomb.IsTombstone());
+  EXPECT_EQ(tomb.Mvcc(), 0x3000u);         // bit 63 masked out of the comparison value
+  EXPECT_FALSE(MergeAccepts(tomb, live));  // newer tombstone beats an older resurrection
+  EXPECT_TRUE(MergeAccepts(tomb, MvccStamp{0x4000, 0xAAAA}));  // a later write beats the tombstone
+  EXPECT_EQ(tomb.DeadlineMs(600'000), (0x3000u >> MvccClock::kCounterBits) + 600'000);
 }
 
 TEST(NodeUuidHashTest, StableAndDistinct) {

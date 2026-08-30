@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -80,6 +81,19 @@ struct MvccStamp {
   bool Empty() const {
     return packed == 0 && origin_hash == 0;
   }
+  // Same origin_hash, packed | kTombstoneBit. This is the ONLY place that may set the tombstone
+  // bit -- it exists for the RDB LOAD path, which reconstructs a tombstone from persisted bytes.
+  // The live delete path sets the bit inside MvccStamper::Commit instead (drakeydb P4-3 Task 2);
+  // that is a second call site by necessity (Commit mints/forwards the stamp, this method does
+  // not), not a duplication of this logic.
+  MvccStamp AsTombstone() const {
+    return MvccStamp{packed | MvccClock::kTombstoneBit, origin_hash};
+  }
+  // The GC deadline for a tombstone, derived on demand rather than stored: no third field, no
+  // size growth (D-10). Callers pass the ttl; this type has no notion of "now".
+  uint64_t DeadlineMs(uint64_t ttl_ms) const {
+    return MsPart() + ttl_ms;
+  }
   // INVARIANT: a tombstone's mvcc MUST be freshly minted via MvccClock::Next -- it must never
   // reuse the mvcc of the value it deletes. operator< masks bit 63 below precisely because a
   // fresh mvcc is assumed to make (mvcc, origin_hash) unique per write; if a tombstone instead
@@ -102,6 +116,21 @@ static_assert(sizeof(MvccStamp) == 16, "side-table per-slot cost is computed fro
 static_assert(alignof(MvccStamp) == 8,
               "16-byte packing assumes 8-byte alignment; a consumer "
               "(e.g. the side table) may depend on this");
+
+// The merge-LWW decision: true when `incoming` should be written over `stored`. Shared verbatim
+// by the key path and the tombstone-apply path (drakeydb P4-3) so both compare the same way.
+//
+// Owner decision, 2026-08-30: ties are won by the STORED side -- an incoming write is accepted
+// only when it is strictly newer, never on equality, so a retried or duplicated apply can never
+// churn a key that already holds that exact stamp.
+//
+// This compares via operator< (masks bit 63, see the INVARIANT comment above), not operator==
+// (raw packed, so a tombstone never compares equal to the live stamp it replaced). That asymmetry
+// is deliberate and load-bearing: it is what lets a tombstone and a later resurrection order
+// correctly against each other here, while still being distinguishable elsewhere by equality.
+inline bool MergeAccepts(const std::optional<MvccStamp>& stored, const MvccStamp& incoming) {
+  return !stored.has_value() || *stored < incoming;
+}
 
 // Stable across processes, builds and architectures -- the hash is persisted in the RDB and
 // compared against values written by other nodes, so std::hash is unusable here.
