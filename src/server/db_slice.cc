@@ -532,9 +532,41 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
   db_arr_.emplace_back();
   CreateDb(0);
   journal_omit_redundant_writes_ = absl::GetFlag(FLAGS_journal_omit_redundant_writes);
+
+  // drakeydb: P4-3 Task 3 -- registers the tombstone GC once per shard, for the lifetime of this
+  // DbSlice: unlike AsyncDeleter's on-demand registration above (EnqueDeletion), there is no
+  // single call site that creates a tombstone -- any DEL, on any key, at any time, can -- so
+  // nothing could re-register this task once it unregistered itself. Gated on mvcc_enabled_ so a
+  // non-active node (the overwhelming majority of deployments) never pays even the cheap per-tick
+  // check: DbTable::mvcc itself is allocated on this exact same condition (DbTable::DbTable,
+  // table.cc). Safe to register here: Namespace::Namespace() (namespaces.cc) constructs every
+  // shard's DbSlice from inside shard_set->RunBriefInParallel, i.e. already on this shard's own
+  // proactor thread, matching AddOnIdleTask's InMyThread() requirement. The level this returns is
+  // never negative (see TombstoneGcStep's own comment, db_slice.h) -- more frequent while there is
+  // a backlog, least intense once caught up, but always registered. See the destructor for the
+  // matching RemoveOnIdleTask this id exists for.
+  if (mvcc_enabled_) {
+    ProactorBase* pb = ProactorBase::me();
+    DCHECK(pb);
+    tombstone_gc_task_id_ = pb->AddOnIdleTask(
+        [this]() -> int32_t { return TombstoneGcStep() ? int32_t(ProactorBase::kOnIdleMaxLevel) : 0; },
+        "mvcc_tombstone_gc");
+  }
 }
 
 DbSlice::~DbSlice() {
+  // drakeydb: P4-3 Task 3 -- unregister before anything else below runs: the on-idle task above
+  // captures `this` and reads db_arr_ (via TombstoneGcStep), so it must not still be reachable
+  // from this shard's proactor once db_arr_ starts getting torn down a few lines down. Mirrors
+  // EngineShard::StopPeriodicFiber's defrag_task_id_/huffman_check_task_id_ cleanup
+  // (engine_shard.cc) for the same reason: Namespaces::Clear() (namespaces.cc) destroys a
+  // DbSlice from inside shard_set->RunBriefInParallel -- on this shard's own, still-running
+  // proactor thread -- so without this, a later ResetService() (every test) would leave a
+  // dangling `this` in that proactor's on-idle array until some future, unrelated test's idle
+  // tick fired it.
+  if (mvcc_enabled_)
+    ProactorBase::me()->RemoveOnIdleTask(tombstone_gc_task_id_);
+
   // we do not need this code but it's easier to debug in case we encounter
   // memory allocation bugs during delete operations.
 
@@ -2742,6 +2774,66 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
       mt.TryRelocateSegment(segment->first);
   } while (mvcc_cursor && !page_usage->QuotaDepleted());
   db_table->mvcc_defrag_cursor = mvcc_cursor;
+}
+
+// drakeydb: P4-3 Task 3 -- see the declaration (db_slice.h) for the full contract. Bounds a
+// single call's work by Traverse-call count (`budget`), shared across every database rather than
+// reset per database, so "one call visits at most --multi_master_tombstone_gc_budget buckets" is
+// true regardless of how many SELECT-able databases are populated.
+//
+// Tombstone reclamation needs no ordering against the key stream or a concurrent journal blob
+// from another peer link on this same shard thread: tombstone application is itself LWW-guarded
+// (MergeAccepts, mvcc.h), and this step only ever erases a tombstone whose deadline has already
+// passed, which can never resurrect anything -- the dense invariant already treats a tombstone
+// slot as having no live prime counterpart, so removing one erases a stale marker, not a value.
+bool DbSlice::TombstoneGcStep() {
+  if (!TombstonesEnabled())
+    return false;
+  // drakeydb: P4-3 Task 3 -- deliberately does NOT gate on "is this the default namespace" the
+  // way PerformDeletionAtomic's C2 gate and TEST_VerifyMvccTable do (both db_slice.cc): an
+  // earlier version of this method checked `ns_ != &namespaces->GetDefaultNamespace()` here, and
+  // it crashed on the very first run (SIGSEGV in Namespaces::GetDefaultNamespace(), reached from
+  // this method, reached from this on-idle task, reached from RunOnIdleTasks() -- see
+  // task-3-report.md for the full trace). The global `namespaces` pointer (common.h) is assigned
+  // only after `new Namespaces()` (engine_shard_set.cc) fully returns, and that constructor's own
+  // body constructs every shard's DbSlice (Namespace::Namespace() -> RunBriefInParallel,
+  // namespaces.cc) -- including registering THIS on-idle task. A shard's proactor can go idle and
+  // fire it the moment that shard's own dispatched construction returns, independent of whether
+  // OTHER shards (or the enclosing Namespaces object) have finished, so `namespaces` can still be
+  // null the first time this runs. Safe to just not check: nothing ever calls SetTombstone for a
+  // non-default namespace (PostUpdate's own F1 gate), so IsTombstone() below is already false for
+  // every entry a non-default namespace could ever hold -- the loop below still runs for one, but
+  // finds nothing to erase, ever. Harmless, not a correctness gap; see the destructor for how this
+  // task's own lifetime is kept safe instead (RemoveOnIdleTask, not a namespace check).
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  uint32_t budget = absl::GetFlag(FLAGS_multi_master_tombstone_gc_budget);
+
+  string scratch;
+  bool pending = false;
+  for (auto& db : db_arr_) {
+    if (!db || !db->mvcc)
+      continue;
+    if (budget == 0) {
+      pending = true;  // other databases are still waiting for a future tick's budget
+      break;
+    }
+
+    const DbIndex db_ind = db->index;
+    auto& mt = *db->mvcc;
+    detail::DashCursor cursor = db->mvcc_gc_cursor;
+    do {
+      cursor = mt.Traverse(cursor, [&](auto it) {
+        if (it->second.IsTombstone() && it->second.DeadlineMs(ttl_ms) <= now_ms)
+          EraseMvcc(db_ind, it->first.GetSlice(&scratch));
+      });
+      --budget;
+    } while (cursor && budget > 0);
+    db->mvcc_gc_cursor = cursor;
+    if (cursor)
+      pending = true;  // this database's own lap did not finish within this tick's budget
+  }
+  return pending;
 }
 
 // drakeydb: Phase 4, P4-1 Task 8 -- `reason` is threaded through Del/PerformDeletionAtomic and

@@ -211,6 +211,12 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
   // the side table's, so without a second cursor here it accumulates mimalloc fragmentation for
   // the process's lifetime. See DbSlice::DefragTableSegments (db_slice.cc).
   MvccTable::Cursor mvcc_defrag_cursor;
+  // drakeydb: P4-3 Task 3 -- the idle-task tombstone GC's own traversal position, independent of
+  // mvcc_defrag_cursor above: the two walks run on unrelated schedules (this one driven by
+  // --multi_master_tombstone_gc_budget on every idle tick once mvcc_enabled_, defrag only on an
+  // explicit MEMORY DEFRAGSEGMENTS) and must not perturb each other's progress through the table.
+  // See DbSlice::TombstoneGcStep (db_slice.cc).
+  MvccTable::Cursor mvcc_gc_cursor;
 
   struct SampleTopKeys {
     TopKeys* top_keys = nullptr;

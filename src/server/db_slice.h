@@ -682,6 +682,35 @@ class DbSlice {
 
   void DefragTableSegments(DbIndex db_ind, PageUsage* page_usage);
 
+  // drakeydb: P4-3 Task 3 -- one incremental step of the idle-task tombstone GC, registered from
+  // the constructor (db_slice.cc) so it runs for the lifetime of the process on an active node.
+  // Sweeps every database's DbTable::mvcc via MvccTable::Traverse -- the same bounded,
+  // resize-safe, erase-during-traversal pattern DefragTableSegments (above) and the production
+  // expiry reaper (DeleteExpiredStep, db_slice.cc) already use -- reclaiming any tombstone whose
+  // MvccStamp::DeadlineMs(ttl_ms) has passed. Reuses EraseMvcc so mvcc_entries/mvcc_tombstones/
+  // mvcc_key_dup_bytes have exactly one place that maintains them, not a second copy here.
+  // --multi_master_tombstone_gc_budget bounds the number of Traverse calls (each visits at most
+  // one non-empty logical bucket) a single call to this makes in total, spread across however
+  // many SELECT-able databases still need visiting this tick -- not a per-database allowance, so
+  // one call has one predictable upper bound regardless of how many databases are populated.
+  // No-ops (returns false) when !TombstonesEnabled() (--multi_master_tombstone_ttl=0).
+  // Deliberately does NOT gate on "is this the default namespace" the way PerformDeletionAtomic
+  // does: doing so via namespaces->GetDefaultNamespace() crashed on the very first run, because
+  // this can be called from a shard's on-idle task before the global `namespaces` registry
+  // (common.h) even exists -- see the definition (db_slice.cc) for the full story. Harmless
+  // without that gate: a non-default namespace's mvcc entries are never tombstoned in the first
+  // place (PostUpdate's own F1 gate), so this finds nothing to erase there, ever.
+  //
+  // Returns true while at least one database's cursor has not completed a full lap this tick
+  // (either it ran out of budget mid-lap, or the budget ran out before this tick even reached
+  // it) -- matching OnIdleTask's contract (helio/util/fibers/proactor_base.h): the wrapper
+  // registered in the constructor maps that into the on-idle "level" (more frequent while there
+  // is a backlog, least intense once caught up), but NEVER negative -- unlike AsyncDeleter's
+  // on-demand registration (the precedent this mirrors, EnqueDeletion above), a tombstone can be
+  // created by any DEL on any key at any time, so nothing could re-register this task once it
+  // unregistered; it must stay registered for as long as this DbSlice exists (see the destructor).
+  bool TombstoneGcStep();
+
  private:
   friend class ReaperJournalFamilyTest;
 
@@ -813,6 +842,15 @@ class DbSlice {
   // drakeydb: P4-1 Task 5. mvcc_enabled_ caches IsActiveReplica() once at construction -- Tasks
   // 7-8's hot paths read this member, never the flag.
   bool mvcc_enabled_ = false;
+
+  // drakeydb: P4-3 Task 3 -- the id AddOnIdleTask (constructor, db_slice.cc) returns for
+  // TombstoneGcStep's registration, only meaningful when mvcc_enabled_ (that is the same
+  // condition the constructor registers under). The destructor passes it to RemoveOnIdleTask,
+  // mirroring EngineShard::StopPeriodicFiber's defrag_task_id_/huffman_check_task_id_ cleanup
+  // (engine_shard.cc) -- without it, a DbSlice torn down and rebuilt on a still-running proactor
+  // (Namespaces::Clear(), exercised by every test's ResetService()) would leave a dangling `this`
+  // captured in that proactor's on_idle_arr_, fired by a later, unrelated test.
+  uint32_t tombstone_gc_task_id_ = 0;
 
   struct Hash {
     size_t operator()(const facade::ConnectionRef& c) const {

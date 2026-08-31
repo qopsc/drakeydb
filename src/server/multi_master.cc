@@ -3,6 +3,8 @@
 
 #include "server/multi_master.h"
 
+#include <limits>
+
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/strings/str_cat.h"
@@ -26,21 +28,19 @@ ABSL_FLAG(bool, multi_master, false,
 // (MvccStamp::DeadlineMs) takes ms, so callers convert.
 ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
           "drakeydb: seconds a tombstone (a deleted key's stamp, kept instead of erased) is "
-          "meant to be retained before a GC reclaims it -- that GC is not implemented yet (a "
-          "later task), so today this value only gates TombstonesEnabled(): a tombstone is kept "
-          "indefinitely (bounded only by --multi_master_max_tombstones) until that task lands. "
-          "0 disables tombstoning entirely: every delete erases its slot immediately, same as "
-          "kEvicted/kSlotFlush.");
+          "retained before DbSlice::TombstoneGcStep's idle-task GC reclaims it. This value also "
+          "gates TombstonesEnabled(): 0 disables tombstoning entirely -- every delete erases its "
+          "slot immediately, same as kEvicted/kSlotFlush -- and the GC step itself no-ops.");
 ABSL_FLAG(uint64_t, multi_master_max_tombstones, 1000000,
           "drakeydb: per-shard cap on live tombstones. A delete that would push a shard's "
           "tombstone count past this degrades to an erase instead (counted in "
           "mvcc_tombstones_dropped), trading resurrection risk for bounded memory on a shard "
           "that never gets an idle moment for GC to catch up.");
 ABSL_FLAG(uint32_t, multi_master_tombstone_gc_budget, 64,
-          "drakeydb: mvcc side-table buckets meant to be visited per idle-task GC tick when "
-          "reclaiming tombstones older than --multi_master_tombstone_ttl. Not consumed yet: no "
-          "such GC task exists in this build (a later task adds it); this flag is defined now "
-          "so that task lands without a second round of flag plumbing.");
+          "drakeydb: mvcc side-table buckets DbSlice::TombstoneGcStep (db_slice.cc) visits per "
+          "idle-task GC tick when reclaiming tombstones older than "
+          "--multi_master_tombstone_ttl. Bounds one tick's total work, spread across however "
+          "many SELECT-able databases still need visiting -- not a per-database allowance.");
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_DECLARE_FLAG(std::string, tiered_prefix);
 ABSL_DECLARE_FLAG(bool, experimental_cascaded_partial_sync);
@@ -78,6 +78,24 @@ bool ValidateMultiMasterFlags() {
   }
   if (absl::GetFlag(FLAGS_experimental_cascaded_partial_sync)) {
     LOG(ERROR) << "--active_replica is incompatible with --experimental_cascaded_partial_sync";
+    return false;
+  }
+  // drakeydb: P4-3 Task 3 -- guards Task 1 review Finding 6 (task-1-review.md, carried forward by
+  // progress.md): a negative value reaching this uint64_t flag (e.g. built from a signed source
+  // upstream of absl's own flag parser, which already rejects a literal "-1" on the command line)
+  // sign-converts to a value near UINT64_MAX. TombstoneGcStep (db_slice.cc) multiplies this by
+  // 1000 for MvccStamp::DeadlineMs's ms domain and adds MsPart() (mvcc.h); with a wrapped ttl that
+  // sum overflows uint64 and wraps to a deadline in the PAST, so the very first GC tick would reap
+  // every live tombstone, silently reopening the resurrection window Task 2 closed.
+  // kMaxTombstoneTtlSeconds is far beyond any real deployment's needs (~136 years) but comfortably
+  // below the region where that overflow becomes reachable, so no legitimate operator value can
+  // ever trip it.
+  constexpr uint64_t kMaxTombstoneTtlSeconds = std::numeric_limits<uint32_t>::max();
+  if (absl::GetFlag(FLAGS_multi_master_tombstone_ttl) > kMaxTombstoneTtlSeconds) {
+    LOG(ERROR) << "--multi_master_tombstone_ttl ("
+               << absl::GetFlag(FLAGS_multi_master_tombstone_ttl)
+               << "s) is implausibly large -- likely a sign-converted negative value; refusing "
+                  "to start";
     return false;
   }
   // drakeydb: P4-3 Task 2 -- not a validation failure (both flags are independently legal), but a

@@ -301,6 +301,23 @@ TEST(MultiMasterFlags, ActiveReplicaRejectsIncompatibleFlags) {
   EXPECT_TRUE(ValidateMultiMasterFlags());
 }
 
+// drakeydb: P4-3 Task 3 -- Task 1 review Finding 6 (task-1-review.md): a negative value reaching
+// --multi_master_tombstone_ttl (a uint64_t flag) sign-converts to a value near UINT64_MAX.
+// TombstoneGcStep's ttl_s*1000 + MsPart() sum (db_slice.cc, mvcc.h) would overflow uint64 and
+// wrap to a deadline in the past, reaping every live tombstone on the first GC tick. absl's own
+// flag parser already rejects a literal "-1" on the command line for a uint64_t flag (it never
+// reaches AbslParseFlag's negative branch), so this exercises the belt-and-suspenders guard
+// directly via SetFlag, the same way a signed-source caller upstream of the CLI parser could.
+TEST(MultiMasterFlags, TombstoneTtlRejectsSignConvertedValue) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, static_cast<uint64_t>(-1));
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
 namespace {
 nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeer(std::vector<std::string> words) {
   CmdArgVec vec;
@@ -1618,6 +1635,75 @@ TEST_F(MvccStoreTest, DeleteAtTombstoneCapDegradesToEraseAndCountsTheDrop) {
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u)
       << "the cap must not be exceeded -- the degraded delete must not add a second tombstone";
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones_dropped, 1u);
+}
+
+// drakeydb: P4-3 Task 3 -- the idle-task GC that reclaims a tombstone once
+// MvccStamp::DeadlineMs(ttl_ms) has passed, bounded per call by
+// --multi_master_tombstone_gc_budget (MvccTable::Traverse calls, each visiting at most one
+// non-empty logical bucket). Drives DbSlice::TombstoneGcStep() directly, per shard, the same way
+// SumMvccMismatchesAcrossShards above drives TEST_VerifyMvccTable directly, rather than waiting
+// on the real on-idle scheduler (registered from the DbSlice constructor) -- this proves the step
+// function itself is correct regardless of when/how often the scheduler happens to call it.
+TEST_F(MvccStoreTest, TombstoneGcReapsExpiredTombstonesWithinBudget) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step -- see below
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  constexpr int kExpiring = 200;
+  for (int i = 0; i < kExpiring; ++i)
+    Run({"set", absl::StrCat("gc-expiring-", i), "v"});
+  for (int i = 0; i < kExpiring; ++i)
+    Run({"del", absl::StrCat("gc-expiring-", i)});
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kExpiring));
+
+  AdvanceTime(2000);  // past the 1s (1000ms) deadline the first batch's tombstones carry
+
+  constexpr int kSurvivors = 10;
+  for (int i = 0; i < kSurvivors; ++i)
+    Run({"set", absl::StrCat("gc-survivor-", i), "v"});
+  for (int i = 0; i < kSurvivors; ++i)
+    Run({"del", absl::StrCat("gc-survivor-", i)});
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kExpiring + kSurvivors))
+      << "both batches must be tombstoned (not yet reaped) before any GC step runs";
+
+  // One step per shard, budget=1 bucket: ExpireTablePolicy's kBucketNum=56 buckets/segment
+  // (dash.h) cannot possibly be drained of kExpiring=200 tombstones by visiting just one, so this
+  // is what proves the budget actually bounds a single step's work instead of draining the whole
+  // table in one call.
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kSurvivors))
+      << "a budget of 1 bucket must not reap all " << kExpiring
+      << " expired tombstones in a single step";
+
+  // Drive every shard's GC to completion. pending[shard] tracks whether THAT shard still has more
+  // work, mirroring SumMvccMismatchesAcrossShards' per-shard-slot pattern above -- each shard's
+  // own thread only ever writes its own slot, so nothing here needs a lock or an atomic.
+  std::vector<uint8_t> pending(shard_set->size(), 1);
+  auto any_pending = [&pending] {
+    for (uint8_t v : pending) {
+      if (v)
+        return true;
+    }
+    return false;
+  };
+  int guard = 0;
+  while (any_pending()) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      pending[shard->shard_id()] = db_slice.TombstoneGcStep() ? 1 : 0;
+    });
+    ASSERT_LT(++guard, 100000) << "TombstoneGcStep never converged";
+  }
+
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kSurvivors))
+      << "expired tombstones must be fully reaped; unexpired survivors from the second batch "
+         "must not be";
 }
 
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified

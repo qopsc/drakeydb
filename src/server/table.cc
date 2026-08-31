@@ -142,6 +142,7 @@ void DbTable::Clear() {
   expire_cursor = PrimeTable::Cursor::end();
   segment_defrag_cursor = PrimeTable::Cursor::end();
   mvcc_defrag_cursor = MvccTable::Cursor::end();
+  mvcc_gc_cursor = MvccTable::Cursor::end();
 }
 
 // drakeydb: P4-2, final review (Critical) -- see the declaration in table.h for why this lives on
