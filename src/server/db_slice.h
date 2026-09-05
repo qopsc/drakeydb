@@ -9,7 +9,6 @@
 
 #include <atomic>
 #include <limits>
-#include <memory>
 
 #include "common/string_or_view.h"
 #include "core/mi_memory_resource.h"
@@ -723,8 +722,21 @@ class DbSlice {
   // is a backlog, least intense once caught up), but NEVER negative -- unlike AsyncDeleter's
   // on-demand registration (the precedent this mirrors, EnqueDeletion above), a tombstone can be
   // created by any DEL on any key at any time, so nothing could re-register this task once it
-  // unregistered; it must stay registered for as long as this DbSlice exists (see the destructor).
+  // unregistered; it must stay registered until StopTombstoneGc() runs (see there).
   bool TombstoneGcStep();
+
+  // drakeydb: P4-3 Task 3, review fix round 4 -- idempotent removal of the on-idle task
+  // TombstoneGcStep() above is registered under, in the constructor (db_slice.cc). Must run on
+  // this DbSlice's own owning shard thread (AddOnIdleTask/RemoveOnIdleTask's InMyThread()
+  // requirement). Two callers, both already on that thread: ~DbSlice (below), for the
+  // ResetService() test path where a DbSlice is destroyed before EngineShard::StopPeriodicFiber
+  // ever runs for that shard -- order was already safe there, this is just cleanup; and
+  // Service::Shutdown (main_service.cc), which calls this BEFORE EngineShardSet::PreShutdown
+  // removes "defrag" -- see the definition (db_slice.cc) for why that specific order is what
+  // makes the shutdown crash this exists to fix structurally unreachable, not merely unlikely.
+  // Idempotent: a no-op if never registered (mvcc_enabled_ was false) or already stopped, so
+  // either caller may run first without the other needing to know.
+  void StopTombstoneGc();
 
  private:
   friend class ReaperJournalFamilyTest;
@@ -858,15 +870,15 @@ class DbSlice {
   // 7-8's hot paths read this member, never the flag.
   bool mvcc_enabled_ = false;
 
-  // drakeydb: P4-3 Task 3, review fix round 3 (Important, regression) -- shared with (copied
-  // into) the on-idle lambda the constructor (db_slice.cc) registers under mvcc_enabled_; null
-  // otherwise. This DbSlice's own copy is the ONLY one the destructor touches: it flips the flag
-  // false and does nothing else -- deliberately NOT calling RemoveOnIdleTask (see the destructor
-  // for why that regressed a real shutdown crash). The lambda's own copy keeps the
-  // std::atomic<bool> itself alive until the task actually runs again and self-unregisters,
-  // which may be well after this DbSlice is destroyed -- that is the point: the flag, not `this`,
-  // is what must outlive DbSlice.
-  std::shared_ptr<std::atomic<bool>> tombstone_gc_alive_;
+  // drakeydb: P4-3 Task 3, review fix round 4 -- the id AddOnIdleTask (constructor, db_slice.cc)
+  // returns for TombstoneGcStep's registration, or nullopt if never registered (mvcc_enabled_
+  // was false) or once StopTombstoneGc() has removed it. Round 3 tried a self-unregistering (-1
+  // return) task gated on a shared atomic<bool>, plus a ServerState::gstate() check, to make
+  // removal order-independent -- both removed here: they narrowed a shutdown race to a low
+  // probability (verified empirically) rather than eliminating it, and round 4's actual fix
+  // (StopTombstoneGc, called before EngineShardSet::PreShutdown removes "defrag") makes the
+  // ordering that mattered deterministic instead, so neither is needed.
+  std::optional<uint32_t> tombstone_gc_task_id_;
 
   // drakeydb: review fix (I3), Critical -- which index into db_arr_ TombstoneGcStep's for-loop
   // (db_slice.cc) starts from THIS call, giving that db first claim on the whole call's budget

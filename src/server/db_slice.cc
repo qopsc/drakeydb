@@ -533,98 +533,78 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
   CreateDb(0);
   journal_omit_redundant_writes_ = absl::GetFlag(FLAGS_journal_omit_redundant_writes);
 
-  // drakeydb: P4-3 Task 3, review fix round 3 (Important, regression) -- registers the tombstone
-  // GC once per shard, for the lifetime of this DbSlice: unlike AsyncDeleter's on-demand
-  // registration above (EnqueDeletion), there is no single call site that creates a tombstone --
-  // any DEL, on any key, at any time, can -- so nothing could re-register this task once it
-  // unregistered itself. Gated on mvcc_enabled_ so a non-active node (the overwhelming majority
-  // of deployments) never pays even the cheap per-tick check: DbTable::mvcc itself is allocated
-  // on this exact same condition (DbTable::DbTable, table.cc). Safe to register here:
-  // Namespace::Namespace() (namespaces.cc) constructs every shard's DbSlice from inside
-  // shard_set->RunBriefInParallel, i.e. already on this shard's own proactor thread, matching
-  // AddOnIdleTask's InMyThread() requirement.
+  // drakeydb: P4-3 Task 3, review fix round 4 -- registers the tombstone GC once per shard, for
+  // the lifetime of this DbSlice: unlike AsyncDeleter's on-demand registration above
+  // (EnqueDeletion), there is no single call site that creates a tombstone -- any DEL, on any
+  // key, at any time, can -- so nothing could re-register this task once it unregistered itself.
+  // Gated on mvcc_enabled_ so a non-active node (the overwhelming majority of deployments) never
+  // pays even the cheap per-tick check: DbTable::mvcc itself is allocated on this exact same
+  // condition (DbTable::DbTable, table.cc). Safe to register here: Namespace::Namespace()
+  // (namespaces.cc) constructs every shard's DbSlice from inside shard_set->RunBriefInParallel,
+  // i.e. already on this shard's own proactor thread, matching AddOnIdleTask's InMyThread()
+  // requirement.
   //
-  // The lambda captures `alive` (a copy of tombstone_gc_alive_) by value, not just `this`, and
-  // checks it FIRST: a round 1 version of this task called RemoveOnIdleTask(id) directly from the
-  // destructor instead -- correct in isolation, but it made this the SECOND on-idle task ever
-  // registered on a shard proactor (EngineShardSet::Init constructs namespaces, hence every
-  // shard's DbSlice, BEFORE StartPeriodicHeartbeatFiber registers "defrag"). At shutdown,
-  // EngineShard::StopPeriodicFiber removes "defrag" via that same explicit RemoveOnIdleTask API,
-  // which pops trailing empties but -- unlike the self-unregister path below -- never clamps
-  // ProactorBase::on_idle_next_ (helio/util/fibers/proactor_base.cc; not ours to fix). Before this
+  // This is the SECOND on-idle task ever registered on a shard proactor: EngineShardSet::Init
+  // constructs namespaces, hence every shard's DbSlice, BEFORE StartPeriodicHeartbeatFiber
+  // registers "defrag" -- so this always gets a LOWER id than "defrag" on every shard. That
+  // ordering is why removal order at shutdown matters and is now handled explicitly by
+  // StopTombstoneGc() (declaration, db_slice.h) rather than left to chance:
+  // EngineShard::StopPeriodicFiber (engine_shard.cc:492, not ours to edit) removes "defrag" via
+  // RemoveOnIdleTask, which pops trailing empties but -- a helio behavior, not ours to fix --
+  // never clamps ProactorBase::on_idle_next_ (helio/util/fibers/proactor_base.cc). Before this
   // task existed, "defrag" was the ONLY registered task, so removing it always emptied the array
-  // and RunOnIdleTasks's own `if (on_idle_arr_.empty()) return false;` short-circuited before ever
-  // touching on_idle_next_ -- structurally safe. With two tasks registered, removing just one can
-  // shrink the array to a nonzero size while on_idle_next_ still points past it, tripping
-  // `DCHECK_LT(on_idle_next_, on_idle_arr_.size())` (proactor_base.cc:190) on a later tick --
-  // reproduced as a -6 crash during Service::Shutdown, 3/12 runs of
-  // multimaster_test.py::test_narrowed_window_admits_peer_during_winners_full_sync, and disproven
-  // by disabling only this task's Add/Remove pair (14/14 passes). Returning -1 instead routes
-  // through RunOnIdleTasks's OWN removal path (same file), which -- when the returning task is
-  // the last live entry -- pops it AND resets on_idle_next_ = 0 in the same step
-  // (proactor_base.cc:199-208), leaving the shared proactor state fully clean rather than a
-  // landmine for the next registration. That matters beyond this one shutdown path:
-  // ResetService() (every test) destroys and rebuilds DbSlices on the SAME long-lived proactor
-  // threads many times per process, so any stale on_idle_next_ left behind by one cycle's
-  // teardown is exactly the kind of thing a LATER cycle's freshly registered task could inherit.
-  //
-  // The flag alone is necessary but NOT sufficient, verified empirically: gating self-
-  // unregistration ONLY on ~DbSlice's flag flip still reproduced the crash (4/20 runs after this
-  // fix's first draft) -- because "defrag" is removed by EngineShard::StopPeriodicFiber, called
-  // from EngineShardSet::PreShutdown, which runs and returns BEFORE EngineShardSet::Shutdown
-  // (which destroys DbSlice, and so is the earliest point this flag can flip) even starts --
-  // Service::Shutdown (main_service.cc) calls them as two separate, sequential top-level
-  // statements. Between them, a shard whose own PreShutdown work already finished sits idle
-  // (nothing else queued on that thread yet) and keeps calling RunOnIdleTasks while this task is
-  // STILL fully alive and still capable of doing real, non-trivial work -- so the crash's
-  // precondition (this task, in a non-last array slot, exhausting the 10us round-robin budget
-  // mid-lap and leaving on_idle_next_ unwrapped, right before "defrag" is removed) can occur
-  // entirely before the flag is ever touched. Also checking
-  // ServerState::tlocal()->gstate() == SHUTTING_DOWN closes that gap: EnterLameDuck() sets it from
-  // Service::Shutdown's very FIRST statement, dispatched to every proactor (including this shard's)
-  // before any of cluster_family_/server_family_/PreShutdown's own (slower) teardown work even
-  // starts, so this task gets many idle ticks -- on this same thread, no cross-thread signaling
-  // needed -- to notice and self-unregister well ahead of "defrag"'s removal in the common case.
-  // Kept alongside (not instead of) the flag: ResetService() (tests) tears down and rebuilds
-  // DbSlices without necessarily driving gstate through SHUTTING_DOWN, so the flag remains the
-  // only signal that covers that path.
+  // and RunOnIdleTasks's own `if (on_idle_arr_.empty()) return false;` short-circuited before
+  // ever touching on_idle_next_ -- structurally safe. Removing THIS task (id 0) while "defrag"
+  // (id 1) is still present leaves a HOLE at index 0 in an array that stays size 2 (helio only
+  // pops TRAILING empties, and index 1 is still live) -- on_idle_next_ can only ever be 0 or 1,
+  // both still valid for size 2, so no DCHECK can fire from removing this task first. "defrag"'s
+  // later removal then pops BOTH trailing empties (index 1, then the hole at index 0) down to
+  // size 0 in one call, and RunOnIdleTasks's empty check protects every tick after that,
+  // regardless of on_idle_next_'s value -- no timing argument needed, unlike round 3's self-
+  // unregistering (-1 return) task gated on a shared atomic<bool> plus a ServerState::gstate()
+  // check, which narrowed the crash's window to a low empirical probability (verified: still
+  // 4/20 with the flag alone, 0/35 with the flag+gstate combination) rather than removing it.
+  // Both are gone; see StopTombstoneGc's own comment for the deterministic replacement and
+  // where it is actually called from (main_service.cc, not this file).
   if (mvcc_enabled_) {
     ProactorBase* pb = ProactorBase::me();
     DCHECK(pb);
-    tombstone_gc_alive_ = std::make_shared<std::atomic<bool>>(true);
-    pb->AddOnIdleTask(
-        [this, alive = tombstone_gc_alive_]() -> int32_t {
-          // Checked first, before touching `this`: a tick that lands after this DbSlice is
-          // destroyed (the destructor only flips the flag, it does not -- and must not --
-          // remove the task itself; see there) must never dereference `this` again. Returning
-          // -1 here is what actually removes the task; see the registration comment above.
-          if (!alive->load())
-            return -1;
-          // See the registration comment above: this closes the gap between process-wide
-          // shutdown starting and this specific DbSlice being destroyed, without which the
-          // flag alone leaves this task alive (and able to do real, slow work) for longer than
-          // is safe.
-          const ServerState* ss = ServerState::tlocal();
-          if (ss && ss->gstate() == GlobalState::SHUTTING_DOWN)
-            return -1;
+    tombstone_gc_task_id_ = pb->AddOnIdleTask(
+        [this]() -> int32_t {
           return TombstoneGcStep() ? int32_t(ProactorBase::kOnIdleMaxLevel) : 0;
         },
         "mvcc_tombstone_gc");
   }
 }
 
+// drakeydb: P4-3 Task 3, review fix round 4 -- see the declaration (db_slice.h) for the
+// idempotency contract. Two callers, both already covered above (the registration comment):
+// ~DbSlice, immediately below, for the ResetService() test path; and Service::Shutdown
+// (main_service.cc, via Namespaces::StopTombstoneGc(), namespaces.cc), which must call this
+// BEFORE EngineShardSet::PreShutdown -- verified: PreShutdown runs at main_service.cc:1228,
+// AFTER the gstate flip (:1210) and the point this now runs from -- so THIS task, not "defrag",
+// is always the first of the two removed, making the shutdown crash this exists to fix
+// structurally unreachable rather than merely unlikely (see the registration comment above for
+// why removal order is what matters).
+void DbSlice::StopTombstoneGc() {
+  if (!tombstone_gc_task_id_)
+    return;  // never registered (mvcc_enabled_ was false), or already stopped -- idempotent.
+  DCHECK(ProactorBase::me());
+  ProactorBase::me()->RemoveOnIdleTask(*tombstone_gc_task_id_);
+  tombstone_gc_task_id_ = std::nullopt;
+}
+
 DbSlice::~DbSlice() {
-  // drakeydb: P4-3 Task 3, review fix round 3 (Important, regression) -- deliberately does NOT
-  // call RemoveOnIdleTask for this task anymore (round 1 did; see the registration comment,
-  // above in this file, for the shutdown crash that caused and how self-unregistering via a -1
-  // return fixes it). Flipping the flag is all this destructor does: db_arr_ is about to be torn
-  // down a few lines down, and the lambda checks this flag BEFORE it ever touches `this` or
-  // db_arr_ again, so a tick that lands after this point (on this same shard's still-running
-  // proactor -- Namespaces::Clear() destroys a DbSlice from inside shard_set->RunBriefInParallel,
-  // so this always runs on the owning shard's own thread) is a harmless, `this`-free -1 return,
-  // not a dangling-pointer access.
-  if (tombstone_gc_alive_)
-    tombstone_gc_alive_->store(false);
+  // drakeydb: P4-3 Task 3, review fix round 4 -- see StopTombstoneGc's own comment for the full
+  // contract; this is the ResetService() (test) path's caller. db_arr_ is about to be torn down
+  // a few lines down, and the on-idle task above reads it (via TombstoneGcStep), so it must not
+  // still be reachable from this shard's proactor once that starts -- unlike round 3, this
+  // ACTUALLY removes the task synchronously here (via RemoveOnIdleTask), rather than deferring
+  // to a later self-unregistering tick. Namespaces::Clear() (namespaces.cc) destroys a DbSlice
+  // from inside shard_set->RunBriefInParallel -- on this shard's own, still-running proactor
+  // thread -- so this always runs on the correct thread. Safe even for the production shutdown
+  // path where Service::Shutdown's own call already ran (see StopTombstoneGc): idempotent.
+  StopTombstoneGc();
 
   // we do not need this code but it's easier to debug in case we encounter
   // memory allocation bugs during delete operations.

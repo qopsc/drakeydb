@@ -117,6 +117,24 @@ void Namespaces::SetExpiredEventsRecording(bool enable) {
   });
 }
 
+// drakeydb: P4-3 Task 3, review fix round 4 -- see the declaration (namespaces.h) for why every
+// namespace's DbSlice needs this, not just the default one. Mirrors SetExpiredEventsRecording's
+// fan-out above (mu_ serializes this with concurrent namespace creation the same way); does not
+// need the lock for anything it writes -- there is no Namespaces-level state to update here --
+// but takes it anyway so a namespace cannot be inserted mid-iteration and be missed or read
+// half-constructed, exactly the hazard SetExpiredEventsRecording's own comment names.
+void Namespaces::StopTombstoneGc() {
+  util::fb2::LockGuard guard(mu_);
+  shard_set->pool()->AwaitFiberOnAll([&](unsigned, util::ProactorBase*) {
+    EngineShard* shard = EngineShard::tlocal();
+    if (shard) {
+      for (auto& entry : ABSL_TS_UNCHECKED_READ(namespaces_)) {
+        entry.second.GetDbSlice(shard->shard_id()).StopTombstoneGc();
+      }
+    }
+  });
+}
+
 Namespace& Namespaces::GetOrInsert(std::string_view ns) {
   {
     // Try to look up under a shared lock

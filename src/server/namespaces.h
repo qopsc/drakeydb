@@ -66,6 +66,16 @@ class Namespaces {
   // Applies to all namespaces and becomes the default for namespaces created later.
   void SetExpiredEventsRecording(bool enable) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // drakeydb: P4-3 Task 3, review fix round 4 -- idempotently stops the tombstone GC idle task
+  // (DbSlice::StopTombstoneGc, db_slice.h) on every (namespace, shard) DbSlice. Mirrors
+  // SetExpiredEventsRecording's fan-out shape above for the same reason: DbSlice::
+  // StopTombstoneGc's own task was registered per-DbSlice (mvcc_enabled_ is DbSlice-wide, not
+  // namespace-scoped), so a non-default namespace's DbSlice on a given shard has one too, and
+  // all of them must be stopped, not just the default namespace's. Called from Service::Shutdown
+  // (main_service.cc) BEFORE EngineShardSet::PreShutdown -- see DbSlice::StopTombstoneGc's own
+  // comment (db_slice.cc) for why that specific order matters.
+  void StopTombstoneGc() ABSL_LOCKS_EXCLUDED(mu_);
+
  private:
   util::fb2::SharedMutex mu_{};
   absl::node_hash_map<std::string, Namespace> namespaces_ ABSL_GUARDED_BY(mu_);
