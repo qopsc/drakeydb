@@ -693,13 +693,16 @@ class DbSlice {
   // one non-empty logical bucket) a single call to this makes in total, spread across however
   // many SELECT-able databases still need visiting this tick -- not a per-database allowance, so
   // one call has one predictable upper bound regardless of how many databases are populated.
-  // No-ops (returns false) when !TombstonesEnabled() (--multi_master_tombstone_ttl=0).
+  // No-ops (returns false) when !TombstonesEnabled() (--multi_master_tombstone_ttl=0). Skips a
+  // tombstone whose Mvcc() is still 0 -- PerformDeletionAtomic's synchronous placeholder, mid-
+  // epoch and not yet committed or rolled back -- since erasing it here races the delete's own
+  // journal commit; see the definition (db_slice.cc) for the full race analysis.
   // Deliberately does NOT gate on "is this the default namespace" the way PerformDeletionAtomic
-  // does: doing so via namespaces->GetDefaultNamespace() crashed on the very first run, because
-  // this can be called from a shard's on-idle task before the global `namespaces` registry
-  // (common.h) even exists -- see the definition (db_slice.cc) for the full story. Harmless
-  // without that gate: a non-default namespace's mvcc entries are never tombstoned in the first
-  // place (PostUpdate's own F1 gate), so this finds nothing to erase there, ever.
+  // does: this can be called from a shard's on-idle task before the global `namespaces` registry
+  // (common.h) is even assigned -- see the definition (db_slice.cc) for why that is reachable by
+  // construction order, not just theoretical. Harmless without that gate: a non-default
+  // namespace's mvcc entries are never tombstoned in the first place (PostUpdate's own F1 gate),
+  // so this finds nothing to erase there, ever.
   //
   // Returns true while at least one database's cursor has not completed a full lap this tick
   // (either it ran out of budget mid-lap, or the budget ran out before this tick even reached

@@ -1706,6 +1706,47 @@ TEST_F(MvccStoreTest, TombstoneGcReapsExpiredTombstonesWithinBudget) {
          "must not be";
 }
 
+// drakeydb: P4-3 Task 3, self-review finding (Critical) -- PerformDeletionAtomic (db_slice.cc)
+// writes a SYNCHRONOUS zero-authority placeholder (MvccStamp{kTombstoneBit, 0}, so Mvcc()==0)
+// before the delete's own journal commit lands. That placeholder's DeadlineMs(ttl_ms) is just
+// ttl_ms (MsPart()==0), which is always <= any real now_ms, so unless TombstoneGcStep excludes it
+// explicitly, it looks permanently "expired" for as long as it exists -- and that window is real:
+// journal::RecordEntry's AddLogRecord (journal.cc) can yield on JournalStreamer::ThrottleIfNeeded
+// whenever a peer link is backpressured, before Commit() overwrites the placeholder with the
+// delete's real, minted stamp. If TombstoneGcStep ran during that yield and erased the
+// placeholder, the eventual Commit() -> SetExistingMvcc would CHECK-fail ("MVCC slot must be
+// prepared before journal commit") the instant the delete's own commit resumed. Reproduces the
+// placeholder's exact shape directly (SetTombstone), the way PerformDeletionAtomic creates it,
+// rather than actually stalling a peer link to hit the yield window.
+TEST_F(MvccStoreTest, TombstoneGcSkipsAnUncommittedPlaceholder) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "gc-placeholder";
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
+
+    // Drive the GC to the end of its lap over this (tiny) table, so the placeholder gets at
+    // least one real chance to be (wrongly) reaped if the Mvcc() != 0 guard is missing.
+    int guard = 0;
+    while (db_slice.TombstoneGcStep())
+      ASSERT_LT(++guard, 100000) << "TombstoneGcStep never converged";
+
+    auto stamp = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stamp.has_value())
+        << "GC erased a placeholder tombstone that was still mid-epoch (uncommitted)";
+    EXPECT_TRUE(stamp->IsTombstone());
+    EXPECT_EQ(stamp->Mvcc(), 0u);
+    EXPECT_EQ(db_slice.GetStats().db_stats[0].mvcc_tombstones, 1u);
+
+    // The eventual journal commit (Commit()'s CommitFn calls this) must still find the slot --
+    // this is exactly what would CHECK-fail ("MVCC slot must be prepared before journal commit")
+    // had GC erased it out from under the pending arm.
+    db_slice.SetExistingMvcc(0, key, MvccStamp{MvccClock::kTombstoneBit | (5000ULL << 20), 42});
+  });
+}
+
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
 // empirically (temporary LOG(WARNING) of Shard(key, shard_set->size()); the reviewer separately
 // confirmed via XXH64(...) % 2) that under this fixture's shard count (2), Shard("a")=1 and

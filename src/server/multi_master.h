@@ -37,13 +37,16 @@ bool IsMultiMaster();
 // main() before the proactor pool starts (see dfly_main.cc), like the TLS/snapshot validators.
 bool ValidateMultiMasterFlags();
 
-// drakeydb: P4-3 Task 2 -- true unless --multi_master_tombstone_ttl=0, an explicit operator
+// drakeydb: P4-3 Task 2/3 -- true unless --multi_master_tombstone_ttl=0, an explicit operator
 // opt-out: every delete erases its side-table slot, exactly like pre-Task-2 behavior, and
-// --multi_master_max_tombstones/--multi_master_tombstone_gc_budget go unused. The ttl value
-// itself is not consumed by this task -- Task 2 only bounds tombstones by COUNT (see
-// --multi_master_max_tombstones above); the time-based GC sweep that reads the ttl is a later
-// task's job. Declared here (not a bare FLAGS_multi_master_tombstone_ttl != 0 at each call site)
-// because "is tombstoning enabled at all" is a derived condition, not a 1:1 flag read.
+// --multi_master_max_tombstones/--multi_master_tombstone_gc_budget go unused (DbSlice::
+// TombstoneGcStep, db_slice.cc, no-ops too, since it reads this same flag). Otherwise the ttl
+// value bounds a tombstone's lifetime: TombstoneGcStep's idle-task GC reclaims a tombstone once
+// its deadline passes, and is the primary reclaim path on a healthy server; Task 2's
+// --multi_master_max_tombstones cap is an inline backstop for a saturated shard that never gets
+// an idle moment for that GC to run. Declared here (not a bare FLAGS_multi_master_tombstone_ttl
+// != 0 at each call site) because "is tombstoning enabled at all" is a derived condition, not a
+// 1:1 flag read.
 bool TombstonesEnabled();
 
 struct PeerReplicaOfCmd {

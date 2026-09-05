@@ -549,7 +549,9 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
     ProactorBase* pb = ProactorBase::me();
     DCHECK(pb);
     tombstone_gc_task_id_ = pb->AddOnIdleTask(
-        [this]() -> int32_t { return TombstoneGcStep() ? int32_t(ProactorBase::kOnIdleMaxLevel) : 0; },
+        [this]() -> int32_t {
+          return TombstoneGcStep() ? int32_t(ProactorBase::kOnIdleMaxLevel) : 0;
+        },
         "mvcc_tombstone_gc");
   }
 }
@@ -2786,24 +2788,39 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // (MergeAccepts, mvcc.h), and this step only ever erases a tombstone whose deadline has already
 // passed, which can never resurrect anything -- the dense invariant already treats a tombstone
 // slot as having no live prime counterpart, so removing one erases a stale marker, not a value.
+//
+// GC-vs-rollback race (self-review, Critical): PerformDeletionAtomic (below in this file) writes
+// a SYNCHRONOUS zero-authority placeholder -- MvccStamp{kTombstoneBit, 0}, so Mvcc()==0 -- before
+// the delete's own journal commit lands. That placeholder's DeadlineMs(ttl_ms) is just ttl_ms
+// (MsPart()==0), which is always <= a real now_ms, so it looks permanently "expired" for as long
+// as it exists. That window is real, not theoretical: journal::RecordEntry (journal.cc) calls
+// AddLogRecord -- which can yield on JournalStreamer::ThrottleIfNeeded whenever a peer link is
+// backpressured -- BEFORE Commit() overwrites the placeholder with the delete's real, minted
+// stamp (SetExistingMvcc). If this shard's proactor goes idle during that yield and this step
+// runs, erasing the placeholder here would make the eventual SetExistingMvcc CHECK-fail ("MVCC
+// slot must be prepared before journal commit") the moment the delete's own commit resumes.
+// Guarded below by requiring Mvcc() != 0: MvccClock::Next never mints 0 for any real now_ms (see
+// mvcc.h), so this is true for every committed tombstone and false only for this placeholder --
+// which always resolves, by the end of the epoch that created it, into either a committed stamp
+// (Commit()) or an erase (EndOfWriteEpoch's rollback), so skipping it here never leaks it; a
+// later tick reaps it once it is a real, committed tombstone with a real deadline.
 bool DbSlice::TombstoneGcStep() {
   if (!TombstonesEnabled())
     return false;
   // drakeydb: P4-3 Task 3 -- deliberately does NOT gate on "is this the default namespace" the
-  // way PerformDeletionAtomic's C2 gate and TEST_VerifyMvccTable do (both db_slice.cc): an
-  // earlier version of this method checked `ns_ != &namespaces->GetDefaultNamespace()` here, and
-  // it crashed on the very first run (SIGSEGV in Namespaces::GetDefaultNamespace(), reached from
-  // this method, reached from this on-idle task, reached from RunOnIdleTasks() -- see
-  // task-3-report.md for the full trace). The global `namespaces` pointer (common.h) is assigned
-  // only after `new Namespaces()` (engine_shard_set.cc) fully returns, and that constructor's own
-  // body constructs every shard's DbSlice (Namespace::Namespace() -> RunBriefInParallel,
-  // namespaces.cc) -- including registering THIS on-idle task. A shard's proactor can go idle and
-  // fire it the moment that shard's own dispatched construction returns, independent of whether
-  // OTHER shards (or the enclosing Namespaces object) have finished, so `namespaces` can still be
-  // null the first time this runs. Safe to just not check: nothing ever calls SetTombstone for a
-  // non-default namespace (PostUpdate's own F1 gate), so IsTombstone() below is already false for
-  // every entry a non-default namespace could ever hold -- the loop below still runs for one, but
-  // finds nothing to erase, ever. Harmless, not a correctness gap; see the destructor for how this
+  // way PerformDeletionAtomic's C2 gate and TEST_VerifyMvccTable do (both db_slice.cc): the
+  // global `namespaces` pointer (common.h) is assigned only after `new Namespaces()`
+  // (engine_shard_set.cc) fully returns, and that constructor's own body constructs every shard's
+  // DbSlice (Namespace::Namespace() -> RunBriefInParallel, namespaces.cc) -- including
+  // registering THIS on-idle task, from this same shard's thread. A shard's own dispatched
+  // construction call returns -- freeing that shard's proactor to go idle and run this -- the
+  // instant THAT shard's DbSlice is built, independent of whether other shards, or the enclosing
+  // Namespaces object, have finished constructing, so `namespaces` can still be null the first
+  // time this runs (reachable by inspection of the construction order above, not empirically
+  // reproduced here). Safe to just not check: nothing ever calls SetTombstone for a non-default
+  // namespace (PostUpdate's own F1 gate), so IsTombstone() below is already false for every entry
+  // a non-default namespace could ever hold -- the loop below still runs for one, but finds
+  // nothing to erase, ever. Harmless, not a correctness gap; see the destructor for how this
   // task's own lifetime is kept safe instead (RemoveOnIdleTask, not a namespace check).
   const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
   const uint64_t now_ms = GetCurrentTimeMs();
@@ -2824,7 +2841,10 @@ bool DbSlice::TombstoneGcStep() {
     detail::DashCursor cursor = db->mvcc_gc_cursor;
     do {
       cursor = mt.Traverse(cursor, [&](auto it) {
-        if (it->second.IsTombstone() && it->second.DeadlineMs(ttl_ms) <= now_ms)
+        // Mvcc() != 0 excludes a mid-epoch, not-yet-committed placeholder -- see the
+        // GC-vs-rollback race comment above this function for why erasing it here is unsafe.
+        if (it->second.IsTombstone() && it->second.Mvcc() != 0 &&
+            it->second.DeadlineMs(ttl_ms) <= now_ms)
           EraseMvcc(db_ind, it->first.GetSlice(&scratch));
       });
       --budget;
