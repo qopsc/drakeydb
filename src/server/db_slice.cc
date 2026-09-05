@@ -1943,9 +1943,25 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
   // it. Journaling before Del() (the old order) left the arm to be picked up by some unrelated,
   // later Commit() -- or, with nothing else armed this epoch, orphaned to EndOfWriteEpoch's
   // rollback (Task 2's I3) -- either way, never this delete's own stamp. The entry's content is
-  // unchanged; only its position within this function moved, and Del() (PerformDeletionAtomic's
-  // FiberAtomicGuard) never yields, so no other journal entry can land between the old and new
-  // call sites -- what a non-active replica observes on the wire is identical. See
+  // unchanged; only its position within this function moved.
+  //
+  // review fix (I1) -- the region this reorder jumps the journal call over is NOT preemption-free:
+  // PerformDeletionAtomic's FiberAtomicGuard is scoped to that function alone, and the
+  // events_recording block above (`channel_store->SendMessages`, read-path branch only --
+  // channel_store.cc's SendMessages DCHECKs !IsFiberAtomicSection() and may suspend via
+  // EnsureMemoryBudget) sits inside the jumped-over region on the read path. What actually
+  // prevents another command's journal entry from landing in that window is NOT atomicity here,
+  // it is that nothing else CAN run that would emit one: on the read path this call is inside a
+  // Transaction's RunCallback, and running_tx_ (set for the callback's whole duration) blocks
+  // EngineShard::PollExecution/::Heartbeat from dispatching any other transaction on this shard
+  // thread until the callback returns (engine_shard.cc:614,799; see RunCallback's own comment,
+  // transaction.cc) -- a yield inside SendMessages cannot let a competing command run here. On the
+  // sweep path (ExpireAllIfNeeded/DeleteExpiredStep below) `events` is non-null, so the read-only
+  // SendMessages branch is never taken at all, and the whole traversal additionally runs under
+  // journal::DisableFlushGuard, whose ctor/dtor call
+  // EnterFiberAtomicSection/LeaveFiberAtomicSection (journal.h) -- a real atomic section spanning
+  // this call. Either way, this entry's position relative to every OTHER journal entry is
+  // unchanged, so what a non-active replica observes on the wire is identical. See
   // PerformDeletionAtomic's own comment (below in this file) for the STOP finding this resolves.
   if (auto journal = owner_->journal(); journal && journal_expiry) {
     RecordExpiryBlocking(cntx, key);
@@ -2148,11 +2164,13 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpir
       // three-arg Del(cntx, Iterator, DbTable*) overload, which reaches PerformDeletionAtomic
       // directly and never calls FindMutable/OnChange at all -- see snapshot.cc's stream_mu_
       // comment ("expiry paths emit DEL via RecordDelete directly, bypassing OnChange"). Reaping
-      // is an expiry, not a command, so it belongs on that same path: RecordDerivedDelete (the
-      // expiry-path journal primitive, sharing RecordExpiryBlocking's "safe under
-      // DisableFlushGuard because SetFlushMode(false) prevents AddLogRecord from preempting"
-      // guarantee -- see journal_slice.h) followed by the three-arg Del(), exactly mirroring
-      // ExpireIfNeeded's own record-then-delete pattern a few dozen lines above in this file. The
+      // is an expiry, not a command, so it belongs on that same path: the three-arg Del() followed
+      // by RecordDerivedDelete (the expiry-path journal primitive, sharing RecordExpiryBlocking's
+      // "safe under DisableFlushGuard because SetFlushMode(false) prevents AddLogRecord from
+      // preempting" guarantee -- see journal_slice.h), both now inside DeleteReapedContainer
+      // (below in this file) -- exactly mirroring ExpireIfNeeded's own delete-then-record order
+      // (P4-3 Task 11; this pair used to run record-then-delete, the reverse, until that task
+      // reordered both so kExpired's tombstone arm is consumed by the right Commit()). The
       // container walk itself was already confirmed non-preempting (ReaperExpireStep below calls
       // only plain synchronous C++, no fiber-aware call anywhere in DenseSet/StringMap's
       // lazy-expiry-on-iterate path) -- only the delete mechanism needed to change.
@@ -2322,12 +2340,13 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpir
         if (it->second.Size() == 0) {
           size_t freed = it->first.MallocUsed() + it->second.MallocUsed();
 
-          // Journal the derived DEL before deleting, mirroring ExpireIfNeeded's own
-          // record-then-delete order a few dozen lines above. kEntryFlagDerived (not
-          // kEntryFlagExpired) is deliberate: this is conceptually "a read would have deleted
-          // this too", the same category DeleteSetIfEmpty/DeleteIfEmpty's default `derived=true`
-          // already covers -- see those functions' own comments (set_family.cc, hset_family.cc)
-          // for why kEntryFlagExpired is reserved for whole-key TTL specifically.
+          // DeleteReapedContainer deletes first and journals the derived DEL after (P4-3 Task 11),
+          // mirroring ExpireIfNeeded's own delete-then-record order -- see that function's own
+          // comment for why. kEntryFlagDerived (not kEntryFlagExpired) is deliberate: this is
+          // conceptually "a read would have deleted this too", the same category
+          // DeleteSetIfEmpty/DeleteIfEmpty's default `derived=true` already covers -- see those
+          // functions' own comments (set_family.cc, hset_family.cc) for why kEntryFlagExpired is
+          // reserved for whole-key TTL specifically.
           DeleteReapedContainer(cntx, key, wrapped_it, options.journal_deletions);
 
           // freed bytes are folded into deleted_bytes (engine_shard.cc's eviction-goal
@@ -2401,11 +2420,19 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
   // drakeydb: P4-3 Task 11 -- delete before recording now, not after (the pre-Task-11 order this
   // replaces), matching ExpireIfNeeded's own reorder above and every kExplicit site. Do not route
   // through FindMutable or the family helpers: their OnChange callback can preempt inside the
-  // heartbeat's atomic section. See ExpireIfNeeded's own comment for the full argument (identical
-  // here): kExpired now shares PerformDeletionAtomic's earns_tombstone branch with kExplicit, so
-  // the tombstone arm placed while this key is still in `prime` must exist before this call's own
-  // Commit() runs, and Del()'s FiberAtomicGuard never yields, so no other entry can land between
-  // the erase and this record -- the wire content a non-active replica observes is unchanged.
+  // heartbeat's atomic section. kExpired now shares PerformDeletionAtomic's earns_tombstone branch
+  // with kExplicit, so the tombstone arm placed while this key is still in `prime` must exist
+  // before this call's own Commit() runs.
+  //
+  // review fix (I1) -- this function's only production caller is DeleteExpiredStep, itself only
+  // ever called from engine_shard.cc's heartbeat wrapped in journal::DisableFlushGuard
+  // (engine_shard.cc:893,993), whose ctor/dtor call EnterFiberAtomicSection/LeaveFiberAtomicSection
+  // (journal.h) for the guard's entire scope, spanning this Del()+RecordDerivedDelete pair (NOT
+  // Del()'s own FiberAtomicGuard, which is scoped to PerformDeletionAtomic alone and does not
+  // reach this far). No preemption is possible in that window, so no other journal entry can land
+  // between the erase and this record -- the wire content a non-active replica observes is
+  // unchanged. See ExpireIfNeeded's own comment above for the read-path argument, which does not
+  // apply here (this function is never reached from the read path).
   Del(cntx, it, db_arr_[cntx.db_index].get(), false, DeleteReason::kExpired);
   if (owner_->journal() && journal_deletion)
     RecordDerivedDelete(cntx, key_owned);

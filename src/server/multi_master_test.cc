@@ -2456,6 +2456,71 @@ TEST_F(MvccStoreTest, ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc) {
   EXPECT_EQ(st2->origin_hash, peer_hash);
 }
 
+// drakeydb: P4-3 Task 11, review ruling I2 -- a lazy expiry firing while applying a peer's
+// command must mint its OWN fresh self stamp for its tombstone, never inherit that peer
+// command's mvcc/origin (db_cntx.repl_mvcc/repl_origin_idx) -- an expiry is always a local
+// decision (D-10), regardless of whose command happened to trigger it. Before this fix,
+// RecordExpiryBlocking (tx_base.cc) forwarded db_cntx.repl_mvcc/repl_origin_idx unconditionally
+// (review wave 2, F4) so a sibling key swept into the SAME Commit() call mid a replicated
+// multi-key command would correctly retain the author's stamp (see
+// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc above) -- but that same forwarding also
+// reached the EXPIRING key's own tombstone arm, with no way to tell the two apart. If the
+// peer's forwarded stamp predates the expired key's own prior stamp (clock skew, or simply an
+// old command applied late, as here), the resulting tombstone is OLDER than the value it
+// replaces and a peer's still-live copy of the same key would resurrect it forever.
+//
+// The simplest repro needs no multi-key command at all: replaying a peer's plain DEL of a key
+// that is ALREADY (lazily, not yet swept) expired routes through DbSlice::FindMutable ->
+// FindInternal -> ExpireIfNeeded BEFORE GenericFamily::OpDelV2 ever gets a valid iterator for it
+// (IsValid(it.it) is false, so OpDelV2 just skips it and journals nothing of its own, per its
+// journal_args/deleted_cnt bookkeeping) -- the ONLY journal entry this command produces is the
+// expiry's own RecordExpiryBlocking call, so whatever it stamps "j" with is exactly, and only,
+// what this test observes; nothing else can overwrite it afterward the way k2's resurrection
+// masks the same transient stamp in the sibling test above.
+//
+// kOldPeerMvcc is deliberately tiny (far smaller than any real HopStamp, which is derived from
+// wall-clock ms) so a stamp that wrongly inherited it would be strictly OLDER than "j"'s own
+// prior live stamp -- exactly the resurrection hazard the ruling describes.
+//
+// Falsifying: removing the MvccStamper::tlocal()->CommitOwnTombstone(...) call at the top of
+// RecordExpiryBlocking (tx_base.cc) reproduces this -- see task-11-report.md's fix report for
+// the verbatim failure (tomb->Mvcc() comes back equal to kOldPeerMvcc, tomb->origin_hash equal
+// to peer_hash, instead of a fresh self stamp).
+TEST_F(MvccStoreTest, LazyExpiryDuringAppliedPeerCommandMintsFreshSelfStamp) {
+  constexpr uint32_t kPeerIdx = 11;
+  constexpr uint64_t kOldPeerMvcc = 0x1000ULL;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-0000-4000-8000-0000000000ee");
+  shard_set->pool()->AwaitBrief(
+      [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(kPeerIdx, peer_hash); });
+
+  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
+  // expiry tombstone's below without hardcoding this node's uuid hash (same technique as
+  // LazyExpiryEarnsATombstoneWithSelfOrigin above).
+  Run({"set", "control", "v"});
+  const uint64_t self_origin_hash = StampOf("control")->origin_hash;
+
+  Run({"set", "j", "v", "px", "10"});
+  const MvccStamp before = *StampOf("j");
+  AdvanceTime(50);
+
+  // Apply a peer's DEL of "j" as if replicated. "j" is already lazily expired but not yet
+  // physically removed, so this command's own FindMutable lookup discovers and expires it.
+  ApplyReplicatedCommand({"del", "j"}, kPeerIdx, kOldPeerMvcc);
+
+  auto tomb = StampOf("j");
+  ASSERT_TRUE(tomb.has_value())
+      << "the applied peer DEL's own lazy expiry of j must still leave a tombstone";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_GT(tomb->Mvcc(), before.Mvcc())
+      << "must be a freshly minted self stamp, strictly newer than the value it replaces -- not "
+         "the peer's old mvcc, or a peer's still-live copy of j would resurrect it";
+  EXPECT_NE(tomb->Mvcc(), kOldPeerMvcc);
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "an expiry is always a local decision -- it must be self-originated even while applying "
+         "a peer's command, never attributed to that peer";
+  EXPECT_NE(tomb->origin_hash, peer_hash);
+}
+
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
 // origin_hash correctly regardless of which shard a replicated write's key lands on, which
 // AppliedWriteKeepsAuthorStampVerbatim above cannot: that test touches exactly one key/shard, so
@@ -2672,6 +2737,10 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
       << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
          "key absent";
   EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
+         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
+         "checks above would both pass for a stuck placeholder too)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -2702,6 +2771,10 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingSetEarnsATombstone) {
       << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
          "key absent";
   EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not a stuck zero-authority "
+         "{kTombstoneBit, 0} placeholder (review M3: this test's own has_value()+IsTombstone() "
+         "checks above would both pass for a stuck placeholder too)";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -3247,10 +3320,17 @@ TEST_F(OriginJournalFamilyTest, ExpiredKeyDelCarriesExpiryFlagUserDelDoesNot) {
   // drakeydb: P4-3 Task 11, Step 4 -- the brief's explicit non-active-replica ordering check:
   // "expiring-key"'s own baseline write (its SET) must still be journaled before the expiry's
   // mutation (its DEL) after ExpireIfNeeded's reorder in db_slice.cc. That reorder only moved
-  // RecordExpiryBlocking relative to Del() INSIDE ExpireIfNeeded -- a single, non-yielding
-  // function (PerformDeletionAtomic's FiberAtomicGuard forbids preemption) -- so it cannot change
-  // this entry's position relative to any OTHER journal entry emitted from elsewhere. This fixture
-  // never sets --active_replica, so this is exactly a non-active replica's view of the wire.
+  // RecordExpiryBlocking relative to Del() INSIDE ExpireIfNeeded; PerformDeletionAtomic's
+  // FiberAtomicGuard does NOT span that whole region (it is scoped to that one function, and the
+  // jumped-over region includes the events_recording block's channel_store->SendMessages, which
+  // may suspend -- see ExpireIfNeeded's own comment, db_slice.cc, for the corrected invariant
+  // after review). What actually prevents another command's entry from landing in between here:
+  // this GET dispatches through Transaction::RunCallback, and running_tx_ (set for the callback's
+  // whole duration) blocks EngineShard::PollExecution/::Heartbeat from dispatching any OTHER
+  // transaction on this shard thread until the callback returns (engine_shard.cc:614,799) -- so no
+  // other command's journal entry can be emitted in the window this reorder crosses, regardless of
+  // whether anything inside it yields. This fixture never sets --active_replica, so this is
+  // exactly a non-active replica's view of the wire.
   int last_set_idx = -1, expiry_del_idx = -1;
   for (size_t i = 0; i < consumer.entries.size(); ++i) {
     if (consumer.entries[i].cmd == "SET")

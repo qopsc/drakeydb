@@ -149,6 +149,37 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp);
 }
 
+// drakeydb: P4-3 Task 11, review ruling I2 -- see the declaration (mvcc.h) for the contract.
+// RecordExpiryBlocking (tx_base.cc) is the only caller, and calls this BEFORE its own
+// journal::RecordEntry -> Commit(): an expiry's own tombstone must always get a freshly minted
+// self stamp, decoupled from whatever ambient (possibly a replicated peer's, possibly old) mvcc/
+// origin that later Commit() call would otherwise apply to every currently armed key, including
+// this one, if it were still armed by then.
+bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, uint64_t now_ms,
+                                     const CommitFn& fn) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "
+                                 "call erases from armed_ mid-iteration, which would corrupt an "
+                                 "outer Commit()/EndOfWriteEpoch() call's own in-progress "
+                                 "iteration over the same container";
+  for (auto it = armed_.begin(); it != armed_.end(); ++it) {
+    if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
+      const MvccStamp stamp{HopStamp(now_ms) | MvccClock::kTombstoneBit, OriginHash(0)};
+      ++commit_depth_;
+      // RAII, matching Commit()'s own exception-safety contract (fn may throw): erase this one
+      // arm and restore commit_depth_ whether or not fn throws. Does not touch arena_ -- same as
+      // Disarm() above, an erased Armed entry's slice of arena_ becomes unreferenced garbage,
+      // reclaimed wholesale the next time Commit()/EndOfWriteEpoch() clears it.
+      absl::Cleanup restore_depth = [this, it] {
+        --commit_depth_;
+        armed_.erase(it);
+      };
+      fn(db_index, ArmedKey(*it), stamp);
+      return true;
+    }
+  }
+  return false;
+}
+
 void MvccStamper::EndOfWriteEpoch(const EraseFn& erase_fn) {
   // The fourth mutator of armed_/arena_ (with Arm/Disarm/Commit, all DCHECK'd above): guards
   // against a CommitFn that calls back into EndOfWriteEpoch() while Commit() is mid-iteration,

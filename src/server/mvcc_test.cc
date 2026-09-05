@@ -425,6 +425,105 @@ TEST(MvccStamperTest, ManyArmsDoNotInvalidateEarlierOnes) {
     EXPECT_EQ(rec.writes[i].key, keys[i]) << "arm " << i << " was corrupted by later growth";
 }
 
+// drakeydb: P4-3 Task 11, review ruling I2 -- CommitOwnTombstone's headline contract: it commits
+// (and removes) ONLY the named key's own tombstone arm, minting its own stamp independently of
+// whatever an ordinary Commit() call elsewhere in the same epoch would use. A sibling PLAIN arm
+// for a different key must survive untouched, so a later ordinary Commit() call still sees and
+// correctly stamps it -- this is what lets RecordExpiryBlocking (tx_base.cc) give an expiring
+// key's own tombstone a fresh self stamp while a sibling key swept from a replicated multi-key
+// command still gets that command's real author stamp (see
+// ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc, multi_master_test.cc).
+TEST(MvccStamperTest, CommitOwnTombstoneMintsSelfStampAndSparesSiblingArm) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "sibling");
+  s->ArmTombstone(0, "victim");
+
+  constexpr uint64_t kNowMs = 123'456'789;
+  const uint64_t expected_mvcc = s->HopStamp(kNowMs);  // memoized -- CommitOwnTombstone below
+                                                       // must return this same value, not a
+                                                       // second, different mint.
+
+  Recorder victim_rec;
+  EXPECT_TRUE(s->CommitOwnTombstone(0, "victim", kNowMs, victim_rec.Fn()));
+  ASSERT_EQ(victim_rec.writes.size(), 1u);
+  EXPECT_EQ(victim_rec.writes[0].key, "victim");
+  EXPECT_TRUE(victim_rec.writes[0].stamp.IsTombstone());
+  EXPECT_EQ(victim_rec.writes[0].stamp.Mvcc(), expected_mvcc);
+  EXPECT_EQ(victim_rec.writes[0].stamp.origin_hash,
+            NodeUuidHash("6f1c4c3e-0000-4000-8000-00000000000a"))
+      << "must always be self-originated, regardless of anything an ambient replicated-apply "
+         "context might otherwise carry";
+
+  // The sibling arm must be untouched: a later, ordinary Commit() call (using a DIFFERENT
+  // mvcc/origin, standing in for a replicated command's real author stamp) must still see and
+  // correctly stamp it, and must NOT see "victim" again (already committed and removed above).
+  constexpr uint32_t kPeerIdx = 3;
+  s->RegisterOriginHash(kPeerIdx, 0xBEEFu);
+  Recorder sibling_rec;
+  s->Commit(999, kPeerIdx, sibling_rec.Fn());
+  ASSERT_EQ(sibling_rec.writes.size(), 1u)
+      << "the victim's tombstone arm must already be gone -- CommitOwnTombstone above must have "
+         "removed it, or this ordinary Commit() would see and re-stamp it too";
+  EXPECT_EQ(sibling_rec.writes[0].key, "sibling");
+  EXPECT_FALSE(sibling_rec.writes[0].stamp.IsTombstone());
+  EXPECT_EQ(sibling_rec.writes[0].stamp.Mvcc(), 999u);
+  EXPECT_EQ(sibling_rec.writes[0].stamp.origin_hash, 0xBEEFu);
+}
+
+// No tombstone arm for the named key -- e.g. TombstonesEnabled() was false, or
+// PerformDeletionAtomic degraded to a plain erase at the tombstone cap -- must be a harmless
+// no-op: no mint, no call to fn, and any OTHER arm must be left alone for the caller's own
+// subsequent ordinary Commit() to handle exactly as if CommitOwnTombstone had never been called.
+TEST(MvccStamperTest, CommitOwnTombstoneIsANoopWhenNothingIsArmed) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "unrelated");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "missing", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "the unrelated arm must have survived the no-op call above";
+  EXPECT_EQ(rec2.writes[0].key, "unrelated");
+}
+
+// A plain (non-tombstone) arm for the exact same key must not be mistaken for a tombstone arm --
+// CommitOwnTombstone's contract is specifically "the named key's TOMBSTONE arm", matching
+// ArmTombstone alone, never a plain Arm().
+TEST(MvccStamperTest, CommitOwnTombstoneIgnoresAPlainArmOfTheSameKey) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "the plain arm for \"k\" must still be armed and unstamped";
+  EXPECT_EQ(rec2.writes[0].key, "k");
+  EXPECT_FALSE(rec2.writes[0].stamp.IsTombstone());
+}
+
+// CommitOwnTombstone is scoped by db_index, matching Disarm/Commit's own scoping
+// (DisarmIsScopedToTheDbIndex above) -- a tombstone arm for the same key name on a DIFFERENT db
+// must not be matched.
+TEST(MvccStamperTest, CommitOwnTombstoneIsScopedToTheDbIndex) {
+  MvccStamper* s = FreshStamper();
+  s->ArmTombstone(1, "k");
+
+  Recorder rec;
+  EXPECT_FALSE(s->CommitOwnTombstone(0, "k", 123, rec.Fn()));
+  EXPECT_TRUE(rec.writes.empty());
+
+  Recorder rec2;
+  s->Commit(7, 0, rec2.Fn());
+  ASSERT_EQ(rec2.writes.size(), 1u) << "db=1's tombstone arm must still be armed";
+  EXPECT_EQ(rec2.writes[0].key, "k");
+  EXPECT_TRUE(rec2.writes[0].stamp.IsTombstone());
+}
+
 // ---------------------------------------------------------------------------
 // commit_depth_ reentrancy guard: fix round 2, findings 1(a) (exception safety) and 1(b)
 // (nesting-awareness). DCHECKs active in debug builds only.

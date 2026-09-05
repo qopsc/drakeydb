@@ -234,6 +234,31 @@ class MvccStamper {
   // armed_ out from under it. All four are DCHECK'd in the .cc via commit_depth_.
   void Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn);
 
+  // drakeydb: P4-3 Task 11, review ruling I2 -- commits ONLY the tombstone arm for (db_index,
+  // key), if one is currently armed, with a stamp minted/looked up independently of whatever
+  // ambient value the epoch's ordinary Commit() call above would otherwise apply to EVERY armed
+  // key. An expiry is always a local decision (D-10): its own tombstone must never inherit an
+  // applied peer command's mvcc/origin, even when a sibling key armed earlier in the SAME epoch
+  // (e.g. a replicated multi-key command's other pair, see
+  // ExpiryMidMultiKeyAppliedWriteKeepsSiblingAuthorMvcc, multi_master_test.cc) correctly must
+  // retain that peer's stamp via the ordinary Commit() call. RecordExpiryBlocking (tx_base.cc) is
+  // the only caller: it calls this BEFORE its own journal::RecordEntry -> Commit(), so by the time
+  // that generic sweep runs, this key's arm (if any) has already been removed and stamped here,
+  // and cannot be double-stamped with the wrong value.
+  //
+  // Mints HopStamp(now_ms) and looks up this node's own (kSelfIdx) origin hash internally, but
+  // ONLY if a matching tombstone arm is found -- avoids advancing the shared per-thread clock (or
+  // doing the origin lookup) on every expiry when nothing is armed (TombstonesEnabled() is false,
+  // the delete was outside the default namespace, or PerformDeletionAtomic degraded to a plain
+  // erase at the tombstone cap). Returns true if it found and committed (removing) that arm;
+  // false otherwise -- the caller has no narrower way to know which of those cases applies, and
+  // does not need to: either way, its own subsequent Commit() call is unaffected.
+  //
+  // Same reentrancy contract as Commit()/EndOfWriteEpoch() above: fn must not call Arm()/Disarm()/
+  // Commit()/EndOfWriteEpoch()/this method itself -- DCHECK'd the same way, via commit_depth_.
+  bool CommitOwnTombstone(DbIndex db_index, std::string_view key, uint64_t now_ms,
+                          const CommitFn& fn);
+
   // The fourth mutator of armed_/arena_ (Task 7 closes the gap: originally not DCHECK'd against
   // commit_depth_ like Arm()/Disarm()/Commit() above). See Commit()'s comment for why a CommitFn
   // calling this would corrupt Commit()'s own in-progress iteration.
