@@ -544,29 +544,46 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
   // i.e. already on this shard's own proactor thread, matching AddOnIdleTask's InMyThread()
   // requirement.
   //
-  // This is the SECOND on-idle task ever registered on a shard proactor: EngineShardSet::Init
-  // constructs namespaces, hence every shard's DbSlice, BEFORE StartPeriodicHeartbeatFiber
-  // registers "defrag" -- so this always gets a LOWER id than "defrag" on every shard. That
-  // ordering is why removal order at shutdown matters and is now handled explicitly by
-  // StopTombstoneGc() (declaration, db_slice.h) rather than left to chance:
-  // EngineShard::StopPeriodicFiber (engine_shard.cc:492, not ours to edit) removes "defrag" via
-  // RemoveOnIdleTask, which pops trailing empties but -- a helio behavior, not ours to fix --
-  // never clamps ProactorBase::on_idle_next_ (helio/util/fibers/proactor_base.cc). Before this
-  // task existed, "defrag" was the ONLY registered task, so removing it always emptied the array
-  // and RunOnIdleTasks's own `if (on_idle_arr_.empty()) return false;` short-circuited before
-  // ever touching on_idle_next_ -- structurally safe. Removing THIS task (id 0) while "defrag"
-  // (id 1) is still present leaves a HOLE at index 0 in an array that stays size 2 (helio only
-  // pops TRAILING empties, and index 1 is still live) -- on_idle_next_ can only ever be 0 or 1,
-  // both still valid for size 2, so no DCHECK can fire from removing this task first. "defrag"'s
-  // later removal then pops BOTH trailing empties (index 1, then the hole at index 0) down to
-  // size 0 in one call, and RunOnIdleTasks's empty check protects every tick after that,
-  // regardless of on_idle_next_'s value -- no timing argument needed, unlike round 3's self-
-  // unregistering (-1 return) task gated on a shared atomic<bool> plus a ServerState::gstate()
-  // check, which narrowed the crash's window to a low empirical probability (verified: still
-  // 4/20 with the flag alone, 0/35 with the flag+gstate combination) rather than removing it.
-  // Both are gone; see StopTombstoneGc's own comment for the deterministic replacement and
-  // where it is actually called from (main_service.cc, not this file).
-  if (mvcc_enabled_) {
+  // ---- on-idle registration/removal ordering (round 4, restated round 5 R3) ----
+  //
+  // helio's RemoveOnIdleTask (helio/util/fibers/proactor_base.cc, not ours to edit) pops only
+  // TRAILING empty slots and never clamps ProactorBase::on_idle_next_, while RunOnIdleTasks
+  // short-circuits on an EMPTY array before it compares that cursor against the array's size.
+  // The invariant that keeps both safe is therefore narrow and worth stating exactly:
+  //
+  //     never remove a TRAILING on-idle task while an EARLIER-registered one is still live.
+  //
+  // Violating it shrinks the array below a cursor that may still point at the old top index, and
+  // a later tick indexes past the end (debug: DCHECK_LT at proactor_base.cc; release: an
+  // out-of-bounds read). This is not a claim that any particular ordering is "impossible to get
+  // wrong" -- it is the one property every registration site here has to keep.
+  //
+  // How the DEFAULT namespace's GC task keeps it: EngineShardSet::Init constructs `namespaces`,
+  // hence the default namespace's per-shard DbSlices (engine_shard_set.cc:121), BEFORE
+  // StartPeriodicHeartbeatFiber registers "defrag" (:130) -- so this task is id 0 and "defrag"
+  // is id 1 on every shard. Service::Shutdown removes id 0 first, via Namespaces::
+  // StopTombstoneGc (main_service.cc, ahead of shard_set->PreShutdown()), which leaves a HOLE at
+  // index 0 in an array that stays size 2: nothing is popped, on_idle_next_ can only be 0 or 1,
+  // both still in range. "defrag"'s later removal pops BOTH trailing empties down to size 0 in
+  // one call, after which RunOnIdleTasks's empty check covers every tick regardless of the
+  // cursor. Registered first, removed first: the invariant holds without a timing argument --
+  // unlike round 3's self-unregistering (-1 return) task gated on a shared atomic<bool> plus a
+  // ServerState::gstate() check, which only narrowed the window to a low empirical probability
+  // (verified: still 4/20 with the flag alone, 0/35 with flag+gstate). Both are gone.
+  //
+  // Why NON-DEFAULT namespaces register nothing (round 5, R1): a namespace created at RUNTIME --
+  // ACL `NAMESPACE:` on AUTH (server_family.cc), or a test's namespaces->GetOrInsert() -- builds
+  // its DbSlices AFTER "defrag" is already registered, so its GC task would take an id ABOVE
+  // "defrag"'s. Namespaces::StopTombstoneGc's fan-out would then remove that TRAILING task while
+  // "defrag" and the default namespace's own GC are still live -- exactly the violation above.
+  // Not registering is also strictly free: every tombstone producer is already gated on
+  // `ns_ == &namespaces->GetDefaultNamespace()` (PostUpdate and PerformDeletionAtomic in this
+  // file), so a non-default namespace's side table never holds a tombstone for this task to
+  // reclaim. ns_->IsDefault() is used instead of that same `&namespaces->GetDefaultNamespace()`
+  // comparison because `namespaces` is NOT yet constructed here while the DEFAULT namespace's
+  // own DbSlice is being built -- it is created from inside `new Namespaces()` -- so the global
+  // is null at that moment; Namespace carries the answer down instead (namespaces.h).
+  if (mvcc_enabled_ && ns_->IsDefault()) {
     ProactorBase* pb = ProactorBase::me();
     DCHECK(pb);
     tombstone_gc_task_id_ = pb->AddOnIdleTask(
@@ -577,15 +594,22 @@ DbSlice::DbSlice(uint32_t index, bool cache_mode, EngineShard* owner, Namespace*
   }
 }
 
-// drakeydb: P4-3 Task 3, review fix round 4 -- see the declaration (db_slice.h) for the
-// idempotency contract. Two callers, both already covered above (the registration comment):
-// ~DbSlice, immediately below, for the ResetService() test path; and Service::Shutdown
-// (main_service.cc, via Namespaces::StopTombstoneGc(), namespaces.cc), which must call this
-// BEFORE EngineShardSet::PreShutdown -- verified: PreShutdown runs at main_service.cc:1228,
-// AFTER the gstate flip (:1210) and the point this now runs from -- so THIS task, not "defrag",
-// is always the first of the two removed, making the shutdown crash this exists to fix
-// structurally unreachable rather than merely unlikely (see the registration comment above for
-// why removal order is what matters).
+// drakeydb: P4-3 Task 3, review fix round 4; wording corrected round 5 (R3) -- see the
+// declaration (db_slice.h) for the idempotency contract. Two callers, both already covered above
+// (the registration comment): ~DbSlice, immediately below, for the ResetService() test path; and
+// Service::Shutdown (main_service.cc, via Namespaces::StopTombstoneGc(), namespaces.cc), which
+// must call this BEFORE EngineShardSet::PreShutdown -- verified: PreShutdown runs at
+// main_service.cc:1238, AFTER the gstate flip (:1210) and after the point this now runs from
+// (:1236). That order is what upholds the registration comment's invariant -- never remove a
+// trailing on-idle task while an earlier-registered one is still live -- for the only task this
+// ever removes: the default namespace's, registered ahead of "defrag" and now removed ahead of
+// it too. It does NOT make on-idle removal safe in general; a task registered after "defrag"
+// would still violate the invariant, which is why non-default namespaces register none.
+//
+// Test harnesses that tear an EngineShardSet down without going through Service::Shutdown must
+// call this (via Namespaces::StopTombstoneGc) before shard_set->PreShutdown() for the same
+// reason -- see JournalStreamerPeerFilterTest::TearDown (journal/journal_test.cc), the one such
+// fixture that enables --active_replica and therefore actually registers this task.
 void DbSlice::StopTombstoneGc() {
   if (!tombstone_gc_task_id_)
     return;  // never registered (mvcc_enabled_ was false), or already stopped -- idempotent.

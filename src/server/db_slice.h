@@ -709,11 +709,12 @@ class DbSlice {
   // the budget/quota across calls (review fix I3, tombstone_gc_db_index_ below) rather than
   // always starting at database 0, which could starve every later database indefinitely.
   // Deliberately does NOT gate on "is this the default namespace" the way PerformDeletionAtomic
-  // does: this can be called from a shard's on-idle task before the global `namespaces` registry
-  // (common.h) is even assigned -- see the definition (db_slice.cc) for why that is reachable by
-  // construction order, not just theoretical. Harmless without that gate: a non-default
-  // namespace's mvcc entries are never tombstoned in the first place (PostUpdate's own F1 gate),
-  // so this finds nothing to erase there, ever.
+  // does, and does not need to: as of review fix round 5 (R1) it is only ever REGISTERED on the
+  // default namespace's DbSlices (the constructor gates on Namespace::IsDefault(), db_slice.cc),
+  // so a non-default namespace never reaches this at all. Keeping the body namespace-agnostic
+  // also keeps it safe for the direct unit-test calls in multi_master_test.cc, which drive it
+  // without an on-idle task, and avoids a `namespaces->GetDefaultNamespace()` dereference on a
+  // registry that is null while the default namespace's own DbSlices are being constructed.
   //
   // Returns true while at least one database's cursor has not completed a full lap this tick
   // (either it ran out of budget mid-lap, or the budget ran out before this tick even reached
@@ -725,18 +726,31 @@ class DbSlice {
   // unregistered; it must stay registered until StopTombstoneGc() runs (see there).
   bool TombstoneGcStep();
 
-  // drakeydb: P4-3 Task 3, review fix round 4 -- idempotent removal of the on-idle task
-  // TombstoneGcStep() above is registered under, in the constructor (db_slice.cc). Must run on
-  // this DbSlice's own owning shard thread (AddOnIdleTask/RemoveOnIdleTask's InMyThread()
-  // requirement). Two callers, both already on that thread: ~DbSlice (below), for the
-  // ResetService() test path where a DbSlice is destroyed before EngineShard::StopPeriodicFiber
-  // ever runs for that shard -- order was already safe there, this is just cleanup; and
-  // Service::Shutdown (main_service.cc), which calls this BEFORE EngineShardSet::PreShutdown
-  // removes "defrag" -- see the definition (db_slice.cc) for why that specific order is what
-  // makes the shutdown crash this exists to fix structurally unreachable, not merely unlikely.
-  // Idempotent: a no-op if never registered (mvcc_enabled_ was false) or already stopped, so
-  // either caller may run first without the other needing to know.
+  // drakeydb: P4-3 Task 3, review fix round 4; wording corrected round 5 (R3) -- idempotent
+  // removal of the on-idle task TombstoneGcStep() above is registered under, in the constructor
+  // (db_slice.cc). Must run on this DbSlice's own owning shard thread (AddOnIdleTask/
+  // RemoveOnIdleTask's InMyThread() requirement). Two callers, both already on that thread:
+  // ~DbSlice (below), for the ResetService() test path where a DbSlice is destroyed before
+  // EngineShard::StopPeriodicFiber ever runs for that shard -- order was already safe there,
+  // this is just cleanup; and Service::Shutdown (main_service.cc), which calls this BEFORE
+  // EngineShardSet::PreShutdown removes "defrag". That order upholds the on-idle invariant
+  // spelled out at the registration site (db_slice.cc): never remove a trailing on-idle task
+  // while an earlier-registered one is still live. It holds for THIS task because the task is
+  // only ever registered on the default namespace's DbSlices, ahead of "defrag", and removed
+  // ahead of "defrag" -- not because on-idle removal is order-independent in general.
+  // Idempotent: a no-op if never registered (mvcc_enabled_ was false, or this is a non-default
+  // namespace) or already stopped, so either caller may run first without the other knowing.
   void StopTombstoneGc();
+
+  // drakeydb: P4-3 Task 3, review fix round 5 (R1) -- whether this DbSlice currently owns a
+  // registered tombstone GC on-idle task. Tests only: the registration gate (mvcc_enabled_ &&
+  // ns_->IsDefault(), db_slice.cc) is what keeps Namespaces::StopTombstoneGc from removing a
+  // trailing on-idle task registered above "defrag", and that gate has no other observable
+  // effect -- a non-default namespace's tombstone count is already always 0 -- so without this
+  // accessor the gate cannot be pinned by a test at all.
+  bool TEST_HasTombstoneGcTask() const {
+    return tombstone_gc_task_id_.has_value();
+  }
 
  private:
   friend class ReaperJournalFamilyTest;
@@ -872,7 +886,8 @@ class DbSlice {
 
   // drakeydb: P4-3 Task 3, review fix round 4 -- the id AddOnIdleTask (constructor, db_slice.cc)
   // returns for TombstoneGcStep's registration, or nullopt if never registered (mvcc_enabled_
-  // was false) or once StopTombstoneGc() has removed it. Round 3 tried a self-unregistering (-1
+  // was false, or this is a non-default namespace -- round 5, R1) or once StopTombstoneGc() has
+  // removed it. Round 3 tried a self-unregistering (-1
   // return) task gated on a shared atomic<bool>, plus a ServerState::gstate() check, to make
   // removal order-independent -- both removed here: they narrowed a shutdown race to a low
   // probability (verified empirically) rather than eliminating it, and round 4's actual fix

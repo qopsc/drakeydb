@@ -1225,14 +1225,18 @@ void Service::Shutdown() {
 
   engine_varz.reset();
 
-  // drakeydb: P4-3 Task 3, review fix round 4 -- must run BEFORE shard_set->PreShutdown() below,
-  // which calls EngineShard::StopPeriodicFiber (engine_shard.cc:492) on every shard, removing
-  // its "defrag" on-idle task. DbSlice's own tombstone-GC on-idle task always registers with a
-  // LOWER id than "defrag" (DbSlice's constructor runs before StartPeriodicHeartbeatFiber,
-  // engine_shard_set.cc), so removing "defrag" first (the previous order) can leave a stale
-  // ProactorBase::on_idle_next_ pointing past a shrunk-but-nonempty on-idle array -- see
-  // DbSlice::StopTombstoneGc's own comment (db_slice.cc) for the full mechanism and why removing
-  // the GC task first instead makes that structurally unreachable rather than merely unlikely.
+  // drakeydb: P4-3 Task 3, review fix round 4; wording corrected round 5 (R3) -- must run BEFORE
+  // shard_set->PreShutdown() below, which calls EngineShard::StopPeriodicFiber
+  // (engine_shard.cc:492) on every shard, removing its "defrag" on-idle task. helio's
+  // RemoveOnIdleTask pops only TRAILING empty slots and never clamps
+  // ProactorBase::on_idle_next_, so the invariant to keep is: never remove a trailing on-idle
+  // task while an earlier-registered one is still live. The default namespace's tombstone-GC
+  // task registers with a LOWER id than "defrag" (DbSlice's constructor runs before
+  // StartPeriodicHeartbeatFiber, engine_shard_set.cc) -- removing "defrag" first, the previous
+  // order, would shrink the array below a possibly-stale cursor; removing the GC task first
+  // leaves a hole instead and pops nothing. Non-default namespaces register no GC task, so this
+  // fan-out never removes a task above "defrag". See DbSlice's constructor (db_slice.cc) for the
+  // full mechanism.
   namespaces->StopTombstoneGc();
 
   shard_set->PreShutdown();

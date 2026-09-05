@@ -1545,6 +1545,70 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
          "unguarded arm would stamp this unrelated, never-written key instead";
 }
 
+// drakeydb: P4-3 Task 3, review fix round 5 (R1) -- a namespace created at RUNTIME must register
+// no tombstone-GC on-idle task on any shard.
+//
+// helio's RemoveOnIdleTask (proactor_base.cc, not ours to edit) pops only TRAILING empty slots and
+// never clamps ProactorBase::on_idle_next_, while RunOnIdleTasks short-circuits only on a fully
+// EMPTY array. The invariant every registration site must keep is therefore: never remove a
+// trailing on-idle task while an earlier-registered one is still live -- doing so shrinks the
+// array below a cursor that may still point at the old top index, and a later idle tick indexes
+// past the end (DCHECK_LT in a debug build, an out-of-bounds read in a release one).
+//
+// The DEFAULT namespace's task keeps that invariant by construction order: EngineShardSet::Init
+// builds its DbSlices (engine_shard_set.cc) BEFORE StartPeriodicHeartbeatFiber registers
+// "defrag", so it is id 0 and "defrag" is id 1, and Service::Shutdown removes id 0 first
+// (main_service.cc, via Namespaces::StopTombstoneGc, ahead of PreShutdown) -- leaving a hole,
+// popping nothing. A namespace created at runtime -- production reaches this through
+// ServerFamily::DoAuth's `cntx->ns = &namespaces->GetOrInsert(cred.ns)` for an ACL user carrying
+// a NAMESPACE: directive (server_family.cc), which is exactly the GetOrInsert call this test
+// makes -- builds its DbSlices AFTER "defrag" is already registered, so its task would land at an
+// id ABOVE "defrag"'s. The same StopTombstoneGc fan-out would then remove a TRAILING task with
+// two live entries beneath it, and the array WOULD shrink.
+//
+// This test pins the gate rather than the abort deliberately: the abort additionally requires
+// on_idle_next_ to be sitting at the top index at that exact moment (the budget-exhausted exit),
+// which nothing in reach can force without editing helio. The gate is the property that makes the
+// abort unreachable, and it is otherwise entirely invisible -- a non-default namespace's
+// tombstone count is already always 0 (the F1 gate asserted below), so nothing else observes
+// whether the task exists.
+TEST_F(MvccStoreTest, NonDefaultNamespaceRegistersNoTombstoneGcTask) {
+  Namespace& ns1 = namespaces->GetOrInsert("ns1-gc");
+
+  for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
+    shard_set->Await(sid, [&] {
+      EXPECT_TRUE(namespaces->GetDefaultNamespace().GetDbSlice(sid).TEST_HasTombstoneGcTask())
+          << "sanity, shard " << sid
+          << ": the default namespace on an --active_replica node must register the GC task, or "
+             "the non-default assertion below passes vacuously";
+      EXPECT_FALSE(ns1.GetDbSlice(sid).TEST_HasTombstoneGcTask())
+          << "shard " << sid
+          << ": a runtime-created namespace registers its GC task ABOVE \"defrag\", so removing "
+             "it at shutdown pops a trailing slot while live tasks remain -- it must not register "
+             "one at all";
+    });
+  }
+
+  // The gate must not have changed what a non-default namespace's deletes do: still erase, never
+  // tombstone (PerformDeletionAtomic's own F1 gate, db_slice.cc), exactly as before this fix.
+  const std::string_view key = "ns-gc-key";
+  ASSERT_EQ(RunViaNamespace(&ns1, {"set", key, "v"}), "OK");
+  ASSERT_EQ(RunViaNamespace(&ns1, {"del", key}).GetInt(), 1);
+
+  const ShardId sid = Shard(key, shard_set->size());
+  std::optional<MvccStamp> ns1_stamp;
+  size_t ns1_tombstones = 0;
+  shard_set->Await(sid, [&] {
+    ns1_stamp = ns1.GetDbSlice(sid).GetMvcc(0, key);
+    ns1_tombstones = ns1.GetDbSlice(sid).GetStats().db_stats[0].mvcc_tombstones;
+  });
+  EXPECT_FALSE(ns1_stamp.has_value())
+      << "a non-default-namespace DEL must leave no slot behind at all -- not a tombstone the "
+         "(now absent) GC task would have had to reclaim";
+  EXPECT_EQ(ns1_tombstones, 0u);
+  EXPECT_THAT(RunViaNamespace(&ns1, {"get", key}), ArgType(RespExpr::NIL));
+}
+
 // drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- PerformDeletionAtomic must disarm on every delete
 // path, or a pending arm can re-stamp a key that no longer exists (see the DoesNotResurrectAStamp
 // case below). Before Task 2 this meant an erase and an absent stamp; since Task 2 a plain DEL
