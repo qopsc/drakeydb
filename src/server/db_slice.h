@@ -429,12 +429,13 @@ class DbSlice {
   // and kSlotFlush keep erasing. Eviction deliberately gets no tombstone: it is a local capacity
   // decision, so resurrection from a peer is desirable -- the peer's copy is authoritative.
   //
-  // kExpired is a STOP finding, not an oversight: the plan says it should tombstone too, but two
-  // real call sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journal the DEL
-  // BEFORE calling Del()/PerformDeletionAtomic, so the tombstone arm this reason would need is
-  // created too late for any Commit() to consume it -- reproduced as a dense-invariant abort, see
-  // PerformDeletionAtomic's own comment and task-2-report.md. kExpired erases, same as
-  // kEvicted/kSlotFlush, until a controller decision resolves that ordering conflict.
+  // kExpired was a Task 2 STOP finding, not an oversight: the plan says it should tombstone too,
+  // but two real call sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journaled
+  // the DEL BEFORE calling Del()/PerformDeletionAtomic, so the tombstone arm this reason needs
+  // was created too late for any Commit() to consume it -- see PerformDeletionAtomic's own
+  // comment and task-2-report.md. P4-3 Task 11 reordered both sites (delete first, journal after,
+  // matching every kExplicit site) and closed the finding: kExpired now tombstones exactly like
+  // kExplicit, via the same earns_tombstone branch in PerformDeletionAtomic.
   enum class DeleteReason : uint8_t { kExplicit, kExpired, kEvicted, kSlotFlush };
 
   // Deletes the iterator. The iterator must be valid.

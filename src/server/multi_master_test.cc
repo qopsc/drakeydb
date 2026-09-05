@@ -1586,12 +1586,20 @@ TEST_F(MvccStoreTest, DeleteInSameCallbackDoesNotResurrectAStamp) {
 // peer's next full sync is the intended outcome, and the slot is erased exactly as every reason
 // was before this task (see EvictedDeleteLeavesNoSlotOrTombstoneCredit below).
 //
-// kExpired is DELIBERATELY not exercised here as a tombstoning reason -- see the STOP-finding
-// comment on PerformDeletionAtomic (db_slice.cc) and this task's report: two real kExpired call
-// sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journal the DEL before calling
-// Del()/PerformDeletionAtomic, so the tombstone arm that reason would need is created too late
-// for any Commit() to consume it. ExpiryErasesTheStamp above already pins kExpired's unchanged
-// (erase) behavior and doubles as this STOP finding's regression guard.
+// kExpired is DELIBERATELY not exercised here as a tombstoning reason -- it shares
+// PerformDeletionAtomic's earns_tombstone branch with kExplicit (db_slice.cc), so
+// ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue below only needs to pin kExplicit's own
+// stamp-freshness property; kExpired's equivalent coverage is
+// LazyExpiryEarnsATombstoneWithSelfOrigin (this file) and
+// ReaperJournalFamilyTest.MemberExpiryReaperDeleteEarnsATombstone (further down this file).
+//
+// drakeydb: P4-3 Task 11 -- until this task, kExpired was excluded here on purpose: two real
+// call sites (DbSlice::ExpireIfNeeded, DbSlice::DeleteReapedContainer) journaled the DEL before
+// calling Del()/PerformDeletionAtomic, so the tombstone arm that reason would need was created
+// too late for any Commit() to consume it (the STOP finding from Task 2's report). Task 11
+// reordered both sites -- delete first, journal after, matching every kExplicit site -- closing
+// that gap; see the reorder's own comments in db_slice.cc for the fix and DeleteReason's comment
+// (db_slice.h) for the resolution.
 TEST_F(MvccStoreTest, ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue) {
   Run({"set", "gone", "v"});
   const MvccStamp before = *StampOf("gone");
@@ -2238,12 +2246,40 @@ TEST_F(MvccStoreTest, CopyStampsTheDestinationRegardlessOfShardPlacement) {
                                            "own journal entry (via the same DeserializeDest)";
 }
 
-TEST_F(MvccStoreTest, ExpiryErasesTheStamp) {
+// drakeydb: P4-3 Task 11 -- resolves the STOP finding Task 2 left behind (see
+// ExplicitDeleteLeavesATombstoneAtLeastAsNewAsTheValue's comment above and DeleteReason's
+// comment, db_slice.h). DbSlice::ExpireIfNeeded now calls Del()/PerformDeletionAtomic BEFORE
+// RecordExpiryBlocking, so the tombstone arm PerformDeletionAtomic places for this kExpired
+// delete is consumed by this DEL's own Commit(), exactly the way an explicit DEL's arm is.
+// Supersedes ExpiryErasesTheStamp, which pinned the pre-Task-11 erase behavior for the same
+// scenario -- this test is its replacement, not an addition.
+//
+// Falsifying: reverting the ExpireIfNeeded reorder (db_slice.cc) so RecordExpiryBlocking runs
+// before Del() again reproduces the orphaned-arm symptom: EndOfWriteEpoch's rollback (Task 2's
+// I3) erases the synchronous zero-authority placeholder before any Commit() lands a real stamp
+// on it, so StampOf comes back nullopt instead of a tombstone. Verbatim run in task-11-report.md.
+TEST_F(MvccStoreTest, LazyExpiryEarnsATombstoneWithSelfOrigin) {
+  // An ordinary self-authored write, purely so this test can compare its origin_hash against the
+  // expiry tombstone's below without hardcoding this node's uuid hash.
+  Run({"set", "control", "v"});
+  const uint64_t self_origin_hash = StampOf("control")->origin_hash;
+
   Run({"set", "k", "v", "px", "10"});
   ASSERT_TRUE(StampOf("k").has_value());
   AdvanceTime(50);
-  Run({"get", "k"});  // triggers lazy expiry
-  EXPECT_FALSE(StampOf("k").has_value());
+  Run({"get", "k"});  // triggers lazy expiry (DbSlice::ExpireIfNeeded, the read path)
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value())
+      << "a lazily-expired key must keep its slot, as a tombstone -- not an absent slot";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the expiry DEL's own real, minted stamp -- not the zero-authority "
+         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously, which "
+         "EndOfWriteEpoch rolls back if nothing ever commits over it";
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "an expiry is always a local decision (RecordExpiryBlocking pins origin_idx to "
+         "kSelfIdx) -- it must never be attributed to a peer";
 }
 
 // drakeydb: P4-1 Task 8; updated P4-3 Task 2 -- a multi-key DEL is still kExplicit for every key
@@ -2613,7 +2649,17 @@ TEST_F(MvccStoreTest, HdelEmptyingHashDoesNotResurrectAStamp) {
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
 // mvcc->size()/prime->size() DCHECK abort as the HDEL test above -- see final-fix-report.md.
-TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
+//
+// drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingHashDoesNotResurrectAStamp and
+// flipped its final assertion. HSetFamily::DeleteIfEmpty's derived DEL is DeleteReason::kExpired
+// and already deleted before journaling (one of the "three other" sites named in DeleteReason's
+// comment, db_slice.h) -- it needed no reordering -- but PerformDeletionAtomic's earns_tombstone
+// branch (db_slice.cc) cannot distinguish which kExpired call site it came from: now that kExpired
+// joins kExplicit there, this delete earns a tombstone too, exactly like HdelEmptyingHashDoes
+// NotResurrectAStamp above. What this test still pins is unchanged: the double-arm shape must not
+// desync mvcc_entries/mvcc_tombstones (SumMvccMismatchesAcrossShards), whether the result is an
+// erase (pre-Task-11) or a tombstone (post-Task-11).
+TEST_F(MvccStoreTest, FieldExpireEmptyingHashEarnsATombstone) {
   ASSERT_EQ(Run({"hset", "feh", "f", "v"}).GetInt(), 1);
   Run({"fieldexpire", "feh", "1", "f"});
   AdvanceTime(1100);
@@ -2621,13 +2667,16 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
 
   // Guard against a vacuous pass: the hash must have actually been cleaned up.
   ASSERT_EQ(Run({"exists", "feh"}).GetInt(), 0);
-  EXPECT_FALSE(StampOf("feh").has_value())
-      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  auto tomb = StampOf("feh");
+  ASSERT_TRUE(tomb.has_value())
+      << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
+         "key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: review wave 2 (F1, CRITICAL) -- the SET counterpart of
-// FieldExpireEmptyingHashDoesNotResurrectAStamp above: OpFieldExpire's is_set branch calls
+// FieldExpireEmptyingHashEarnsATombstone above: OpFieldExpire's is_set branch calls
 // SetFamily::DeleteSetIfEmpty (set_family.cc) instead of HSetFamily::DeleteIfEmpty, but takes the
 // identical second-FindMutable/second-arm shape. Same recipe as
 // OriginJournalFamilyTest.FieldExpireCausedDeleteIsNotFlaggedDerived (this file), which pins this
@@ -2635,7 +2684,12 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingHashDoesNotResurrectAStamp) {
 //
 // Falsifying: restoring Disarm's early `return` (mvcc.cc) reproduces the same
 // mvcc->size()/prime->size() DCHECK abort as the two tests above -- see final-fix-report.md.
-TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
+//
+// drakeydb: P4-3 Task 11 -- renamed from FieldExpireEmptyingSetDoesNotResurrectAStamp; see
+// FieldExpireEmptyingHashEarnsATombstone's comment above for why this now tombstones instead of
+// erasing (SetFamily::DeleteSetIfEmpty is the SET-side analog of the "three other" sites named in
+// DeleteReason's comment, db_slice.h).
+TEST_F(MvccStoreTest, FieldExpireEmptyingSetEarnsATombstone) {
   ASSERT_EQ(Run({"sadd", "fes", "m"}).GetInt(), 1);
   Run({"fieldexpire", "fes", "1", "m"});
   AdvanceTime(1100);
@@ -2643,8 +2697,11 @@ TEST_F(MvccStoreTest, FieldExpireEmptyingSetDoesNotResurrectAStamp) {
 
   // Guard against a vacuous pass: the set must have actually been cleaned up.
   ASSERT_EQ(Run({"exists", "fes"}).GetInt(), 0);
-  EXPECT_FALSE(StampOf("fes").has_value())
-      << "the derived DEL's own journal entry must not re-stamp the key it just emptied";
+  auto tomb = StampOf("fes");
+  ASSERT_TRUE(tomb.has_value())
+      << "the derived DEL's own journal entry must stamp the tombstone it armed, not leave the "
+         "key absent";
+  EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -3186,6 +3243,26 @@ TEST_F(OriginJournalFamilyTest, ExpiredKeyDelCarriesExpiryFlagUserDelDoesNot) {
 
   EXPECT_TRUE(dels[1].entry_flags & journal::kEntryFlagExpired);
   EXPECT_EQ(PeerRegistry::kSelfIdx, dels[1].origin_idx);
+
+  // drakeydb: P4-3 Task 11, Step 4 -- the brief's explicit non-active-replica ordering check:
+  // "expiring-key"'s own baseline write (its SET) must still be journaled before the expiry's
+  // mutation (its DEL) after ExpireIfNeeded's reorder in db_slice.cc. That reorder only moved
+  // RecordExpiryBlocking relative to Del() INSIDE ExpireIfNeeded -- a single, non-yielding
+  // function (PerformDeletionAtomic's FiberAtomicGuard forbids preemption) -- so it cannot change
+  // this entry's position relative to any OTHER journal entry emitted from elsewhere. This fixture
+  // never sets --active_replica, so this is exactly a non-active replica's view of the wire.
+  int last_set_idx = -1, expiry_del_idx = -1;
+  for (size_t i = 0; i < consumer.entries.size(); ++i) {
+    if (consumer.entries[i].cmd == "SET")
+      last_set_idx = static_cast<int>(i);
+    if (consumer.entries[i].cmd == "DEL" &&
+        (consumer.entries[i].entry_flags & journal::kEntryFlagExpired))
+      expiry_del_idx = static_cast<int>(i);
+  }
+  ASSERT_NE(-1, last_set_idx) << "expiring-key's own SET must have been captured";
+  ASSERT_NE(-1, expiry_del_idx) << "the expiry DEL must have been captured";
+  EXPECT_LT(last_set_idx, expiry_del_idx)
+      << "the key's baseline (its SET) must be journaled before its mutation (the expiry DEL)";
 }
 
 // drakeydb: Phase 3 T4 acceptance case. A DEL derived from a collection command emptying its key
@@ -3748,6 +3825,47 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteCarriesDerivedFlag) {
   peer_check.entry_flags = del->entry_flags;
   EXPECT_FALSE(journal::PassesPeerEchoFilter(peer_check))
       << "reaper DEL must never reach a mesh peer -- the peer derives its own";
+}
+
+// drakeydb: P4-3 Task 11 -- the DeleteReapedContainer equivalent of MvccStoreTest's
+// LazyExpiryEarnsATombstoneWithSelfOrigin above (multi_master_test.cc): DeleteReapedContainer now
+// calls Del()/PerformDeletionAtomic BEFORE RecordDerivedDelete too, so the derived DEL's own
+// Commit() lands the tombstone's real stamp instead of leaving PerformDeletionAtomic's
+// synchronous placeholder for EndOfWriteEpoch to roll back. Reads the stamp from inside the same
+// shard_set->RunBriefInParallel callback that drives DeleteExpiredStep, on this fixture's single
+// shard/thread, so there is no yield between the reap and the read -- mirroring StampOf's own
+// same-shard-thread precondition in MvccStoreTest.
+//
+// Falsifying: reverting the DeleteReapedContainer reorder (db_slice.cc) reproduces the orphaned-
+// arm symptom -- `tomb` comes back nullopt (I3's rollback erases the uncommitted placeholder)
+// instead of a real tombstone. Verbatim run in task-11-report.md.
+TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
+  EXPECT_EQ(Run({"sadd", "rs-tomb", "m"}).GetInt(), 1);
+  Run({"fieldexpire", "rs-tomb", "1", "m"});
+  AdvanceTime(1100);
+
+  std::optional<MvccStamp> tomb;
+  uint64_t self_origin_hash = 0;
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100);
+    tomb = db_slice.GetMvcc(0, "rs-tomb");
+    self_origin_hash = MvccStamper::tlocal()->OriginHash(0);
+  });
+
+  // Guard against a vacuous pass: the container must have actually been reaped.
+  EXPECT_EQ(Run({"exists", "rs-tomb"}).GetInt(), 0);
+
+  ASSERT_TRUE(tomb.has_value())
+      << "the reaper's derived DEL must earn a tombstone, not leave the slot absent";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must carry the derived DEL's own real, minted stamp -- not the zero-authority "
+         "{kTombstoneBit, 0} placeholder PerformDeletionAtomic writes synchronously";
+  EXPECT_EQ(tomb->origin_hash, self_origin_hash)
+      << "a reaper-derived delete is a local decision -- must be self-originated, never "
+         "attributed to a peer";
 }
 
 TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {

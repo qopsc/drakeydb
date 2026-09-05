@@ -22,8 +22,9 @@ ABSL_FLAG(bool, multi_master, false,
 // drakeydb: P4-3 Task 2 -- an explicit DEL keeps its mvcc side-table slot (with kTombstoneBit
 // set) instead of erasing it, so a peer's stale snapshot cannot resurrect a key we deleted.
 // kEvicted/kSlotFlush are unaffected: they always erase (see PerformDeletionAtomic, db_slice.cc).
-// kExpired is a known gap, not a design choice -- see the STOP-finding comment on
-// PerformDeletionAtomic (db_slice.cc) and DeleteReason (db_slice.h). Seconds, not ms, to match
+// kExpired joined kExplicit in P4-3 Task 11, once ExpireIfNeeded/DeleteReapedContainer were
+// reordered to journal after deleting -- see DeleteReason's comment (db_slice.h) for the history.
+// Seconds, not ms, to match
 // --tombstone_ttl-style operator-facing flags elsewhere; a tombstone's own GC deadline math
 // (MvccStamp::DeadlineMs) takes ms, so callers convert.
 ABSL_FLAG(uint64_t, multi_master_tombstone_ttl, 600,
@@ -116,9 +117,8 @@ bool ValidateMultiMasterFlags() {
   // resurrection-semantics gotcha worth surfacing at boot: --cache_mode evicts under memory
   // pressure, and eviction (kEvicted, PerformDeletionAtomic) deliberately writes no tombstone --
   // the peer's copy is authoritative, so resurrection on that peer's next full sync is the whole
-  // point. An explicit DEL on the SAME key still tombstones normally (kExpired does not yet
-  // either, a separate, tracked gap -- see DeleteReason's comment, db_slice.h); only the
-  // memory-pressure-evicted keys are a deliberate design choice rather than a gap.
+  // point. An explicit DEL (or, since P4-3 Task 11, an expiry) on the SAME key still tombstones
+  // normally; only the memory-pressure-evicted keys are a deliberate design choice, not a gap.
   if (TombstonesEnabled() && absl::GetFlag(FLAGS_cache_mode)) {
     LOG(WARNING) << "--active_replica with --cache_mode: eviction cannot free tombstones and "
                     "evicted keys deliberately get none (kEvicted is a capacity decision, not a "

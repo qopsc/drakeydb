@@ -1910,12 +1910,14 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
   }
 
   string scratch;
-  string_view key = it->first.GetSlice(&scratch);
-
-  // Replicate expiry
-  if (auto journal = owner_->journal(); journal && journal_expiry) {
-    RecordExpiryBlocking(cntx, key);
-  }
+  // drakeydb: P4-3 Task 11 -- own a copy, not just a view into `it`. Del() below erases this entry
+  // from the prime table, and CompactObj::GetSlice returns a view straight into the entry's own
+  // storage -- not into `scratch` -- for inline, large-string, and SDS-TTL keys
+  // (compact_object.cc), exactly the encodings Del() frees. RecordExpiryBlocking now runs AFTER
+  // Del() (see that call's own comment below), so it needs a copy that survives the erase; wrapping
+  // GetSlice's result in a `string` guarantees that regardless of which encoding this key happens
+  // to use.
+  string key(it->first.GetSlice(&scratch));
 
   auto& db = db_arr_[cntx.db_index];
   if (expired_keys_events_recording_) {
@@ -1923,14 +1925,31 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
       events->emplace_back(key);
     } else {
       // Read path: not in an atomic section, safe to send immediately.
+      string_view key_view = key;
       channel_store->SendMessages(absl::StrCat("__keyevent@", cntx.db_index, "__:expired"),
-                                  absl::Span<const string_view>{&key, 1}, false);
+                                  absl::Span<const string_view>{&key_view, 1}, false);
     }
   }
 
   // Route through Del so that expiry runs the same per-type hooks as an explicit DEL.
   const_cast<DbSlice*>(this)->Del(cntx, Iterator(it, StringOrView::FromView(key)), db.get(), false,
                                   DeleteReason::kExpired);
+
+  // drakeydb: P4-3 Task 11 -- journal AFTER Del(), not before (the pre-Task-11 order this
+  // replaces). Matches every kExplicit delete site (e.g. GenericFamily::OpDelV2): kExpired now
+  // shares PerformDeletionAtomic's earns_tombstone branch with kExplicit (below in this file), so
+  // the tombstone arm PerformDeletionAtomic places while this key is still in `prime` must exist
+  // BEFORE this call's own journal::RecordEntry -> Commit() runs, or that Commit() cannot consume
+  // it. Journaling before Del() (the old order) left the arm to be picked up by some unrelated,
+  // later Commit() -- or, with nothing else armed this epoch, orphaned to EndOfWriteEpoch's
+  // rollback (Task 2's I3) -- either way, never this delete's own stamp. The entry's content is
+  // unchanged; only its position within this function moved, and Del() (PerformDeletionAtomic's
+  // FiberAtomicGuard) never yields, so no other journal entry can land between the old and new
+  // call sites -- what a non-active replica observes on the wire is identical. See
+  // PerformDeletionAtomic's own comment (below in this file) for the STOP finding this resolves.
+  if (auto journal = owner_->journal(); journal && journal_expiry) {
+    RecordExpiryBlocking(cntx, key);
+  }
 
   ++events_.expired_keys;
   db->stats.events.expired_keys++;
@@ -2371,11 +2390,25 @@ auto DbSlice::DeleteExpiredStep(const Context& cntx, unsigned count, DeleteExpir
 
 void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterator it,
                                     bool journal_deletion) {
-  // Record before deletion, matching whole-key expiry. Do not route through FindMutable or the
-  // family helpers: their OnChange callback can preempt inside the heartbeat's atomic section.
-  if (owner_->journal() && journal_deletion)
-    RecordDerivedDelete(cntx, key);
+  // drakeydb: P4-3 Task 11 -- own a copy of `key` before Del() below erases it from the prime
+  // table: `key` is a view the caller derived from this same entry's PrimeKey via GetSlice
+  // (DeleteExpiredStep, above in this file), and for inline/large-string/SDS-TTL encodings that
+  // view points straight into storage Del() frees (see the identical hazard and fix in
+  // ExpireIfNeeded above). RecordDerivedDelete now runs after Del(), so it needs a copy that
+  // survives the erase.
+  string key_owned(key);
+
+  // drakeydb: P4-3 Task 11 -- delete before recording now, not after (the pre-Task-11 order this
+  // replaces), matching ExpireIfNeeded's own reorder above and every kExplicit site. Do not route
+  // through FindMutable or the family helpers: their OnChange callback can preempt inside the
+  // heartbeat's atomic section. See ExpireIfNeeded's own comment for the full argument (identical
+  // here): kExpired now shares PerformDeletionAtomic's earns_tombstone branch with kExplicit, so
+  // the tombstone arm placed while this key is still in `prime` must exist before this call's own
+  // Commit() runs, and Del()'s FiberAtomicGuard never yields, so no other entry can land between
+  // the erase and this record -- the wire content a non-active replica observes is unchanged.
   Del(cntx, it, db_arr_[cntx.db_index].get(), false, DeleteReason::kExpired);
+  if (owner_->journal() && journal_deletion)
+    RecordDerivedDelete(cntx, key_owned);
 }
 
 int32_t DbSlice::GetNextSegmentForEviction(int32_t segment_id, DbIndex db_ind) const {
@@ -2948,48 +2981,45 @@ bool DbSlice::TombstoneGcStep() {
 // Task 2 below is what actually branches on it.
 //
 // drakeydb: P4-3 Task 2, STOP finding (see task-2-report.md) -- the plan/Global Constraints say
-// kExplicit AND kExpired both earn a tombstone. Only kExplicit does, below, for now:
-// PerformDeletionAtomic only decides WHETHER to tombstone; WHICH stamp that tombstone ends up
-// with depends on this key's ArmTombstone() being consumed by the RIGHT journal::RecordEntry ->
-// Commit() call (Commit is what OR's the bit in and hands the stamp to SetExistingMvcc -- see
-// mvcc.cc). That holds for every kExplicit site (OpDelV2 arms via post_updater.Run() / this
-// function, then journals after) but NOT for two real kExpired sites that journal BEFORE calling
-// Del(): DbSlice::ExpireIfNeeded (RecordExpiryBlocking then Del(), db_slice.cc) and
-// DbSlice::DeleteReapedContainer (RecordDerivedDelete then Del(), db_slice.cc). For those, this
-// function's ArmTombstone() call happens AFTER the one Commit() that could have consumed it with
-// the DELETE's own stamp, so the arm survives to EndOfWriteEpoch() uncommitted.
+// kExplicit AND kExpired both earn a tombstone. Only kExplicit did, below, at the time: this
+// function only decides WHETHER to tombstone; WHICH stamp that tombstone ends up with depends on
+// this key's ArmTombstone() being consumed by the RIGHT journal::RecordEntry -> Commit() call
+// (Commit is what OR's the bit in and hands the stamp to SetExistingMvcc -- see mvcc.cc). That
+// held for every kExplicit site (OpDelV2 arms via post_updater.Run() / this function, then
+// journals after) but NOT for two real kExpired sites that journaled BEFORE calling Del():
+// DbSlice::ExpireIfNeeded (RecordExpiryBlocking then Del()) and DbSlice::DeleteReapedContainer
+// (RecordDerivedDelete then Del()). For those, this function's ArmTombstone() call happened AFTER
+// the one Commit() that could have consumed it with the DELETE's own stamp, so the arm survived
+// to EndOfWriteEpoch() uncommitted.
 //
 // drakeydb: P4-3 Task 2 review fix -- reconciling this report's own earlier inconsistency (a
 // controller review caught it): the paragraph above used to claim this was reproduced as a
-// dense-invariant abort in MvccStoreTest.ExpiryErasesTheStamp. Re-verified against the CURRENT
-// tree (the placeholder write below, and now EndOfWriteEpoch's rollback, review fix I3) and that
-// specific abort text does not reproduce for that specific test -- the synchronous placeholder
-// below already keeps the O(1) invariant intact at every checkpoint regardless of delete reason,
-// so a kExpired inclusion never crashes there. What it produced (before I3's fix) was silent
-// corruption instead: RecordExpiryBlocking's Commit() runs before this function's ArmTombstone(),
-// so the arm is never consumed by the right commit and the placeholder ({kTombstoneBit, 0} --
-// Mvcc()==0, origin_hash==0, the strict minimum of operator<) was abandoned in the table forever,
-// unable to win any future merge comparison -- a silently-lost delete, arguably worse than a
-// crash. Since I3, EndOfWriteEpoch's rollback erases that abandoned placeholder cleanly instead
-// (no crash, no stuck stamp, prime and mvcc both end up with no entry for the key) -- closing the
-// correctness risk generically, for kExpired or any other reason, on this or any other path that
-// can orphan a tombstone arm. kExpired stays excluded regardless: I3 makes an included-but-
-// orphaned kExpired tombstone SAFE, not CORRECT -- ExpireIfNeeded/DeleteReapedContainer would
-// still commit the delete's real stamp to whichever LATER, unrelated key happens to be armed when
-// some other Commit() eventually runs (or, with nothing else armed, just discard it -- I3's own
-// rollback then cleanly un-tombstones it), neither of which is "the deleted key gets tombstoned
-// with its own correct stamp". Fixing that is still a design change (reordering two working call
-// sites, or splitting kExpired into two reasons) beyond this task's scope; ruled into a follow-up
-// task by the controller.
+// dense-invariant abort in a test pinning kExpired's old erase behavior. Re-verified against the
+// CURRENT tree (the placeholder write below, and now EndOfWriteEpoch's rollback, review fix I3)
+// and that specific abort text does not reproduce for that specific test -- the synchronous
+// placeholder below already keeps the O(1) invariant intact at every checkpoint regardless of
+// delete reason, so a kExpired inclusion never crashed there. What it produced (before I3's fix)
+// was silent corruption instead: RecordExpiryBlocking's Commit() ran before this function's
+// ArmTombstone(), so the arm was never consumed by the right commit and the placeholder
+// ({kTombstoneBit, 0} -- Mvcc()==0, origin_hash==0, the strict minimum of operator<) was
+// abandoned in the table forever, unable to win any future merge comparison -- a silently-lost
+// delete, arguably worse than a crash. Since I3, EndOfWriteEpoch's rollback erases that abandoned
+// placeholder cleanly instead (no crash, no stuck stamp, prime and mvcc both end up with no entry
+// for the key) -- closing the correctness risk generically, for kExpired or any other reason, on
+// this or any other path that can orphan a tombstone arm. I3 made an included-but-orphaned
+// kExpired tombstone SAFE, not CORRECT: ExpireIfNeeded/DeleteReapedContainer would still commit
+// the delete's real stamp to whichever LATER, unrelated key happened to be armed when some other
+// Commit() eventually ran (or, with nothing else armed, just discard it -- I3's own rollback then
+// cleanly un-tombstoned it), neither of which is "the deleted key gets tombstoned with its own
+// correct stamp". Task 2 excluded kExpired here rather than fix that, and left the actual fix --
+// reordering the two unsafe call sites -- to a follow-up task by controller ruling.
 //
-// Three OTHER kExpired call sites (HSetFamily::DeleteIfEmpty, SetFamily::DeleteSetIfEmpty,
-// DbSlice::UpdateExpire's EXPIRE-with-negative-ttl branch) all arm/delete BEFORE journaling, so
-// they do NOT have this hazard -- but DeleteReason alone cannot distinguish a safe kExpired call
-// site from an unsafe one here, and reordering the two unsafe sites (or splitting kExpired into
-// two reasons) is a design change beyond this task's scope. Excluding kExpired entirely keeps
-// every reason's pre-Task-2 behavior for kExpired specifically, at the cost of also not
-// tombstoning the three safe sites above until a controller decision re-enables (some of)
-// kExpired.
+// drakeydb: P4-3 Task 11 -- that follow-up. ExpireIfNeeded and DeleteReapedContainer (db_slice.cc)
+// now both call Del()/PerformDeletionAtomic BEFORE journaling (RecordExpiryBlocking /
+// RecordDerivedDelete respectively), matching every kExplicit site, so the ArmTombstone() call
+// below is always consumed by the RIGHT Commit() for kExpired too -- closing the STOP finding.
+// The three other kExpired call sites named below already had this ordering and needed no change.
+// kExplicit and kExpired now share this function's earns_tombstone branch below.
 void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool async,
                                     DeleteReason reason) {
   FiberAtomicGuard guard;
@@ -3049,8 +3079,13 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
   // journal blob from another peer link on this same shard thread.
   if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
     MvccStamper::tlocal()->Disarm(table->index, del_it.key());
-    // kExpired excluded for now -- see the STOP-finding comment above this function.
-    const bool earns_tombstone = TombstonesEnabled() && reason == DeleteReason::kExplicit;
+    // drakeydb: P4-3 Task 11 -- kExpired joins kExplicit here, closing the STOP finding documented
+    // above this function: ExpireIfNeeded and DeleteReapedContainer now both journal AFTER
+    // Del()/PerformDeletionAtomic, so the ArmTombstone() call below is always consumed by THIS
+    // delete's own Commit(), the same guarantee kExplicit already had. kEvicted/kSlotFlush stay
+    // excluded -- see the comment on the `if` block above (capacity/topology, not deletion).
+    const bool earns_tombstone = TombstonesEnabled() && (reason == DeleteReason::kExplicit ||
+                                                         reason == DeleteReason::kExpired);
     if (earns_tombstone &&
         table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
       // drakeydb: P4-3 Task 2, second STOP-finding fold-in (see task-2-report.md) -- write a

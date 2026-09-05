@@ -203,12 +203,12 @@ class MvccStamper {
   // drakeydb: P4-3 Task 2 -- identical bookkeeping to Arm above, except the recorded Armed entry
   // carries tombstone=true, so Commit() ORs kTombstoneBit into the stamp it hands this key's
   // CommitFn (only for this arm; a plain Arm() of a different key in the same Commit() call is
-  // unaffected). PerformDeletionAtomic (db_slice.cc) is the only caller: today, only a kExplicit
-  // delete re-arms the key it just Disarm()'d as a tombstone instead of erasing its side-table
-  // slot outright -- kExpired is excluded for now (see DeleteReason's comment, db_slice.h, for
-  // why). Unlike Arm(), never needs a preceding EnsureMvcc: the dense invariant (mvcc->size() -
-  // mvcc_tombstones == prime.size(), db_slice.cc) guarantees a live prime key -- the only kind
-  // PerformDeletionAtomic ever deletes -- already owns an mvcc slot.
+  // unaffected). PerformDeletionAtomic (db_slice.cc) is the only caller: a kExplicit or kExpired
+  // (P4-3 Task 11) delete re-arms the key it just Disarm()'d as a tombstone instead of erasing its
+  // side-table slot outright -- kEvicted/kSlotFlush still erase (see DeleteReason's comment,
+  // db_slice.h, for why). Unlike Arm(), never needs a preceding EnsureMvcc: the dense invariant
+  // (mvcc->size() - mvcc_tombstones == prime.size(), db_slice.cc) guarantees a live prime key --
+  // the only kind PerformDeletionAtomic ever deletes -- already owns an mvcc slot.
   void ArmTombstone(DbIndex db_index, std::string_view key);
   // Erases EVERY arm matching (db_index, key), not just the first -- see the .cc for why a
   // single-match version corrupted the mvcc side table (review wave 2, F1, CRITICAL).
