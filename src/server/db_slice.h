@@ -693,10 +693,20 @@ class DbSlice {
   // one non-empty logical bucket) a single call to this makes in total, spread across however
   // many SELECT-able databases still need visiting this tick -- not a per-database allowance, so
   // one call has one predictable upper bound regardless of how many databases are populated.
-  // No-ops (returns false) when !TombstonesEnabled() (--multi_master_tombstone_ttl=0). Skips a
-  // tombstone whose Mvcc() is still 0 -- PerformDeletionAtomic's synchronous placeholder, mid-
-  // epoch and not yet committed or rolled back -- since erasing it here races the delete's own
-  // journal commit; see the definition (db_slice.cc) for the full race analysis.
+  // No-ops (returns false) when !TombstonesEnabled() (--multi_master_tombstone_ttl=0) or when
+  // --multi_master_tombstone_gc_budget is 0 -- a budget of 0 can never make progress, so it must
+  // never be reported as "pending work", or the on-idle wrapper would peg this shard's proactor
+  // at its highest re-scheduling frequency forever for zero throughput (review fix C1; see the
+  // definition, db_slice.cc). Skips a tombstone whose Mvcc() is still 0 -- PerformDeletionAtomic's
+  // synchronous placeholder, mid-epoch and not yet committed or rolled back -- since erasing it
+  // here races the delete's own journal commit; see the definition (db_slice.cc) for the full
+  // race analysis. Also confirms, against the prime table, that a tombstone-flagged slot truly
+  // has no live counterpart before erasing it (review fix C2) -- IsTombstone() alone only
+  // reflects what a producer claimed, not what prime independently holds. Bounded by a wall-time
+  // quota underneath the bucket budget (review fix I2), for a sparse table where one "budget
+  // unit" can silently scan many empty buckets. Round-robins which database gets first claim on
+  // the budget/quota across calls (review fix I3, tombstone_gc_db_index_ below) rather than
+  // always starting at database 0, which could starve every later database indefinitely.
   // Deliberately does NOT gate on "is this the default namespace" the way PerformDeletionAtomic
   // does: this can be called from a shard's on-idle task before the global `namespaces` registry
   // (common.h) is even assigned -- see the definition (db_slice.cc) for why that is reachable by
@@ -854,6 +864,17 @@ class DbSlice {
   // (Namespaces::Clear(), exercised by every test's ResetService()) would leave a dangling `this`
   // captured in that proactor's on_idle_arr_, fired by a later, unrelated test.
   uint32_t tombstone_gc_task_id_ = 0;
+
+  // drakeydb: review fix (I3), Critical -- which index into db_arr_ TombstoneGcStep's for-loop
+  // (db_slice.cc) starts from THIS call, giving that db first claim on the whole call's budget
+  // and time quota. Persisted (not reset per call) and advanced by exactly one position on
+  // EVERY call, unconditionally -- not just when a lap finishes, and not "resume wherever this
+  // call left off": a db can be arbitrarily larger than the budget and so may never finish a lap
+  // in any single call, and resuming AT an unfinished db would starve every db after it exactly
+  // as badly as always starting at db_arr_[0] did. Rotating by one guarantees every db gets
+  // first claim at least once every db_arr_.size() calls, independent of any other db's own lap
+  // length -- see TombstoneGcStep's definition for the full analysis.
+  size_t tombstone_gc_db_index_ = 0;
 
   struct Hash {
     size_t operator()(const facade::ConnectionRef& c) const {

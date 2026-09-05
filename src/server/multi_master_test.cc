@@ -318,6 +318,22 @@ TEST(MultiMasterFlags, TombstoneTtlRejectsSignConvertedValue) {
   EXPECT_TRUE(ValidateMultiMasterFlags());
 }
 
+// drakeydb: P4-3 Task 3, review fix (C1), Critical -- a budget of 0 buckets/tick can never make
+// progress. Before this fix DbSlice::TombstoneGcStep (db_slice.cc) treated that identically to
+// "ran out of budget mid-lap, more work queued" and reported pending work forever; the on-idle
+// wrapper (the DbSlice constructor) maps a pending report into the proactor's highest
+// re-scheduling frequency with no backoff, so this pegs a shard's core at 100% doing zero work.
+// Reject at boot so a misconfigured value never reaches that path.
+TEST(MultiMasterFlags, TombstoneGcBudgetRejectsZero) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_active_replica, true);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  EXPECT_FALSE(ValidateMultiMasterFlags());
+
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  EXPECT_TRUE(ValidateMultiMasterFlags());
+}
+
 namespace {
 nonstd::expected<PeerReplicaOfCmd, facade::ErrorReply> ParsePeer(std::vector<std::string> words) {
   CmdArgVec vec;
@@ -1383,7 +1399,15 @@ TEST_F(MvccStoreTest, PureWriteWorkloadLeavesNoUnstampedWrites) {
 // with changes, from {0,0} to the persisted stamp.
 TEST_F(MvccStoreTest, LoaderFinalizationPreservesAnotherTransactionsPendingArm) {
   constexpr uint64_t kPendingMvcc = 0x1234'5678;
-  const MvccStamp kPersistedStamp{0xAAAABBBBCCCC1111ULL, 0xDEADBEEFULL};
+  // drakeydb: P4-3 Task 3, review fix (C2i) -- leading nibble changed from 0xA to 0x2 (otherwise
+  // an arbitrary, purely-for-recognizability constant, unrelated to this test's actual subject):
+  // 0xA's top bit set bit 63 of the packed stamp, i.e. the tombstone bit, incidentally. SetMvcc
+  // (the live-key setter this test exercises below) now masks that bit on every write -- a live
+  // key carrying it is invalid state -- so the unmasked original value could never round-trip
+  // through SetMvcc verbatim again, which is exactly what this constant is asked to do below.
+  // This test is about arm/commit isolation, not tombstones, so the fix is the constant, not the
+  // new masking behavior.
+  const MvccStamp kPersistedStamp{0x2AAABBBBCCCC1111ULL, 0xDEADBEEFULL};
   std::optional<MvccStamp> prepared_stamp;
   std::optional<MvccStamp> pending_stamp;
   std::optional<MvccStamp> loaded_stamp;
@@ -1745,6 +1769,180 @@ TEST_F(MvccStoreTest, TombstoneGcSkipsAnUncommittedPlaceholder) {
     // had GC erased it out from under the pending arm.
     db_slice.SetExistingMvcc(0, key, MvccStamp{MvccClock::kTombstoneBit | (5000ULL << 20), 42});
   });
+}
+
+// drakeydb: P4-3 Task 3, review fix (C1), Critical -- the reviewer's own repro: with
+// --multi_master_tombstone_gc_budget=0 (bypassing ValidateMultiMasterFlags via absl::SetFlag,
+// the same way a future CONFIG SET could), TombstoneGcStep returned true on every one of 5
+// consecutive calls despite doing zero work, because "budget==0 with a database left to try" was
+// treated identically to "ran out of budget mid-lap, real progress was made". The on-idle
+// wrapper (the DbSlice constructor, db_slice.cc) maps a true return into kOnIdleMaxLevel with no
+// backoff, so this would peg a shard's proactor core at 100% forever. Real expired work is set
+// up first so a false return below is provably the zero-budget guard, not just "nothing to do".
+TEST_F(MvccStoreTest, TombstoneGcStepNeverReportsPendingWithZeroBudget) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  const std::string key = "gc-zero-budget";
+  Run({"set", key, "v"});
+  Run({"del", key});
+  AdvanceTime(2000);
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u);
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    for (int i = 0; i < 5; ++i)
+      EXPECT_FALSE(db_slice.TombstoneGcStep()) << "iteration " << i;
+  });
+}
+
+// drakeydb: P4-3 Task 3, review fix (C2i), Critical -- rdb_load.cc's opcode-221 path
+// (CreateObjectOnShard, rdb_load.cc:3389) installs a wire-read stamp through SetMvcc verbatim,
+// with no bit-63 check unlike the KeyDB aux path (rdb_load.cc:3170) -- so a corrupted or
+// malicious stream (or a plain-replica full sync, or DEBUG LOAD) carrying a bit-63-set stamp for
+// a LIVE key used to plant a slot TombstoneGcStep's IsTombstone() check would treat as reapable.
+// Erasing it would underflow mvcc_tombstones (an unsigned counter) to roughly UINT64_MAX, after
+// which PerformDeletionAtomic's `mvcc_tombstones < max_tombstones` cap check can never pass
+// again, silently disabling tombstoning on that shard forever. Fixed by masking bit 63 in
+// SetMvcc itself (the live-key setter) rather than trusting every caller to never pass one.
+TEST_F(MvccStoreTest, LiveKeyStampMasksTombstoneBitAndSurvivesGc) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "loader-live-key";
+  Run({"set", key, "v"});  // a real, live prime key
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Simulates the opcode-221 wire stamp install for this key, corrupted or malicious, with
+    // bit 63 set -- exactly what SetMvcc receives verbatim from rdb_load.cc, unmasked.
+    const MvccStamp wire_stamp{MvccClock::kTombstoneBit | (7000ULL << 20), 99};
+    db_slice.SetMvcc(0, key, wire_stamp);
+
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_FALSE(stored->IsTombstone())
+        << "SetMvcc must mask bit 63 -- it is the live-key setter, SetTombstone is the only "
+           "legitimate bit-63 writer";
+    EXPECT_EQ(stored->Mvcc(), wire_stamp.Mvcc());
+    EXPECT_EQ(stored->origin_hash, wire_stamp.origin_hash);
+  });
+
+  AdvanceTime(2000);  // past the 1s deadline this stamp would carry if it were a real tombstone
+
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value()) << "GC must not erase a live key's (masked) stamp";
+    EXPECT_FALSE(stored->IsTombstone());
+  });
+  EXPECT_EQ(Run({"get", key}), "v");
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 0u);
+}
+
+// drakeydb: P4-3 Task 3, review fix (C2ii), Critical -- IsTombstone() alone is not a safe erase
+// predicate on a dense table: it only reflects what a producer CLAIMED, not what prime
+// independently holds. Constructs that shape directly via SetTombstone (the one legitimate
+// bit-63 writer) on a key that still has a live prime entry -- the state a producer that bypasses
+// SetMvcc's mask (C2i above, any future one, not just today's loader) could otherwise leave --
+// and confirms GC leaves it alone by confirming, against prime itself, that a candidate has no
+// live counterpart before erasing.
+TEST_F(MvccStoreTest, GcDoesNotEraseATombstoneFlaggedSlotWithALivePrimeKey) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "tombstone-shaped-but-live";
+  Run({"set", key, "v"});
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit | (7000ULL << 20), 99});
+  });
+
+  AdvanceTime(2000);  // past the 1s deadline
+
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+    db_slice.TombstoneGcStep();
+  });
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    auto stored = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stored.has_value())
+        << "GC erased a tombstone-flagged slot that still has a live prime key";
+    EXPECT_TRUE(stored->IsTombstone());
+    EXPECT_EQ(db_slice.GetStats().db_stats[0].key_count, 1u)
+        << "the live prime key must still be there too";
+  });
+
+  // Clean up the invariant-violating state this test intentionally injected (a tombstone-bit
+  // slot coexisting with a live prime key -- the exact shape under test): a real DEL's own
+  // placeholder-write logic re-establishes the dense invariant before this test ends, unlike a
+  // direct EraseMvcc/SetTombstone here, which would not go through OnCbFinishBlocking the way
+  // this fixture's later commands (including TearDown) do.
+  Run({"del", key});
+}
+
+// drakeydb: P4-3 Task 3, review fix (I3), Critical -- with a bucket budget smaller than one
+// database's own lap length, always starting TombstoneGcStep's for-loop at database 0
+// deterministically starved every later database forever (see the definition, db_slice.cc, for
+// why: db0's own persisted cursor can land back on "start a new lap" in EXACTLY the tick the
+// budget also runs out for db1's turn). Reproduced with two databases: a backlog on db0 far
+// larger than one budget=1 step can visit, and a small one on db1 -- before this fix, db1's
+// tombstones were never reaped no matter how many steps ran.
+TEST_F(MvccStoreTest, TombstoneGcServicesEveryDatabaseUnderRoundRobin) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 1);  // buckets/step
+  absl::Cleanup restore = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  constexpr int kDb0Keys = 200;  // large enough that no single budget=1 step ever drains it
+  for (int i = 0; i < kDb0Keys; ++i)
+    Run({"set", absl::StrCat("db0-key-", i), "v"});
+  for (int i = 0; i < kDb0Keys; ++i)
+    Run({"del", absl::StrCat("db0-key-", i)});
+
+  Run({"select", "1"});
+  constexpr int kDb1Keys = 3;  // small: fits comfortably inside a handful of budget=1 steps
+  for (int i = 0; i < kDb1Keys; ++i)
+    Run({"set", absl::StrCat("db1-key-", i), "v"});
+  for (int i = 0; i < kDb1Keys; ++i)
+    Run({"del", absl::StrCat("db1-key-", i)});
+  Run({"select", "0"});
+
+  AdvanceTime(2000);  // past the 1s deadline both batches' tombstones carry
+
+  ASSERT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, static_cast<size_t>(kDb0Keys));
+  ASSERT_EQ(GetMetrics().db_stats[1].mvcc_tombstones, static_cast<size_t>(kDb1Keys));
+
+  // Drive enough steps that db1's tiny backlog would have to be fully reaped by now if it ever
+  // gets a turn at all -- but nowhere near enough to drain db0's much larger one, so this proves
+  // db1 was serviced WITHOUT waiting for db0 to finish first.
+  for (int step = 0; step < 20; ++step) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      db_slice.TombstoneGcStep();
+    });
+  }
+
+  EXPECT_EQ(GetMetrics().db_stats[1].mvcc_tombstones, 0u)
+      << "database 1 must be serviced without waiting for database 0's much larger backlog to "
+         "finish first";
+  EXPECT_GT(GetMetrics().db_stats[0].mvcc_tombstones, 0u)
+      << "sanity check: database 0's backlog must still be far from drained after only 20 "
+         "budget=1 steps, otherwise this test isn't distinguishing round-robin from luck";
 }
 
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified

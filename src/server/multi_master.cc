@@ -98,6 +98,20 @@ bool ValidateMultiMasterFlags() {
                   "to start";
     return false;
   }
+  // drakeydb: P4-3 Task 3, review fix (C1), Critical -- 0 buckets/tick can never make progress,
+  // so DbSlice::TombstoneGcStep (db_slice.cc) treats it identically to "GC has nothing to do" and
+  // no-ops -- but before that fix, 0 was indistinguishable from "ran out of budget mid-lap", and
+  // the on-idle wrapper (the DbSlice constructor) maps that into the proactor's highest
+  // re-scheduling frequency with no backoff: reproduced directly, this returned true on 5/5
+  // consecutive calls while doing zero work, which pegs a shard's core at 100% forever. Reject at
+  // boot so a misconfigured value never reaches that path; TombstoneGcStep's own guard remains as
+  // a backstop for a value set after boot (e.g. a future CONFIG SET, or a test's absl::SetFlag).
+  if (absl::GetFlag(FLAGS_multi_master_tombstone_gc_budget) == 0) {
+    LOG(ERROR) << "--multi_master_tombstone_gc_budget must be >= 1 (0 buckets/tick can never "
+                  "reclaim a tombstone, and is treated as a misconfiguration, not a valid "
+                  "'never run' setting -- use --multi_master_tombstone_ttl=0 for that)";
+    return false;
+  }
   // drakeydb: P4-3 Task 2 -- not a validation failure (both flags are independently legal), but a
   // resurrection-semantics gotcha worth surfacing at boot: --cache_mode evicts under memory
   // pressure, and eviction (kEvicted, PerformDeletionAtomic) deliberately writes no tombstone --

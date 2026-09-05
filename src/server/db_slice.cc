@@ -1429,7 +1429,18 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
     return;
-  auto [it, inserted] = db.mvcc->Insert(key, stamp);
+  // drakeydb: review fix (C2i), Critical -- this is the LIVE-key setter (RDB load's opcode-221
+  // path installs a wire stamp here verbatim, with no bit-63 check unlike the KeyDB aux path,
+  // rdb_load.cc; a replicated/applied write's author stamp lands here too) -- SetTombstone
+  // (below in this file) is the ONLY legitimate writer of a bit-63-set stamp. A live key carrying
+  // the tombstone bit is invalid state: TombstoneGcStep's IsTombstone() check (above in this
+  // file) would otherwise treat it as reapable, and EraseMvcc's matching decrement would
+  // underflow mvcc_tombstones (an unsigned counter) to roughly UINT64_MAX the moment it fires --
+  // after which PerformDeletionAtomic's `mvcc_tombstones < max_tombstones` cap check can never
+  // pass again, silently disabling tombstoning on that shard forever. Masking here fixes every
+  // current and future caller of this setter without any of them needing to know why.
+  const MvccStamp live_stamp{stamp.packed & MvccClock::kStampMask, stamp.origin_hash};
+  auto [it, inserted] = db.mvcc->Insert(key, live_stamp);
   // drakeydb: P4-3 Task 2 -- a fresh value overwriting a tombstoned slot (a key deleted, then
   // re-created -- an ordinary SET-after-DEL, not an edge case) must release that slot's
   // mvcc_tombstones credit, or the dense invariant (mvcc->size() - mvcc_tombstones ==
@@ -1437,7 +1448,7 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   // key it previously deleted. Read before the overwrite below, symmetrically with was_tombstone
   // in SetTombstone further down.
   const bool was_tombstone = !inserted && it->second.IsTombstone();
-  it->second = stamp;
+  it->second = live_stamp;
   if (inserted) {
     ++db.stats.mvcc_entries;
     // drakeydb: P4-2 Task 4 -- accounts the second, independent heap copy of `key` this Insert
@@ -1448,7 +1459,9 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
     // and must not double-count it here.
     db.stats.mvcc_key_dup_bytes += it->first.MallocUsed();
   }
-  if (was_tombstone && !stamp.IsTombstone())
+  // live_stamp.IsTombstone() is always false (masked above); kept explicit rather than simplified
+  // to `if (was_tombstone)` so this reads the same as SetTombstone's symmetric check below.
+  if (was_tombstone && !live_stamp.IsTombstone())
     --db.stats.mvcc_tombstones;
 }
 
@@ -2781,7 +2794,13 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // drakeydb: P4-3 Task 3 -- see the declaration (db_slice.h) for the full contract. Bounds a
 // single call's work by Traverse-call count (`budget`), shared across every database rather than
 // reset per database, so "one call visits at most --multi_master_tombstone_gc_budget buckets" is
-// true regardless of how many SELECT-able databases are populated.
+// true regardless of how many SELECT-able databases are populated. Also bounded by a wall-time
+// quota (review fix I2), the same way DeleteExpiredStep's quota_remains is (above in this file):
+// the budget counts Traverse CALLS, not buckets actually visited -- Traverse silently skips
+// empty logical buckets inside a single call (dash.h's own comment on Traverse) -- so a sparse
+// table (many keys deleted, few tombstones left) could make one "budget unit" scan a large
+// fraction of the table's buckets before finding a non-empty one. The quota catches that case
+// the budget alone cannot.
 //
 // Tombstone reclamation needs no ordering against the key stream or a concurrent journal blob
 // from another peer link on this same shard thread: tombstone application is itself LWW-guarded
@@ -2804,6 +2823,22 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // which always resolves, by the end of the epoch that created it, into either a committed stamp
 // (Commit()) or an erase (EndOfWriteEpoch's rollback), so skipping it here never leaks it; a
 // later tick reaps it once it is a real, committed tombstone with a real deadline.
+//
+// drakeydb: review fix (I1) -- Mvcc() != 0 is a property of the VALUES every current committed-
+// tombstone producer happens to mint (MvccClock::Next never returns 0 for any real now_ms), not
+// one enforced by the type system: a future producer of a committed (non-placeholder) tombstone
+// -- named here because it is the next one due, D-7's RDB tombstone-section apply (a later task)
+// -- must likewise never install a stamp with Mvcc()==0, or this discriminator silently stops
+// telling "still mid-epoch" apart from "genuinely expired". Enforcing that at the producer's own
+// boundary is that later task's job, not this one's.
+//
+// drakeydb: review fix (C2ii), Critical -- IsTombstone() alone is not a safe erase predicate on
+// a dense table: it only reflects what a producer CLAIMED, not what the table's own prime side
+// independently holds. SetMvcc (below in this file) now masks bit 63 on every live-key write
+// (review fix C2i), but this check does not rely on that alone -- it confirms, against prime
+// itself, that the key truly has no live counterpart before erasing, so the dense invariant
+// holds against any producer of a tombstone-flagged slot, present or future, not just today's
+// callers of SetMvcc. One extra prime Find per erase candidate (not per entry visited).
 bool DbSlice::TombstoneGcStep() {
   if (!TombstonesEnabled())
     return false;
@@ -2822,17 +2857,60 @@ bool DbSlice::TombstoneGcStep() {
   // a non-default namespace could ever hold -- the loop below still runs for one, but finds
   // nothing to erase, ever. Harmless, not a correctness gap; see the destructor for how this
   // task's own lifetime is kept safe instead (RemoveOnIdleTask, not a namespace check).
+  uint32_t budget = absl::GetFlag(FLAGS_multi_master_tombstone_gc_budget);
+  // drakeydb: review fix (C1), Critical -- a budget of 0 must never be treated as "more work is
+  // queued": the loop below used to set pending=true for the FIRST database whenever budget was
+  // already 0, indistinguishable from "ran out of budget mid-lap, real progress was made". The
+  // on-idle wrapper (the constructor, above in this file) maps a true return into
+  // kOnIdleMaxLevel, which the proactor's idle loop turns into near-continuous re-scheduling with
+  // no backoff -- reproduced directly: with budget=0, this returned true on every one of 5
+  // consecutive calls despite doing zero work, which would peg a shard's core at 100% forever.
+  // ValidateMultiMasterFlags (multi_master.cc) rejects 0 at boot; this is the defensive backstop
+  // for any path that can still observe 0 here (a test's absl::SetFlag bypasses boot validation),
+  // mirroring DeleteExpiredStep's walk_budget clamp above for the identical hazard.
+  if (budget == 0)
+    return false;
+  const size_t db_count = db_arr_.size();
+  if (db_count == 0)
+    return false;
+
   const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
   const uint64_t now_ms = GetCurrentTimeMs();
-  uint32_t budget = absl::GetFlag(FLAGS_multi_master_tombstone_gc_budget);
+  // drakeydb: review fix (I2) -- mirrors DeleteExpiredStep's quota_start/quota_remains (above in
+  // this file): a hard wall-time ceiling underneath the bucket budget, for the sparse-table case
+  // the comment on this function's declaration explains.
+  const uint64_t quota_start = ThisFiber::GetRunningTimeCycles();
+  auto quota_remains = [quota_start] {
+    return base::CycleClock::ToUsec(ThisFiber::GetRunningTimeCycles() - quota_start) < 1000;
+  };
 
   string scratch;
   bool pending = false;
-  for (auto& db : db_arr_) {
+  // drakeydb: review fix (I3), Critical -- rotates which db THIS call's for-loop starts from (and
+  // so gives first claim on the whole call's budget/quota to), persisted in
+  // tombstone_gc_db_index_ (db_slice.h) and advanced by exactly one position EVERY call --
+  // unconditionally, not just when a lap finishes. Before this fix the loop always started at
+  // db_arr_[0]; if db0's own lap length was a multiple of the budget, db0's cursor would land
+  // back on a fresh-lap start (dash.h's Cursor::end() and "start a new lap" share the same zero
+  // value) in EXACTLY the tick the budget also hit 0 for db1's turn -- so db1..dbN were never
+  // even attempted, deterministically, every single tick, forever. Advancing unconditionally
+  // (not "resume wherever this call left off") is load-bearing: db0 alone can be arbitrarily
+  // larger than the budget and so may never finish a lap in any single call -- resuming AT db0
+  // whenever it is left unfinished would reproduce the exact same starvation this fix exists to
+  // remove. Rotating by one guarantees every db gets first claim at least once every db_count
+  // calls, regardless of how long any other db's own lap takes; each db's own mvcc_gc_cursor
+  // still persists its progress independently, so rotating away from an unfinished db never
+  // loses that db's place. `% db_count` guards a db_arr_ that shrank since the value was last
+  // set (never happens today -- ActivateDb only grows it -- but costs nothing to guard).
+  const size_t start = tombstone_gc_db_index_ % db_count;
+  tombstone_gc_db_index_ = (start + 1) % db_count;
+  for (size_t offset = 0; offset < db_count; ++offset) {
+    const size_t i = (start + offset) % db_count;
+    auto& db = db_arr_[i];
     if (!db || !db->mvcc)
       continue;
-    if (budget == 0) {
-      pending = true;  // other databases are still waiting for a future tick's budget
+    if (budget == 0 || !quota_remains()) {
+      pending = true;
       break;
     }
 
@@ -2840,18 +2918,26 @@ bool DbSlice::TombstoneGcStep() {
     auto& mt = *db->mvcc;
     detail::DashCursor cursor = db->mvcc_gc_cursor;
     do {
+      // drakeydb: review fix (I2) -- mirrors DefragTableSegments' identical guard (above in this
+      // file): Traverse is stable across a resize, but nothing here may yield while a callback
+      // is still holding `it` (a bucket-relative iterator) from mid-traversal.
+      FiberAtomicGuard g;
       cursor = mt.Traverse(cursor, [&](auto it) {
-        // Mvcc() != 0 excludes a mid-epoch, not-yet-committed placeholder -- see the
-        // GC-vs-rollback race comment above this function for why erasing it here is unsafe.
-        if (it->second.IsTombstone() && it->second.Mvcc() != 0 &&
-            it->second.DeadlineMs(ttl_ms) <= now_ms)
-          EraseMvcc(db_ind, it->first.GetSlice(&scratch));
+        if (!it->second.IsTombstone() || it->second.Mvcc() == 0 ||
+            it->second.DeadlineMs(ttl_ms) > now_ms)
+          return;
+        // drakeydb: review fix (C2ii) -- confirm no live prime counterpart before erasing; see
+        // the comment on this function's declaration above for why IsTombstone() alone is not
+        // trusted here.
+        string_view key = it->first.GetSlice(&scratch);
+        if (db->prime.Find(key).is_done())
+          EraseMvcc(db_ind, key);
       });
       --budget;
-    } while (cursor && budget > 0);
+    } while (cursor && budget > 0 && quota_remains());
     db->mvcc_gc_cursor = cursor;
     if (cursor)
-      pending = true;  // this database's own lap did not finish within this tick's budget
+      pending = true;  // this db's own lap did not finish within this call's budget/quota
   }
   return pending;
 }
