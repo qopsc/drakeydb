@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <limits>
+#include <memory>
 
 #include "common/string_or_view.h"
 #include "core/mi_memory_resource.h"
@@ -857,14 +858,15 @@ class DbSlice {
   // 7-8's hot paths read this member, never the flag.
   bool mvcc_enabled_ = false;
 
-  // drakeydb: P4-3 Task 3 -- the id AddOnIdleTask (constructor, db_slice.cc) returns for
-  // TombstoneGcStep's registration, only meaningful when mvcc_enabled_ (that is the same
-  // condition the constructor registers under). The destructor passes it to RemoveOnIdleTask,
-  // mirroring EngineShard::StopPeriodicFiber's defrag_task_id_/huffman_check_task_id_ cleanup
-  // (engine_shard.cc) -- without it, a DbSlice torn down and rebuilt on a still-running proactor
-  // (Namespaces::Clear(), exercised by every test's ResetService()) would leave a dangling `this`
-  // captured in that proactor's on_idle_arr_, fired by a later, unrelated test.
-  uint32_t tombstone_gc_task_id_ = 0;
+  // drakeydb: P4-3 Task 3, review fix round 3 (Important, regression) -- shared with (copied
+  // into) the on-idle lambda the constructor (db_slice.cc) registers under mvcc_enabled_; null
+  // otherwise. This DbSlice's own copy is the ONLY one the destructor touches: it flips the flag
+  // false and does nothing else -- deliberately NOT calling RemoveOnIdleTask (see the destructor
+  // for why that regressed a real shutdown crash). The lambda's own copy keeps the
+  // std::atomic<bool> itself alive until the task actually runs again and self-unregisters,
+  // which may be well after this DbSlice is destroyed -- that is the point: the flag, not `this`,
+  // is what must outlive DbSlice.
+  std::shared_ptr<std::atomic<bool>> tombstone_gc_alive_;
 
   // drakeydb: review fix (I3), Critical -- which index into db_arr_ TombstoneGcStep's for-loop
   // (db_slice.cc) starts from THIS call, giving that db first claim on the whole call's budget
