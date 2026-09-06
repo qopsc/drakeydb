@@ -1167,6 +1167,40 @@ OpResult<DbSlice::ItAndUpdater> DbSlice::AddOrFindInternal(const Context& cntx, 
       .omitted_journal = omit_journal};
 }
 
+// See the declaration (db_slice.h) for the full contract. Mirrors, in reverse, exactly the
+// key/entry-count/slot bookkeeping the insert branch just above (AddOrFindInternal) performed for
+// a still-empty PrimeValue{} -- not table_memory_/memory_budget_'s dash-table-growth debit, which
+// PerformDeletionAtomic (below in this file) does not reverse either ("we do not shrink our tables
+// upon deletion" -- that growth belongs to the segment, which stays), and not the events_/
+// garbage-collection counters the insert may have bumped, which reflect real work the dash table
+// already did regardless of whether this particular key survives.
+void DbSlice::RollbackFreshInsert(DbIndex db_ind, const Iterator& it) {
+  DCHECK(IsValid(it));
+  DCHECK_EQ(it->second.MallocUsed(), 0u)
+      << "RollbackFreshInsert is only valid for AddOrFindInternal's still-empty PrimeValue{}";
+
+  auto& db = *db_arr_[db_ind];
+  const string_view key = it.key();
+
+  if (it->first.IsInline()) {
+    --db.stats.inline_keys;
+  } else {
+    AccountObjectMemory(key, OBJ_KEY, -static_cast<int64_t>(it->first.MallocUsed()), &db);
+  }
+  if (db.slots_stats) {
+    db.slots_stats[KeySlot(key)].key_count -= 1;
+  }
+
+  db.prime.Erase(it.GetInnerIt());
+  --entries_count_;
+
+  // The caller never called SetMvcc/EnsureMvcc for this key (it decided to reject the write before
+  // doing either), so the mvcc side table has no slot for it -- erasing the prime entry above is
+  // therefore the WHOLE fix, immediately restoring the dense invariant.
+  if (db.mvcc)
+    DCHECK_EQ(db.mvcc->size() - db.stats.mvcc_tombstones, db.prime.size());
+}
+
 void DbSlice::ActivateDb(DbIndex db_ind) {
   if (db_arr_.size() <= db_ind)
     db_arr_.resize(db_ind + 1);

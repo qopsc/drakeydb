@@ -322,6 +322,29 @@ class DbSlice {
   OpResult<ItAndUpdater> AddOrFind(const Context& cntx, std::string_view key,
                                    std::optional<unsigned> req_obj_type);
 
+  // drakeydb: P4-3 Task 4, Hazard 1 fix -- undoes a FRESH AddOrFind insert that a caller decided,
+  // strictly after AddOrFind returned and strictly before installing any value into it, must not
+  // have happened (rdb_load.cc's merge-LWW authoritative recheck is the one caller today: a
+  // concurrent apply can tombstone a key, with a stamp beating an in-flight peer snapshot's, during
+  // AddOrFind's own PreUpdateBlocking/insert-branch yield -- see that call site). Only ever valid
+  // for the specific empty PrimeValue{} AddOrFindInternal's insert branch just placed
+  // (db_slice.cc): MallocUsed() == 0 (DCHECK'd), no expiry, no mvcc slot (the caller must not have
+  // called SetMvcc/EnsureMvcc yet), no journal entry was ever going to be written for it (a load
+  // has no COMMAND journal entry) -- this key was never observable to any other caller. NOT a
+  // substitute for PerformDeletionAtomic: that method assumes a real, observable, possibly-non-
+  // empty key, and journals/tombstones/notifies accordingly; none of that applies here, so this
+  // mirrors, in reverse, only the key/entry-count/slot bookkeeping AddOrFindInternal's insert
+  // branch performed -- the same way PerformDeletionAtomic mirrors that same insert branch for a
+  // REAL delete, minus everything a still-empty, still-unobserved entry never needed. Restores the
+  // dense invariant (mvcc->size() - mvcc_tombstones == prime.size()) immediately, since no mvcc
+  // slot was ever created for this key to begin with -- DCHECK'd in the .cc.
+  //
+  // Caller must have already called `it_updater.post_updater.Cancel()` before this: this method
+  // does not touch it, and the AutoUpdater's own DCHECK (RunInternal, db_slice.cc) would fail if
+  // its still-live Run() (e.g. from its destructor) ran against an iterator this method just
+  // erased.
+  void RollbackFreshInsert(DbIndex db_ind, const Iterator& it);
+
   // Same as AddOrSkip, but overwrites in case entry exists.
   OpResult<ItAndUpdater> AddOrUpdate(const Context& cntx, std::string_view key, PrimeValue obj,
                                      uint64_t expire_at_ms);
