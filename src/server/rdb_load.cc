@@ -3345,6 +3345,42 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     return;
   }
 
+  // drakeydb: P4-3 Task 4 -- merge-LWW for a peer-mode full sync (merge_lww_ is only ever set true
+  // by replica.cc's two peer-mode call sites; every other loader keeps the pre-existing
+  // last-loaded-wins behavior below unconditionally). INTENDED invariant: this GetMvcc read and
+  // the AddOrUpdate + SetMvcc write below run on the same shard thread with no yield between them
+  // -- main_service.cc admits other peers' is_replicating applies to run concurrently on this
+  // thread during LOADING, so a yield here would let one of those land on `item->key` between the
+  // compare and the write, using a stamp this compare never saw.
+  //
+  // NOT closed by this change (see task-4-report.md, Hazard 1, verified by tracing, not assumed):
+  // AddOrUpdate, when item->key already has a resident value, reaches
+  // DbSlice::AddOrFindInternal's PreUpdateBlocking (db_slice.cc) -> CallChangeCallbacks ->
+  // ChangeConsumerInterface::OnChange -> SerializerBase::OnChange, which db_slice.cc's own
+  // comments (on the member-expiry reaper, a prior instance of this exact hazard class) document
+  // as able to synchronously block -- ThreadLocalMutex::lock's cond_var_.wait via
+  // SerializeBucketLocked, or BucketDependencies::Wait -- whenever a BGSAVE/full-sync SliceSnapshot
+  // is concurrently registered as an on-change consumer on this shard. If that happens here, a
+  // concurrent peer apply landing in that window can change item->key's stored stamp after this
+  // compare ran, and the SetMvcc call below still applies unconditionally on the now-stale compare
+  // result. Reported, not silently patched around: see the report for the resolution.
+  //
+  // GetMvcc's stored side already includes TOMBSTONES (Task 2/11 leave a delete's stamp in this
+  // same side table instead of erasing it) -- that is what stops a peer's stale snapshot
+  // resurrecting a key we deleted, and it is also why tombstone application is itself LWW-guarded:
+  // whichever of {a tombstone record, this key stream, the concurrent journal blob} lands last for
+  // a given key, MergeAccepts resolves it the same way, so no ordering constraint is needed
+  // between them.
+  //
+  // ShouldDiscardKey (below, called from ReadAndDispatchObject) looks like a cheaper home for this
+  // check and is wrong: it runs on the loader fiber, not the target shard, so it would read this
+  // shard's mvcc side table cross-thread.
+  if (merge_lww_) {
+    const MvccStamp incoming = item->has_mvcc ? item->mvcc : MvccStamp{};
+    if (!MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
+      return;  // stored side wins; the deserialized value is dropped (D-8 accepts that cost)
+  }
+
   auto op_res = db_slice->AddOrUpdate(db_cntx, item->key, std::move(pv), item->expire_ms);
   if (!op_res) {
     LOG(ERROR) << "OOM failed to add key '" << item->key << "' in DB " << db_ind;
