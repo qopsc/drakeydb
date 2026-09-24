@@ -138,6 +138,45 @@ static_assert(alignof(MvccStamp) == 8,
               "16-byte packing assumes 8-byte alignment; a consumer "
               "(e.g. the side table) may depend on this");
 
+// drakeydb: P4-5 -- the tombstone's 64-bit "meta" word (owner-approved storage: embedded in the
+// mvcc slot's own CompactKey TTL word, not a third MvccStamp field -- see the register for why).
+// 0 means no meta: an explicit or legacy tombstone GCs on its own stamp alone, exactly as before
+// this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms). Bit 63 set marks
+// an anchor-only meta (a reap time, never a whole-key deadline) -- TombMetaMs still exposes its ms
+// value here, but a caller outside GC eligibility must never treat it as D.
+constexpr uint64_t kTombMetaNone = 0;
+constexpr uint64_t kTombMetaAnchorOnly = 1ULL << 63;
+
+inline uint64_t TombMetaMs(uint64_t meta) {
+  return meta & ~kTombMetaAnchorOnly;
+}
+
+// The GC deadline for a tombstone that may also carry a meta word, atop MvccStamp::DeadlineMs
+// above: eligibility floors on whichever of the stamp's own ms component or the meta deadline is
+// later, so a tombstone installed for an already-late whole-key TTL never GCs before that TTL
+// itself would have. meta=kTombMetaNone makes this identical to stamp.DeadlineMs(ttl_ms); every
+// install/apply site still passes that today, with no producer yet minting a real D or an
+// anchor-only R.
+//
+// Saturates rather than overflows: unlike DeadlineMs's own plain add (safe because MsPart() is
+// bounded to 43 bits by the wall clock), TombMetaMs(meta) can be as large as kStampMask -- a
+// hostile or corrupted peer meta must not wrap the sum into a small value that looks
+// already-expired.
+inline uint64_t TombstoneGcAtMs(const MvccStamp& stamp, uint64_t meta, uint64_t ttl_ms) {
+  const uint64_t base = std::max(stamp.MsPart(), TombMetaMs(meta));
+  const uint64_t sum = base + ttl_ms;
+  return sum >= base ? sum : UINT64_MAX;
+}
+
+// Whether a tombstone (plus optional meta) is eligible for GC/drop-from-save at `now_ms`. Keeps
+// the exact "<=" boundary TombstoneGcStep (db_slice.cc) and SerializeTombstones (snapshot.cc)
+// already use: a tombstone is GC-eligible/droppable at the instant now_ms reaches its deadline,
+// not only strictly past it.
+inline bool TombstoneExpiredAt(const MvccStamp& stamp, uint64_t meta, uint64_t ttl_ms,
+                               uint64_t now_ms) {
+  return TombstoneGcAtMs(stamp, meta, ttl_ms) <= now_ms;
+}
+
 // The merge-LWW decision: true when `incoming` should be written over `stored`. Shared verbatim
 // by the key path and the tombstone-apply path (drakeydb P4-3) so both compare the same way.
 //

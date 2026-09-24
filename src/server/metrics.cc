@@ -515,6 +515,15 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
           "multimaster_lww_dropped_total",
           "Replicated writes dropped on peer links by the streaming multi-master LWW guard.",
           m.coordinator_stats.multimaster_lww_dropped, MetricType::COUNTER, &resp->body());
+      // drakeydb: P4-5 -- same counter/gate shape as multimaster_lww_dropped_total above; see
+      // ServerState::Stats::multimaster_expired_delta_dropped (server_state.h). 0 until the D-27
+      // veto that increments it lands.
+      AppendMetricWithoutLabels(
+          "multimaster_expired_delta_dropped_total",
+          "Delta read-modify-write commands dropped because they targeted a key still covered "
+          "by a whole-key deadline tombstone.",
+          m.coordinator_stats.multimaster_expired_delta_dropped, MetricType::COUNTER,
+          &resp->body());
     }
     AppendMetricHeader("connected_replica_lag_records", "Lag in records of a connected replica.",
                        MetricType::GAUGE, &replication_lag_metrics);

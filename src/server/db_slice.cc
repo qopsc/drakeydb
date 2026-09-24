@@ -3211,7 +3211,7 @@ bool DbSlice::TombstoneGcStep() {
       FiberAtomicGuard g;
       cursor = mt.Traverse(cursor, [&](auto it) {
         if (!it->second.IsTombstone() || it->second.Mvcc() == 0 ||
-            it->second.DeadlineMs(ttl_ms) > now_ms)
+            !TombstoneExpiredAt(it->second, kTombMetaNone, ttl_ms, now_ms))
           return;
         // drakeydb: review fix (C2ii) -- confirm no live prime counterpart before erasing; see
         // the comment on this function's declaration above for why IsTombstone() alone is not

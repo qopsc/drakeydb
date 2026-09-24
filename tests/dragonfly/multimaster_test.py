@@ -2691,6 +2691,10 @@ async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
       - the metric is present on B and its value equals INFO replication's own count;
       - the metric is entirely ABSENT -- never printed as 0 -- on a plain, non-active node.
 
+    Also covers dragonfly_multimaster_expired_delta_dropped_total, its P4-5 sibling: no code path
+    yet drops a delta against a deadline tombstone, so this only pins the same
+    present-and-0-on-active/absent-on-non-active shape, not a forced nonzero value.
+
     Falsifying: dropping metrics.cc's `if (IsActiveReplica())` gate around this metric's
     AppendMetricWithoutLabels call makes the non-active assertion below fail (the key would be
     present, at 0, instead of absent entirely).
@@ -2726,11 +2730,26 @@ async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
         samples[0].value == info_dropped
     ), f"/metrics ({samples[0].value}) must agree with INFO replication ({info_dropped})"
 
+    # drakeydb: P4-5 -- multimaster_expired_delta_dropped_total has no producer yet (the D-27 veto
+    # that increments it lands separately), so this only pins the same presence/gate shape its
+    # sibling above gets: present and 0 on an active node, entirely absent on a non-active one.
+    info_expired_dropped = int((await c_b.info("replication"))["multimaster_expired_delta_dropped"])
+    assert info_expired_dropped == 0, "sanity: nothing here increments this counter yet"
+    assert (
+        "dragonfly_multimaster_expired_delta_dropped" in metrics_b
+    ), "dragonfly_multimaster_expired_delta_dropped_total must render on /metrics on an active node"
+    expired_samples = metrics_b["dragonfly_multimaster_expired_delta_dropped"].samples
+    assert len(expired_samples) == 1, expired_samples
+    assert expired_samples[0].value == 0
+
     plain = df_factory.create(proactor_threads=2)
     plain.start()
     metrics_plain = await plain.metrics()
     assert (
         "dragonfly_multimaster_lww_dropped" not in metrics_plain
+    ), "the counter must be entirely absent -- not printed as 0 -- on a non-active node"
+    assert (
+        "dragonfly_multimaster_expired_delta_dropped" not in metrics_plain
     ), "the counter must be entirely absent -- not printed as 0 -- on a non-active node"
 
 

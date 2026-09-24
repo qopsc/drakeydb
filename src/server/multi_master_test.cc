@@ -716,6 +716,10 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, info.find("multi_master:1\r\n"));
   EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
   EXPECT_EQ(std::string::npos, info.find("master_host:"));
+  // drakeydb: P4-5 -- multimaster_expired_delta_dropped joins multimaster_lww_dropped under the
+  // same IsActiveReplica() gate (server_family.cc); nothing here yet drops a delta against a
+  // deadline tombstone, so 0 is the only value it can hold.
+  EXPECT_NE(std::string::npos, info.find("multimaster_expired_delta_dropped:0\r\n"));
 
   // drakeydb: review wave 2 (F5, MINOR) -- the positive half of NonActiveInfoHasNoActiveFields
   // below: these three must actually show up when active, or gating them behind IsActiveReplica()
@@ -726,6 +730,10 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones:"));
   // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped (Task 2) beside mvcc_tombstones, same gate.
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
+  // drakeydb: P4-5 -- mvcc_tombstones_born_expired (table.h) beside mvcc_tombstones_dropped, same
+  // gate; nothing here yet refuses a peer-sourced install as born-expired, so 0 is the only value
+  // it can hold.
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_born_expired:0\r\n"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -750,6 +758,9 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   // (server_family.cc) those three already sit behind, just below them -- absent, not printed as
   // 0, on a non-active node, since the streaming LWW guard can never engage there at all.
   EXPECT_EQ(std::string::npos, info.find("multimaster_lww_dropped:"));
+  // drakeydb: P4-5 -- multimaster_expired_delta_dropped must be gated identically to its sibling
+  // multimaster_lww_dropped above.
+  EXPECT_EQ(std::string::npos, info.find("multimaster_expired_delta_dropped:"));
 
   // drakeydb: review wave 2 (F5, MINOR) -- server_family.cc used to append mvcc_table_bytes/
   // mvcc_entries/mvcc_tombstones to INFO memory unconditionally; a non-active node emitted all
@@ -765,6 +776,8 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones:"));
   // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped must be gated identically to its siblings.
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
+  // drakeydb: P4-5 -- mvcc_tombstones_born_expired must be gated identically to its siblings.
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_born_expired:"));
 }
 
 // drakeydb: P4-4 Task A1 -- NoteLwwDrop touches ServerState::tlocal(), which only resolves on a
@@ -4192,6 +4205,35 @@ TEST_F(MvccStoreTest, InfoReplicationShowsLwwDroppedSummedAcrossShards) {
       << "INFO must report the SUM across every shard thread, not just one";
 }
 
+// drakeydb: P4-5 -- mirrors InfoReplicationShowsLwwDroppedSummedAcrossShards immediately above,
+// but writes the counter directly (shard_set->Await) instead of driving a real drop: nothing
+// yet vetoes a delta against a whole-key deadline tombstone, so there is no production path to
+// drive through. This still proves the counter's own cross-THREAD aggregation
+// (ServerState::Stats::Add, server_state.cc) sums every thread's contribution rather than
+// reading (or aggregating) just one.
+//
+// Falsifying: commenting out server_state.cc's `ADD(multimaster_expired_delta_dropped);` line
+// makes the parsed INFO value come back as 0 instead of 2, the same way the sibling test above
+// falsifies multimaster_lww_dropped's own ADD line.
+TEST_F(MvccStoreTest, InfoReplicationShowsExpiredDeltaDroppedSummedAcrossShards) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is proving cross-THREAD aggregation -- "
+                               "with only one shard there is only one thread's counter to sum";
+
+  shard_set->Await(0, [] { ServerState::tlocal()->stats.multimaster_expired_delta_dropped += 1; });
+  shard_set->Await(1, [] { ServerState::tlocal()->stats.multimaster_expired_delta_dropped += 1; });
+
+  const std::string info{ToSV(Run({"info", "replication"}).GetBuf())};
+  const size_t pos = info.find("\nmultimaster_expired_delta_dropped:");
+  ASSERT_NE(std::string::npos, pos) << "field must be present on an --active_replica node";
+  const size_t value_start = pos + std::string("\nmultimaster_expired_delta_dropped:").size();
+  const size_t value_end = info.find("\r\n", value_start);
+  ASSERT_NE(std::string::npos, value_end);
+  uint64_t parsed = 0;
+  ASSERT_TRUE(absl::SimpleAtoi(info.substr(value_start, value_end - value_start), &parsed));
+  EXPECT_EQ(parsed, 2u) << "INFO must report the SUM across every shard thread, not just one";
+}
+
 // drakeydb: P4-4 Task A7 -- the headline partial-apply case: k1 is fresh (no stored stamp, so
 // MergeAccepts(nullopt, incoming) is always true -- it can never be dropped) while k2 already
 // carries a local stamp strictly newer than the incoming mvcc. Exactly one pair must survive, it
@@ -6449,7 +6491,15 @@ TEST_F(MvccStoreTest, DebugMvccReportsValueState) {
 // it against DbSlice::GetMvcc's own stamp for the same key (StampOf), the same side-table read
 // production code (and DEBUG MVCC itself) uses. Catches a regression where the reply says
 // "state:tombstone" but prints a stale, zero, or otherwise wrong stamp.
+//
+// drakeydb: P4-5 -- also pins the exact `gc_at_ms:<n>` value: pins ttl to a known value (rather
+// than trusting the process default), computes the expected deadline the same way the production
+// helper does (TombstoneGcAtMs with meta=kTombMetaNone, i.e. tomb->DeadlineMs(ttl_ms)), and
+// asserts the printed field matches exactly -- not merely that a gc_at_ms: field is present.
 TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);  // seconds; the process default, pinned
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
   Run({"set", "k", "v"});
   Run({"del", "k"});
 
@@ -6463,6 +6513,11 @@ TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
   EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", tomb->Mvcc())))
       << "printed stamp must match the side table's own tombstone stamp: " << body;
   EXPECT_THAT(body, testing::HasSubstr("origin:"));
+
+  const uint64_t expect_gc_at_ms = TombstoneGcAtMs(*tomb, kTombMetaNone, 600'000);
+  EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("gc_at_ms:", expect_gc_at_ms)))
+      << "printed gc_at_ms must equal TombstoneGcAtMs(stamp, kTombMetaNone, ttl_ms) exactly: "
+      << body;
 }
 
 TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {

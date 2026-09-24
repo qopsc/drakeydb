@@ -213,10 +213,24 @@ def _comparable(entry, stamp_free):
     pinned, with a full `{mvcc, origin}` equality assertion, by
     `test_resurrection_pin_natural_expiry_deletes_stale_value_on_full_sync` below -- this
     relaxation is scoped to the fuzzer, which cannot tell the two situations apart.
+
+    Even in the non-stamp_free case, this projects down to exactly {state, mvcc, origin, value}
+    rather than returning `entry` verbatim: `DEBUG MVCC`'s per-node fields beyond those four
+    (`ms`/`counter`/`shard`, and a tombstone's `gc_at_ms`) are either redundant with `mvcc` (ms and
+    counter are both already encoded inside it) or -- like `gc_at_ms`, and a future meta field --
+    derived from the local reap/GC-config instant rather than from anything the two peers must
+    agree on, so comparing them verbatim would make two genuinely converged peers compare unequal
+    for no reason this module's docstring already covers.
     """
+    stamp = entry["stamp"]
     if stamp_free:
         return {"value": entry["value"]}
-    return entry
+    return {
+        "state": stamp.get("state"),
+        "mvcc": stamp.get("mvcc"),
+        "origin": stamp.get("origin"),
+        "value": entry["value"],
+    }
 
 
 async def _wait_converged(c_a, c_b, keys, label, timeout=30, stamp_free_keys=frozenset()):

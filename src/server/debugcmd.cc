@@ -750,10 +750,12 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    Inspect the per-key MVCC/LWW stamp side table (--active_replica only). With <key>,",
         "    hops to that key's shard and prints its stamp: 'state:value mvcc:<u64> ms:<u64>",
         "    counter:<u32> origin:<hex16> shard:<n>', 'state:tombstone mvcc:<u64> ms:<u64>",
-        "    origin:<hex16> shard:<n>' (no counter: field), or 'state:absent shard:<n>'. With no",
-        "    key, prints per-shard aggregates (entries/tombstones/tombstones_dropped/bytes/",
-        "    clock_last/clock_ahead_ms/unstamped_writes). VERIFY runs the from-scratch",
-        "    dense-invariant check on every shard and every db, returning 'mismatches:<n>'.",
+        "    origin:<hex16> shard:<n> gc_at_ms:<u64>' (no counter: field; gc_at_ms is 0 when",
+        "    --multi_master_tombstone_ttl=0 disables tombstone GC), or 'state:absent shard:<n>'.",
+        "    With no key, prints per-shard aggregates (entries/tombstones/tombstones_dropped/",
+        "    tombstones_born_expired/bytes/clock_last/clock_ahead_ms/unstamped_writes). VERIFY",
+        "    runs the from-scratch dense-invariant check on every shard and every db, returning",
+        "    'mismatches:<n>'.",
         "    Supported only in the default namespace; errors name --active_replica when the",
         "    feature is off.",
         "HELP",
@@ -1285,9 +1287,10 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
 //
 // Three forms, dispatched on what follows "MVCC":
 //   DEBUG MVCC <key>    -- shard-hops to <key>'s shard (Inspect()'s precedent, above) and prints
-//                           its stamp.
+//                           its stamp, including gc_at_ms for a tombstone.
 //   DEBUG MVCC          -- per-shard aggregates (side-table entries/tombstones/tombstones_dropped/
-//                           bytes, this shard's clock/unstamped-write counters).
+//                           tombstones_born_expired/bytes, this shard's clock/unstamped-write
+//                           counters).
 //   DEBUG MVCC VERIFY   -- runs the from-scratch dense-invariant check (DbSlice::
 //                           TEST_VerifyMvccTable) on every db of every shard.
 //
@@ -1355,6 +1358,9 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       // instead), but this aggregate never surfaced the per-shard count an operator would need to
       // tell WHICH shard is degrading. Same DbTableStats field INFO reads, summed the same way.
       size_t tombstones_dropped = 0;
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h). Stays 0 until
+      // the peer-sourced install refusal that increments it lands.
+      size_t tombstones_born_expired = 0;
       size_t bytes = 0;
       uint64_t clock_last = 0;
       uint64_t clock_ahead_ms = 0;
@@ -1378,6 +1384,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       info.entries = total.mvcc_entries;
       info.tombstones = total.mvcc_tombstones;
       info.tombstones_dropped = total.mvcc_tombstones_dropped;
+      info.tombstones_born_expired = total.mvcc_tombstones_born_expired;
       // drakeydb: Task 11 fix round 1 (F3, Minor) -- DbSlice::mvcc_table_memory() (db_slice.h)
       // already sums DbTable::mvcc_table_memory() over every db directly; re-deriving the same
       // number via total.mvcc_table_bytes above would just repeat that summation a second time
@@ -1397,8 +1404,9 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       const ShardMvccInfo& info = infos[i];
       StrAppend(&resp, i == 0 ? "" : " ", "shard", i, "_entries:", info.entries, " shard", i,
                 "_tombstones:", info.tombstones, " shard", i,
-                "_tombstones_dropped:", info.tombstones_dropped, " shard", i, "_bytes:", info.bytes,
-                " shard", i, "_clock_last:", info.clock_last, " shard", i,
+                "_tombstones_dropped:", info.tombstones_dropped, " shard", i,
+                "_tombstones_born_expired:", info.tombstones_born_expired, " shard", i,
+                "_bytes:", info.bytes, " shard", i, "_clock_last:", info.clock_last, " shard", i,
                 "_clock_ahead_ms:", info.clock_ahead_ms, " shard", i,
                 "_unstamped_writes:", info.unstamped_writes);
     }
@@ -1428,8 +1436,15 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       // Task 2, MvccStamper::Commit (mvcc.cc) sets kTombstoneBit on the live kExplicit delete
       // path (PerformDeletionAtomic, db_slice.cc), so this branch is now reachable in production,
       // not just a forward-compatible stub.
+      // drakeydb: P4-5 -- ttl_ms==0 means --multi_master_tombstone_ttl disabled tombstone GC
+      // entirely (TombstonesEnabled() is false): there is no deadline to report, so this prints
+      // gc_at_ms:0 rather than a real TombstoneGcAtMs value that would misleadingly suggest GC
+      // is still scheduled to run.
+      const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+      const uint64_t gc_at_ms = ttl_ms == 0 ? 0 : TombstoneGcAtMs(*stamp, kTombMetaNone, ttl_ms);
       StrAppend(&out, "state:tombstone mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
-                " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid);
+                " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid,
+                " gc_at_ms:", gc_at_ms);
     } else {
       StrAppend(&out, "state:value mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
                 " counter:", (stamp->Mvcc() & MvccClock::kCounterMask),

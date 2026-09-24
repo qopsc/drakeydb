@@ -170,6 +170,64 @@ TEST(MvccStamp, ATombstoneComparesByItsStampNotItsBit) {
   EXPECT_EQ(tomb.DeadlineMs(600'000), kTombMs + 600'000);
 }
 
+// drakeydb: P4-5 -- TombstoneGcAtMs/TombstoneExpiredAt (mvcc.h): the meta-aware GC deadline a
+// stored whole-key deadline or anchor will use once something mints one. Every install/apply site
+// still passes meta=kTombMetaNone today, so these pin the helper's own behaviour directly, not
+// any caller's.
+TEST(TombstoneGcAtMsTest, MetaNoneMatchesDeadlineMs) {
+  constexpr uint64_t kMs = 4'321;
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  EXPECT_EQ(TombstoneGcAtMs(tomb, kTombMetaNone, kTtl), tomb.DeadlineMs(kTtl));
+}
+
+TEST(TombstoneGcAtMsTest, MetaDeadlineAboveStampMsWins) {
+  constexpr uint64_t kMs = 1'000;
+  constexpr uint64_t kMetaMs = 9'000;  // > kMs, bit 63 clear -- a whole-key deadline D
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  ASSERT_GT(kMetaMs, kMs);
+  EXPECT_EQ(TombstoneGcAtMs(tomb, kMetaMs, kTtl), kMetaMs + kTtl);
+  EXPECT_NE(TombstoneGcAtMs(tomb, kMetaMs, kTtl), tomb.DeadlineMs(kTtl))
+      << "the meta deadline must actually be consulted, not silently ignored in favour of the "
+         "stamp's own ms component";
+}
+
+TEST(TombstoneGcAtMsTest, AnchorOnlyMetaMasksBit63) {
+  constexpr uint64_t kMs = 1'000;
+  constexpr uint64_t kReapMs = 7'000;
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  const uint64_t anchor_meta = kTombMetaAnchorOnly | kReapMs;
+  EXPECT_EQ(TombMetaMs(anchor_meta), kReapMs);
+  EXPECT_EQ(TombstoneGcAtMs(tomb, anchor_meta, kTtl), kReapMs + kTtl);
+}
+
+TEST(TombstoneGcAtMsTest, SaturatesAtStampMaskInsteadOfOverflowing) {
+  const MvccStamp tomb = MvccStamp{MvccClock::kStampMask, 0xAAAA}.AsTombstone();
+  // MsPart() of a stamp at kStampMask is still bounded to 43 bits; pair it with a maximal ttl to
+  // force the overflow this test exists to catch.
+  EXPECT_EQ(TombstoneGcAtMs(tomb, kTombMetaNone, UINT64_MAX), UINT64_MAX);
+}
+
+TEST(TombstoneGcAtMsTest, SaturatesAtMaxMetaInsteadOfOverflowing) {
+  const MvccStamp tomb = MvccStamp{0, 0xAAAA}.AsTombstone();
+  // A meta with bit 63 clear can be as large as kStampMask -- TombMetaMs's own ceiling.
+  EXPECT_EQ(TombstoneGcAtMs(tomb, MvccClock::kStampMask, UINT64_MAX), UINT64_MAX);
+}
+
+TEST(TombstoneExpiredAtTest, BoundaryIsInclusive) {
+  constexpr uint64_t kMs = 1'000;
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  const uint64_t gc_at = TombstoneGcAtMs(tomb, kTombMetaNone, kTtl);
+  EXPECT_TRUE(TombstoneExpiredAt(tomb, kTombMetaNone, kTtl, gc_at))
+      << "now == gc_at must already count as expired -- matches TombstoneGcStep's own `> now_ms` "
+         "skip condition (db_slice.cc) and SerializeTombstones' `<= now_ms` drop condition "
+         "(snapshot.cc), both of which this helper now backs";
+  EXPECT_FALSE(TombstoneExpiredAt(tomb, kTombMetaNone, kTtl, gc_at - 1));
+}
+
 // ---------------------------------------------------------------------------
 // FloorAppliedStamp (P4-4 Task A5): the "just-below" floor for an applied write whose author
 // stamp is older than the key's own stored stamp. See mvcc.h's declaration for the full why.

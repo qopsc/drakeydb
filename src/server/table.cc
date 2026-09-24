@@ -48,7 +48,8 @@ DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   constexpr size_t kDbSz = sizeof(DbTableStats) - sizeof(memory_usage_by_type);
   // drakeydb: P4-1 Task 5 -- +16 for mvcc_entries/mvcc_tombstones. P4-2 Task 4 -- +8 for
   // mvcc_key_dup_bytes (96 -> 104). P4-3 Task 2 -- +8 for mvcc_tombstones_dropped (104 -> 112).
-  static_assert(kDbSz == 112);
+  // P4-5 -- +8 for mvcc_tombstones_born_expired (112 -> 120).
+  static_assert(kDbSz == 120);
 
   ADD(inline_keys);
   ADD(expire_count);
@@ -56,6 +57,7 @@ DbTableStats& DbTableStats::operator+=(const DbTableStats& o) {
   ADD(mvcc_entries);
   ADD(mvcc_tombstones);
   ADD(mvcc_tombstones_dropped);
+  ADD(mvcc_tombstones_born_expired);
   ADD(mvcc_key_dup_bytes);
   ADD(obj_memory_usage);
   ADD(tiered_entries);

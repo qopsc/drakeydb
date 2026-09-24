@@ -2904,6 +2904,9 @@ string ServerFamily::FormatInfoMetrics(
       // mvcc_tombstones_dropped (table.h) for why this must stay visible rather than a silent,
       // unbounded fallback to pre-Task-2 resurrection-on-full-sync behavior.
       append("mvcc_tombstones_dropped", total.mvcc_tombstones_dropped);
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h). Stays 0 until
+      // the peer-sourced install refusal that increments it lands.
+      append("mvcc_tombstones_born_expired", total.mvcc_tombstones_born_expired);
     }
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);
@@ -3159,6 +3162,12 @@ string ServerFamily::FormatInfoMetrics(
         // Same gate as its siblings above: the guard can only engage on an active-replica peer
         // link, so this stays exactly 0 -- never printed -- on a non-active node.
         append("multimaster_lww_dropped", m.coordinator_stats.multimaster_lww_dropped);
+        // drakeydb: P4-5 -- see ServerState::Stats::multimaster_expired_delta_dropped
+        // (server_state.h). Same gate/aggregation path as multimaster_lww_dropped above; stays
+        // exactly 0 -- never printed -- on a non-active node, and 0 here too until the D-27 veto
+        // that increments it lands.
+        append("multimaster_expired_delta_dropped",
+               m.coordinator_stats.multimaster_expired_delta_dropped);
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");

@@ -257,7 +257,7 @@ void SliceSnapshot::SerializeTombstones() {
         cursor = db->mvcc->Traverse(cursor, [&](auto it) {
           if (!it->second.IsTombstone() || it->second.Mvcc() == 0)
             return;
-          if (it->second.DeadlineMs(ttl_ms) <= now_ms)
+          if (TombstoneExpiredAt(it->second, kTombMetaNone, ttl_ms, now_ms))
             return;
           chunk.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second);
         });
