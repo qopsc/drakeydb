@@ -203,6 +203,34 @@ TEST(TombstoneGcAtMsTest, AnchorOnlyMetaMasksBit63) {
   EXPECT_EQ(TombstoneGcAtMs(tomb, anchor_meta, kTtl), kReapMs + kTtl);
 }
 
+// drakeydb: P4-5 -- every case above with a non-zero meta uses one ABOVE MsPart, so
+// `meta ? TombMetaMs(meta) : stamp.MsPart()` (replacing the stamp's own ms with meta whenever
+// meta is non-zero, instead of taking the max of the two) would pass every one of them: it and
+// std::max agree whenever meta is the larger operand. These two pin the other side: meta BELOW
+// MsPart must still floor on MsPart, not silently replace it.
+TEST(TombstoneGcAtMsTest, MetaDeadlineBelowStampMsLoses) {
+  constexpr uint64_t kMs = 9'000;
+  constexpr uint64_t kMetaMs = 1'000;  // < kMs, bit 63 clear -- a whole-key deadline D
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  ASSERT_LT(kMetaMs, kMs);
+  EXPECT_EQ(TombstoneGcAtMs(tomb, kMetaMs, kTtl), kMs + kTtl)
+      << "max() must floor on the stamp's own ms component when meta is the SMALLER of the two, "
+         "not replace it with meta unconditionally";
+}
+
+TEST(TombstoneGcAtMsTest, AnchorOnlyMetaBelowStampMsLoses) {
+  constexpr uint64_t kMs = 9'000;
+  constexpr uint64_t kReapMs = 1'000;  // < kMs
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  const uint64_t anchor_meta = kTombMetaAnchorOnly | kReapMs;
+  ASSERT_LT(kReapMs, kMs);
+  EXPECT_EQ(TombstoneGcAtMs(tomb, anchor_meta, kTtl), kMs + kTtl)
+      << "max() must floor on the stamp's own ms component when the anchor reap time is the "
+         "SMALLER of the two, not replace it with the anchor unconditionally";
+}
+
 TEST(TombstoneGcAtMsTest, SaturatesAtStampMaskInsteadOfOverflowing) {
   const MvccStamp tomb = MvccStamp{MvccClock::kStampMask, 0xAAAA}.AsTombstone();
   // MsPart() of a stamp at kStampMask is still bounded to 43 bits; pair it with a maximal ttl to
@@ -222,10 +250,37 @@ TEST(TombstoneExpiredAtTest, BoundaryIsInclusive) {
   const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
   const uint64_t gc_at = TombstoneGcAtMs(tomb, kTombMetaNone, kTtl);
   EXPECT_TRUE(TombstoneExpiredAt(tomb, kTombMetaNone, kTtl, gc_at))
-      << "now == gc_at must already count as expired -- matches TombstoneGcStep's own `> now_ms` "
-         "skip condition (db_slice.cc) and SerializeTombstones' `<= now_ms` drop condition "
-         "(snapshot.cc), both of which this helper now backs";
+      << "now == gc_at must already count as expired -- the inclusive boundary GC/save-filter "
+         "eligibility has always used, now backed by this one shared helper instead of two "
+         "separately-written comparisons";
   EXPECT_FALSE(TombstoneExpiredAt(tomb, kTombMetaNone, kTtl, gc_at - 1));
+}
+
+// drakeydb: P4-5 -- the boundary must stay inclusive when max() actually floors on
+// the stamp's own ms (meta below MsPart), not just when meta=kTombMetaNone.
+TEST(TombstoneExpiredAtTest, BoundaryIsInclusiveWhenMetaDeadlineIsBelowStampMs) {
+  constexpr uint64_t kMs = 9'000;
+  constexpr uint64_t kMetaMs = 1'000;
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  ASSERT_LT(kMetaMs, kMs);
+  const uint64_t gc_at = TombstoneGcAtMs(tomb, kMetaMs, kTtl);
+  ASSERT_EQ(gc_at, kMs + kTtl);
+  EXPECT_TRUE(TombstoneExpiredAt(tomb, kMetaMs, kTtl, gc_at));
+  EXPECT_FALSE(TombstoneExpiredAt(tomb, kMetaMs, kTtl, gc_at - 1));
+}
+
+TEST(TombstoneExpiredAtTest, BoundaryIsInclusiveWhenAnchorMetaIsBelowStampMs) {
+  constexpr uint64_t kMs = 9'000;
+  constexpr uint64_t kReapMs = 1'000;
+  constexpr uint64_t kTtl = 600'000;
+  const MvccStamp tomb = MvccStamp{kMs << MvccClock::kCounterBits, 0xAAAA}.AsTombstone();
+  const uint64_t anchor_meta = kTombMetaAnchorOnly | kReapMs;
+  ASSERT_LT(kReapMs, kMs);
+  const uint64_t gc_at = TombstoneGcAtMs(tomb, anchor_meta, kTtl);
+  ASSERT_EQ(gc_at, kMs + kTtl);
+  EXPECT_TRUE(TombstoneExpiredAt(tomb, anchor_meta, kTtl, gc_at));
+  EXPECT_FALSE(TombstoneExpiredAt(tomb, anchor_meta, kTtl, gc_at - 1));
 }
 
 // ---------------------------------------------------------------------------

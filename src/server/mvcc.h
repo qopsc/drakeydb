@@ -138,8 +138,9 @@ static_assert(alignof(MvccStamp) == 8,
               "16-byte packing assumes 8-byte alignment; a consumer "
               "(e.g. the side table) may depend on this");
 
-// drakeydb: P4-5 -- the tombstone's 64-bit "meta" word (owner-approved storage: embedded in the
-// mvcc slot's own CompactKey TTL word, not a third MvccStamp field -- see the register for why).
+// drakeydb: P4-5 -- the tombstone's 64-bit "meta" word (embedded in the mvcc slot's own
+// CompactKey TTL word, not a third MvccStamp field: widening MvccStamp itself would cost every
+// live key and explicit tombstone extra bytes for a word only some tombstones ever carry).
 // 0 means no meta: an explicit or legacy tombstone GCs on its own stamp alone, exactly as before
 // this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms). Bit 63 set marks
 // an anchor-only meta (a reap time, never a whole-key deadline) -- TombMetaMs still exposes its ms
@@ -154,14 +155,20 @@ inline uint64_t TombMetaMs(uint64_t meta) {
 // The GC deadline for a tombstone that may also carry a meta word, atop MvccStamp::DeadlineMs
 // above: eligibility floors on whichever of the stamp's own ms component or the meta deadline is
 // later, so a tombstone installed for an already-late whole-key TTL never GCs before that TTL
-// itself would have. meta=kTombMetaNone makes this identical to stamp.DeadlineMs(ttl_ms); every
-// install/apply site still passes that today, with no producer yet minting a real D or an
-// anchor-only R.
+// itself would have. meta=kTombMetaNone makes this identical to stamp.DeadlineMs(ttl_ms) for a
+// VALIDATED ttl (see below); every install/apply site still passes kTombMetaNone today, with no
+// producer yet minting a real D or an anchor-only R.
 //
-// Saturates rather than overflows: unlike DeadlineMs's own plain add (safe because MsPart() is
-// bounded to 43 bits by the wall clock), TombMetaMs(meta) can be as large as kStampMask -- a
-// hostile or corrupted peer meta must not wrap the sum into a small value that looks
-// already-expired.
+// Saturates rather than overflows, but only as a backstop, not a load-bearing guarantee.
+// DeadlineMs's own plain add is safe not because MsPart() alone is bounded (its 43-bit layout
+// does not guarantee that on its own -- pair it with an unvalidated ttl and it still overflows),
+// but because ValidateMultiMasterFlags (multi_master.cc) caps --multi_master_tombstone_ttl at
+// boot; with that validated ttl, and a meta no larger than kStampMask (TombMetaMs's own ceiling,
+// 2^63-1), the sum here cannot actually overflow either. The real risk a hostile or corrupted
+// peer meta poses is a tombstone that never expires -- an install-time clamp to "now" elsewhere
+// handles that -- not wrapping this sum into a small value that looks already-expired; the check
+// still costs nothing, so it stays as a backstop against a ttl reaching this helper unvalidated
+// (e.g. a test's absl::SetFlag).
 inline uint64_t TombstoneGcAtMs(const MvccStamp& stamp, uint64_t meta, uint64_t ttl_ms) {
   const uint64_t base = std::max(stamp.MsPart(), TombMetaMs(meta));
   const uint64_t sum = base + ttl_ms;

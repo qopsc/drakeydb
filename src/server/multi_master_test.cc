@@ -6514,10 +6514,12 @@ TEST_F(MvccStoreTest, DebugMvccReportsTombstoneState) {
       << "printed stamp must match the side table's own tombstone stamp: " << body;
   EXPECT_THAT(body, testing::HasSubstr("origin:"));
 
-  const uint64_t expect_gc_at_ms = TombstoneGcAtMs(*tomb, kTombMetaNone, 600'000);
+  // drakeydb: P4-5 -- pinned independently of TombstoneGcAtMs itself (MsPart() + the
+  // fixture's own ttl_ms, computed by hand): using the helper under test to derive its own
+  // expectation would make this vacuous against a helper that is wrong in the same way.
+  const uint64_t expect_gc_at_ms = tomb->MsPart() + 600'000;
   EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("gc_at_ms:", expect_gc_at_ms)))
-      << "printed gc_at_ms must equal TombstoneGcAtMs(stamp, kTombMetaNone, ttl_ms) exactly: "
-      << body;
+      << "printed gc_at_ms must equal MsPart() + ttl_ms exactly: " << body;
 }
 
 TEST_F(MvccStoreTest, DebugMvccReportsAbsent) {
@@ -6539,6 +6541,8 @@ TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_entries:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_clock_ahead_ms:"));
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_unstamped_writes:"));
+  // drakeydb: P4-5 -- shard<N>_tombstones_born_expired (debugcmd.cc) had no coverage.
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_tombstones_born_expired:"));
 }
 
 // drakeydb: P4-3 Task 8 -- INFO memory got

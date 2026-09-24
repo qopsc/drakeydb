@@ -85,10 +85,12 @@ struct DbTableStats {
   // benchmark output rather than a silent, unbounded fallback to today's resurrection-on-full-sync
   // behavior. Maintained in DbSlice::PerformDeletionAtomic (db_slice.cc).
   size_t mvcc_tombstones_dropped = 0;
-  // drakeydb: P4-5 -- a peer-sourced tombstone install (merge-load or streaming) that was already
-  // past its own GC deadline (TombstoneExpiredAt) the instant it arrived, so it was refused rather
-  // than installed at all. Purely diagnostic, like mvcc_tombstones_dropped above; every install
-  // site still installs unconditionally, with no refusal wired in yet to increment this.
+  // drakeydb: P4-5 -- a tombstone that was already past its own GC deadline (TombstoneExpiredAt)
+  // the instant it was created. Two shapes: a peer-sourced install (merge-load or streaming) is
+  // REFUSED outright and counted here instead of installed; a LOCAL expiry commit is still
+  // committed as usual (the normal lazy/active expiry path never refuses its own key) and only
+  // counted, never refused. Purely diagnostic, like mvcc_tombstones_dropped above; no site checks
+  // against this predicate yet, so it stays 0 either way until one does.
   size_t mvcc_tombstones_born_expired = 0;
 
   // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of
