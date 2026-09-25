@@ -2200,13 +2200,16 @@ TEST_F(MvccStoreTest, TombstoneGcServicesEveryDatabaseUnderRoundRobin) {
 }
 
 namespace {
-// drakeydb: P4-5 -- builds a key that is unconditionally heap-allocated (never inline, never
-// INT_TAG), the same shape TableBytesAccountsForDuplicatedKeyHeapBytes above already validated:
-// a non-numeric leading byte (so CompactObj::SetString's int-parse fast path never fires) and a
-// length over kInlineLen (16) so it is never inline either. `len` also picks which non-inline
-// encoding SetString lands on (SMALL_TAG vs LARGE_STR_TAG), which changes whether re-encoding to
-// SDS_TTL_TAG grows, shrinks, or leaves MallocUsed() unchanged -- see the two call sites below,
-// which deliberately use different lengths for that reason.
+// drakeydb: P4-5 -- builds a key that is heap-allocated, not inline and not INT_TAG, the same
+// shape TableBytesAccountsForDuplicatedKeyHeapBytes above already validated: a non-numeric
+// leading byte (so CompactObj::SetString's int-parse fast path never fires) and a length long
+// enough to escape inlining for real -- `len` alone is NOT sufficient for that in general (a
+// 17-18 char string can still land under CompactObj::kInlineLen (16) via ASCII1_ENC's ~7-bit
+// packing, compact_object.cc), but every length this file actually passes (20+) is safely past
+// that. `SmallString::CanAllocate`'s own ceiling is 255 bytes (small_string.cc), so every length
+// used here lands on the same SMALL_TAG encoding regardless of `len` -- `len` instead changes how
+// SetTombMetaOnSlot's re-encoding to SDS_TTL_TAG happens to land relative to mimalloc's own
+// size-class rounding, which is what actually decides whether that delta is zero or not.
 std::string HeapKey(char prefix, size_t len, int i) {
   std::string suffix = std::to_string(i);
   std::string key(len, '0');

@@ -1570,7 +1570,7 @@ void AppendBinaryDouble(std::string* out, double val) {
   out->append(reinterpret_cast<const char*>(buf), sizeof(buf));
 }
 
-// drakeydb: P4-5 fix round 1 -- hand-encodes an RDB_ENC_INT32 value byte-for-byte the way
+// drakeydb: P4-5 -- hand-encodes an RDB_ENC_INT32 value byte-for-byte the way
 // EncodeInteger (rdb_save.cc, anonymous namespace there, not reachable from this file) does, so a
 // test can construct an aux value identical in shape to what SaveAuxFieldStrInt/TryIntegerEncoding
 // actually write for ctime/used-mem/etc. -- including one deliberately chosen so a payload byte
@@ -1582,7 +1582,7 @@ void AppendEncodedInt32(std::string* out, int32_t val) {
   out->append(reinterpret_cast<const char*>(buf), sizeof(buf));
 }
 
-// drakeydb: P4-5 fix round 1 -- returns the offset of the first opcode at or after `pos` that is
+// drakeydb: P4-5 -- returns the offset of the first opcode at or after `pos` that is
 // NOT RDB_OPCODE_AUX, skipping each aux field's key/value pair along the way. `pos` must already
 // sit on an opcode byte (callers pass the offset right after the 9-byte magic header, where
 // RdbSaver::SaveHeader's own SaveAux writes every aux field, rdb_save.cc). A raw 0xDD byte-scan
@@ -1591,9 +1591,11 @@ void AppendEncodedInt32(std::string* out, int32_t val) {
 // RDB_ENC_INT8/16/32 raw binary rather than decimal text, and any byte of that binary value can
 // coincidentally equal whatever opcode byte a scan is looking for. Every aux value SaveAux
 // actually writes is either a plain length-prefixed string or one of those three integer shapes --
-// never RDB_ENC_LZF (SaveString's compression path only fires above 20 bytes, far longer than any
-// value SaveAux writes) -- so an LZF marker here is rejected loudly (npos) rather than
-// mis-skipped.
+// never RDB_ENC_LZF: aux fields are written through meta_serializer_, constructed with
+// CompressionMode::NONE (RdbSaver::Impl's own constructor, rdb_save.cc), so SaveString's
+// compression path can never fire for them regardless of length -- lua/search-index/snapshot-id
+// values can be far longer than 20 bytes and still never compress. An LZF marker here is
+// therefore rejected loudly (npos) rather than mis-skipped.
 size_t SkipAuxSection(std::string_view bytes, size_t pos) {
   auto skip_string = [&](size_t p) -> size_t {
     if (p >= bytes.size())
@@ -2572,7 +2574,7 @@ TEST_F(RdbTest, EofWithRemoteShardChunksPending) {
   EXPECT_EQ(Run({"EXISTS", key}), 0);
 }
 
-// drakeydb: P4-5 fix round 1 -- deterministic proof of the byte-scan hazard SkipAuxSection exists
+// drakeydb: P4-5 -- deterministic proof of the byte-scan hazard SkipAuxSection exists
 // to close, and of the fix itself, without depending on wall-clock timing or any production hook:
 // hand-builds a minimal RDB-shaped buffer (magic header, one aux field whose value is a
 // hand-encoded RDB_ENC_INT32 -- SaveAuxFieldStrInt's own real shape for ctime/used-mem,
@@ -2609,6 +2611,41 @@ TEST_F(RdbTest, ByteScanMustStartAfterAuxSectionNotOffsetZero) {
       << "SkipAuxSection must land exactly on the first opcode after the aux section";
   EXPECT_EQ(bytes.find(static_cast<char>(0xDD), after_aux), mvcc_pos)
       << "scanning from after the aux section must find only the real mvcc opcode block";
+}
+
+// drakeydb: P4-5 -- the same mechanism as ByteScanMustStartAfterAuxSectionNotOffsetZero above,
+// for RDB_OPCODE_DF_TOMBSTONES (0xE1) instead of RDB_OPCODE_DF_MVCC (0xDD): proves
+// NoTombstoneOpcodeWhenInactive's own SkipAuxSection anchoring is load-bearing, not cosmetic,
+// using a hand-built buffer rather than a live wall-clock-dependent ctime/used-mem collision
+// (infeasible to force on demand for the same reason the 0xDD case above is).
+TEST_F(RdbTest, TombstoneByteScanMustStartAfterAuxSectionNotOffsetZero) {
+  std::string bytes = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);
+  ASSERT_EQ(bytes.size(), 9u);
+  bytes.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&bytes, "used-mem");
+  // 0x12E13456 little-endian is 56 34 e1 12 -- byte 2 of the 4-byte payload is 0xE1.
+  AppendEncodedInt32(&bytes, 0x12E13456);
+  const size_t selectdb_pos = bytes.size();
+  bytes.push_back(static_cast<char>(RDB_OPCODE_SELECTDB));
+  AppendLen(&bytes, 0);
+  const size_t tombstones_pos = bytes.size();
+  bytes.push_back(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES));
+  AppendLen(&bytes, 0);  // db_index
+  AppendLen(&bytes, 0);  // entry count
+
+  // OLD behavior: a scan from offset 0 is fooled by the aux value's own 0xE1 byte.
+  const size_t naive_pos = bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES));
+  ASSERT_NE(naive_pos, std::string::npos);
+  EXPECT_LT(naive_pos, selectdb_pos)
+      << "the coincidental byte must sit inside the aux section for this to be a real repro";
+  EXPECT_NE(naive_pos, tombstones_pos) << "the naive scan must NOT land on the real opcode";
+
+  // NEW behavior: anchored after the aux section, the scan is not fooled by it.
+  const size_t after_aux = SkipAuxSection(bytes, 9);
+  EXPECT_EQ(after_aux, selectdb_pos)
+      << "SkipAuxSection must land exactly on the first opcode after the aux section";
+  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES), after_aux), tombstones_pos)
+      << "scanning from after the aux section must find only the real tombstones opcode";
 }
 
 // drakeydb: P4-2 Task 1 -- pins num_shards=1 (RdbTest's default num_threads_ == 3 gives 2 shards)
@@ -3650,7 +3687,8 @@ TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesLiveKeyButInstallsNoneAtCap) 
 
 // drakeydb: P4-3 Task 5, D-7 -- the write-side counterpart to NoMvccOpcodeOrAuxWhenInactive
 // above: an --active_replica off save must never emit RDB_OPCODE_DF_TOMBSTONES (byte 225 / 0xE1),
-// even though DEL below performs a real delete.
+// even though DEL below performs a real delete. The scan starts at SkipAuxSection(bytes, 9), not
+// offset 0 -- see that helper's own comment for why a scan from offset 0 is unsound.
 TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
   ASSERT_FALSE(IsActiveReplica());
   ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
@@ -3671,7 +3709,9 @@ TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
     return std::move(sink).str();
   });
 
-  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES)), std::string::npos);
+  const size_t scan_start = SkipAuxSection(bytes, 9);
+  ASSERT_NE(scan_start, std::string::npos) << "could not locate the end of the aux section";
+  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES), scan_start), std::string::npos);
 }
 
 // drakeydb: P4-3 Task 5 review fix (I5) -- every tombstone test above uses RdbMvccTest, whose
