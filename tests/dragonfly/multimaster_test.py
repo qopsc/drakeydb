@@ -3154,11 +3154,11 @@ async def _wait_converged_3(c_a, c_b, c_c, key, label, timeout=30):
 async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
     df_factory: DflyInstanceFactory, proxy_factory
 ):
-    """The drop-only design's own reason for existing (owner decision, 2026-09-25): with 3+ nodes,
-    a peer stream carries no cross-link causality, so ADVANCING the tombstone the D-27 veto drops
-    against can permanently delete a genuine re-create authored by a third node the receiver has
-    not yet heard from. This is the data-loss scenario the "advance" design (reverted before this
-    veto shipped) would have reintroduced.
+    """The drop-only design's own reason for existing: with 3+ nodes, a peer stream carries no
+    cross-link causality, so ADVANCING the tombstone the D-27 veto drops against can permanently
+    delete a genuine re-create authored by a third node the receiver has not yet heard from. This
+    is the data-loss scenario the "advance" design (reverted before this veto shipped) would have
+    reintroduced.
 
     Topology: A, B, C in a full mesh, with A's own two consuming links (to B and to C) each routed
     through their own proxy, so either can be paused independently while the other, and every
@@ -3177,13 +3177,17 @@ async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
          still-live (now provably past-D, unreaped) slot. The veto's own lazy reap installs A's
          local whole-key tombstone (this node's own {S, o+1}+D, unrelated to either B's or C's own
          stamps), then drops the delta outright: A ends this step lacking the key.
-      7. A's C-facing proxy is deliberately left paused through all of this -- C's own DEL, stamped
-         BELOW B's later INCR, never reaches A by streaming at all in this test.
-      8. A full sync heals A back into the mesh (detach-all, then a fresh REPLICAOF on every leg,
-         no proxies): the merge-on-load LWW compare (MergeAccepts, mvcc.h -- the SAME rule the
-         streaming veto itself defers to) now decides, not arrival order. A's own local tombstone
-         is OLDER than B's live key (it derives from A's ORIGINAL pre-detach stamp, which predates
-         every event in this scenario), so B's live value wins the merge on A.
+      7. A's C-facing proxy is THEN resumed too, and C's own DEL is drained through to A by
+         ordinary streaming (not yet a full sync): C's DEL is a guarded write, and its own stamp
+         (minted at C's real wall-clock DEL time, after every node's initial convergence) is newer
+         than A's own local tombstone (derived from A's ORIGINAL pre-detach stamp, untouched since)
+         -- it wins the per-key compare on A, replacing A's local tombstone with C's own explicit,
+         meta-less one. A is now an explicit tombstone, diverged from B/C's live re-created key.
+      8. A full sync heals that divergence (detach-all, then a fresh REPLICAOF on every leg, no
+         proxies): the merge-on-load LWW compare (MergeAccepts, mvcc.h -- the SAME rule the
+         streaming veto itself defers to) now decides. B's INCR (step 4) was minted AFTER C's DEL
+         in real time, so B's live key's own stamp is newer than A's current (C's DEL-derived)
+         tombstone -- B's live value wins the merge on A.
       9. Every node ends holding B's re-created key, at B's own stamp -- verified via DEBUG MVCC.
 
     Falsifying: adding the advance the design considered and rejected -- committing
@@ -3192,6 +3196,11 @@ async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
     B's live key, so at step 8's merge it wins instead: the delete propagates to B and C too, and
     the key this test expects to survive is gone everywhere. This is the "advance" design's own
     data-loss case, not merely a slower convergence.
+
+    See test_expired_delta_veto_reorder_residual_identical_stamp_split_survives_remesh (below) for
+    the registered residual this same reorder shape produces when step 4's author (B) issues ONE
+    MORE unguarded delta after step 7's drain, instead of proceeding straight to step 8's full
+    sync.
     """
     # drakeydb: P4-5 -- margin, not a tight bound: TWO sequential _pause_and_settle calls below
     # (each with its own fixed 0.3s settle sleep) plus the post-PEXPIRE propagation sleep already
@@ -3264,7 +3273,18 @@ async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
     dropped = int((await c_a.info("replication"))["multimaster_expired_delta_dropped"])
     assert dropped >= baseline_dropped + 1, f"drop counter did not advance: {dropped}"
 
-    # C's own DEL never reached A by streaming at all -- proxy_ac was never resumed.
+    # Drain C's own DEL to A too, over ordinary streaming (not yet a full sync): C's DEL is a
+    # guarded write, and its own stamp -- minted at C's real wall-clock DEL time, strictly after
+    # every node's initial convergence -- is newer than A's own local tombstone (still A's
+    # ORIGINAL pre-detach stamp, untouched by anything since), so it wins the per-key compare and
+    # replaces A's tombstone with C's own explicit, meta-less one.
+    proxy_ac.resume()
+    await c_c.set("drain-reorder-c", "x")
+    await wait_for_value(c_a, "drain-reorder-c", "x")
+    assert await _exists(c_a, "k") is False, "C's own DEL must still leave A absent"
+    a_tomb_after_drain = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    assert a_tomb_after_drain["state"] == "tombstone", a_tomb_after_drain
+
     await _detach_all_local([c_a, c_b, c_c])
     await attach(c_a, b)
     await wait_for_peers(c_a, 1)
@@ -3295,3 +3315,142 @@ async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
         assert text == "mismatches:0", (label, text)
         unstamped = int((await client.info("replication"))["mvcc_unstamped_writes"])
         assert unstamped == 0, (label, unstamped)
+
+
+async def test_expired_delta_veto_reorder_residual_identical_stamp_split_survives_remesh(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """Pins a REGISTERED residual (D-23, ISSUE-REGISTER.md), not a desired behavior: this test
+    asserts what the drop-only design does TODAY in this narrow shape, so any change to it is
+    noticed, not because the split it produces is the goal.
+
+    Repeats test_expired_delta_veto_survives_three_node_cross_link_reorder's own setup through its
+    own step 7 (the reorder, then draining C's DEL to A too, over ordinary streaming) -- at that
+    point A holds an explicit tombstone stamped at C's own DEL, while B and C hold B's re-created
+    "1" live. Instead of that test's own step 8 (a full sync, which heals the split because B's
+    live stamp is newer than A's tombstone), this test has B issue ONE MORE unguarded delta with
+    no following full-state write (no EXPIRE) -- the shape docs/ISSUE-REGISTER.md's own D-27 entry
+    names as the rate-limiter pattern's OWN self-healing exception, deliberately absent here:
+
+      1. B runs a second `INCR k` (no EXPIRE after it) -- mints a fresh stamp I2, strictly newer
+         than every stamp involved so far. B and C (direct link) converge to "2"@I2.
+      2. That same delta reaches A too (A's own link to B was never re-paused after the drain
+         above). A's CURRENT slot is the explicit (meta-less) tombstone C's DEL left behind in the
+         base test's own step 7 -- meta-less, so this veto never acts on it (case (d) of the unit
+         suite) -- so the delta applies UNGUARDED, in plain arrival order: FloorAppliedStamp
+         (mvcc.h) commits I2 verbatim (it is not older than what A has stored), and INCR on an
+         absent key starts counting from 0 -- A ends at "1"@I2, not "2"@I2.
+      3. A and B (and C) now sit at the IDENTICAL stamp I2 with DIFFERENT values ("1" on A, "2" on
+         B/C) -- D-23's own mechanism, reachable here specifically because the reorder left A on a
+         stale tombstone for one extra hop before this second delta arrived.
+      4. A full re-mesh (detach-all, fresh REPLICAOF on every leg) does NOT heal this: ties favor
+         the stored side (MergeAccepts, mvcc.h), and every node's own stamp for `k` already ties
+         with every other's, so nothing about the merge picks a winner. The split persists.
+
+    This is not asserting the desired outcome -- it is asserting today's, so a real fix (a finer
+    per-key/per-field stamp than one MVCC stamp per key, or CRDT-style deltas -- what would need to
+    change for a delta and a full-state write on the same key to stop competing for the same
+    stamp) changes this test, not merely a regression in it.
+    """
+    px_ms = 3000
+
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    c = df_factory.create(**active_args())
+    df_factory.start_all([a, b, c])
+    c_a, c_b, c_c = a.client(), b.client(), c.client()
+
+    proxy_ab = await proxy_factory(b.port)
+    proxy_ac = await proxy_factory(c.port)
+
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, proxy_ab)
+    await wait_for_peers(c_a, 1)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
+    await attach(c_a, proxy_ac)
+    await wait_for_peers(c_a, 2)
+    await attach(c_b, c)
+    await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
+
+    assert await c_a.set("k", "v0")
+    await wait_for_value(c_b, "k", "v0")
+    await wait_for_value(c_c, "k", "v0")
+    assert await c_a.execute_command("pexpire", "k", str(px_ms)) == 1
+    await asyncio.sleep(0.2)
+    assert int(await c_b.execute_command("pttl", "k")) > 0
+    assert int(await c_c.execute_command("pttl", "k")) > 0
+
+    await _pause_and_settle(proxy_ab, c_b, "settle-residual-b")
+    await _pause_and_settle(proxy_ac, c_c, "settle-residual-c")
+
+    assert await c_c.delete("k") == 1
+
+    @assert_eventually(timeout=10)
+    async def _b_sees_del():
+        assert await _exists(c_b, "k") is False
+
+    await _b_sees_del()
+
+    assert await c_b.incr("k") == 1  # B's first re-create: fresh, absent key, own stamp I < D.
+
+    @assert_eventually(timeout=10)
+    async def _c_sees_first_incr():
+        assert await c_c.get("k") == "1"
+
+    await _c_sees_first_incr()
+
+    await asyncio.sleep(px_ms / 1000 + 0.5)  # past D on the shared wall clock.
+    assert await _exists(c_a, "k") is False, "A must lazily expire its own still-live copy first"
+
+    proxy_ab.resume()
+    await c_b.set("drain-residual-1", "x")
+    await wait_for_value(c_a, "drain-residual-1", "x")
+    assert await _exists(c_a, "k") is False, "the veto must drop B's first, stale INCR"
+
+    proxy_ac.resume()
+    await c_c.set("drain-residual-2", "x")
+    await wait_for_value(c_a, "drain-residual-2", "x")
+    a_tomb = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    assert a_tomb["state"] == "tombstone", a_tomb
+
+    # B's SECOND INCR, deliberately with no EXPIRE after it -- the residual's own trigger.
+    assert await c_b.incr("k") == 2
+    b_stamp2 = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+    assert b_stamp2["state"] == "value", b_stamp2
+
+    await c_c.set("drain-residual-3", "x")
+    await wait_for_value(c_a, "drain-residual-3", "x")
+    await wait_for_value(c_c, "drain-residual-3", "x")
+
+    # The split itself: A holds "1", B/C hold "2", all at the SAME stamp.
+    assert await c_a.get("k") == "1"
+    assert await c_b.get("k") == "2"
+    assert await c_c.get("k") == "2"
+    a_stamp = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    assert a_stamp["state"] == "value", a_stamp
+    assert a_stamp["mvcc"] == b_stamp2["mvcc"], (a_stamp, b_stamp2)
+    assert a_stamp["origin"] == b_stamp2["origin"], (a_stamp, b_stamp2)
+
+    # A full re-mesh must not heal it: ties favor the stored side on every node.
+    await _detach_all_local([c_a, c_b, c_c])
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, c)
+    await wait_for_peers(c_a, 2)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
+    await attach(c_b, c)
+    await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
+
+    await asyncio.sleep(1.0)  # a bounded settle -- there is no "converged" state to poll toward.
+    assert await c_a.get("k") == "1", "the split survives a full re-mesh -- this is the residual"
+    assert await c_b.get("k") == "2"
+    assert await c_c.get("k") == "2"
