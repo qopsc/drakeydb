@@ -93,14 +93,22 @@ struct DbTableStats {
   // against this predicate yet, so it stays 0 either way until one does.
   size_t mvcc_tombstones_born_expired = 0;
 
-  // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of
-  // every key over CompactObj::kInlineLen (16 B). DashTable::mem_usage() (dash.h) only counts
-  // the table's bucket/segment structure, never the hosted keys' own allocations -- see
-  // DbTable::mvcc_table_memory() below, which adds this in. Maintained via the stored key's
-  // MallocUsed() at exactly the three mutation points that already maintain mvcc_entries
-  // (DbSlice::SetMvcc/EnsureMvcc/EraseMvcc, db_slice.cc): += on insert, -= on erase, untouched on
-  // SetMvcc's overwrite path (same key object, no reallocation). Scoped to mvcc only: prime's own
-  // key cost is already covered by AccountObjectMemory's OBJ_KEY tracking (PerformDeletionAtomic,
+  // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of a
+  // key's content. DashTable::mem_usage() (dash.h) only counts the table's bucket/segment
+  // structure, never the hosted keys' own allocations -- see DbTable::mvcc_table_memory() below,
+  // which adds this in. Originally scoped to keys over CompactObj::kInlineLen (16 B) -- those were
+  // the only ones with a non-zero MallocUsed() before P4-5 -- but P4-5's tombstone meta word can
+  // put ANY key, including a previously-inline one, into a heap-allocated SDS_TTL_TAG
+  // representation, so this now covers every key; it is simply 0 for one that stays inline.
+  // Maintained at four mutation points, all via the stored key's own before/after MallocUsed():
+  // DbSlice::SetMvcc/EnsureMvcc's insert branches and EraseMvcc (db_slice.cc, += on insert, -= on
+  // erase), and DbSlice::SetTombMetaOnSlot (db_slice.cc) -- P4-5's shared helper for every writer
+  // of the meta word (SetTombstone, SetTombMeta, TEST_ForceTombMeta, and EnsureMvcc/SetMvcc's own
+  // tombstone->live clearing branches), whose delta can grow, shrink, or leave this field
+  // unchanged depending on how the key's own encoding happens to re-size. SetMvcc's own
+  // overwrite-without-a-meta-change path still reallocates nothing (same key object, untouched);
+  // it is specifically a meta-word write that can. Scoped to mvcc only: prime's own key cost is
+  // already covered by AccountObjectMemory's OBJ_KEY tracking (PerformDeletionAtomic,
   // db_slice.cc), which is a different accounting path (memory_usage_by_type, not a bytes field
   // exposed on DbTableStats directly). mcflag (DashTable<PrimeKey, uint32_t, ...>) has the same
   // per-key duplication blind spot mvcc had, but no metric field surfaces its table_memory()

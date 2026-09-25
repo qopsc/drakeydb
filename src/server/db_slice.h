@@ -442,7 +442,12 @@ class DbSlice {
   //
   // drakeydb: P4-5 -- `meta` sets (or, at kTombMetaNone, clears) the tombstone's meta word in the
   // same call; every existing caller passes nothing and keeps installing a meta-less tombstone,
-  // exactly as before this parameter existed.
+  // exactly as before this parameter existed. The default is not "leave whatever was there
+  // alone" -- a call that omits `meta` CLEARS it, same as passing kTombMetaNone explicitly, since
+  // this always writes the slot's complete new state (see the definition's own comment,
+  // db_slice.cc). A future tombstone->tombstone update (e.g. re-advancing an already-installed
+  // deadline) that must keep the existing meta has to read it first (GetTombMeta) and pass it
+  // back explicitly -- there is no implicit carry-over.
   void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                     uint64_t meta = kTombMetaNone);
   // drakeydb: P4-4 -- installs `stamp` as an ABSENT key's tombstone: the caller has already
