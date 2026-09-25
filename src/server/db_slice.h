@@ -483,8 +483,10 @@ class DbSlice {
   // identical shape via a full sync, rather than copied a third time there; by SetCmd::Set's
   // already-expired absent-key branch, OpRestore, and Renamer::DeserializeDest (string_family.cc
   // / generic_family.cc); and by generic_family.cc's RecordAbsentKeyRemoval (the D-20 fix), whose
-  // own five call sites cover DEL/UNLINK/GETDEL, the RENAME/RENAMENX source, the MOVE source, and
+  // own four call sites cover DEL/UNLINK/GETDEL, the RENAME/RENAMENX source (same-shard OpRen and
+  // its cross-shard Renamer::SerializeSrc twin, each gated against a self-rename/COPY no-op), and
   // a same-shard SORT ... STORE empty-result destination replaying against an already-absent key.
+  // MOVE deliberately does NOT call it (OpMove's own comment, generic_family.cc): D-18.
   //
   // NOTE: the same write landing on a PRESENT live key (stored S < incoming X) never reaches this
   // call -- SetCmd::DeleteExpiredKey / OpRestore's found_prev branch deletes it through the

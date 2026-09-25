@@ -399,25 +399,38 @@ void RecordFullStateJournal(const OpArgs& op_args, string_view key, const PrimeK
 
 OpStatus OpPersist(const OpArgs& op_args, string_view key);
 
-// drakeydb: P4-5 -- D-20 fix, generalized to every server-side removal (controller ruling R40, D-20
-// ISSUE-REGISTER.md). On a guarded applied entry (LwwGuardActive), a removal of `key` that finds it
-// already absent -- never resident here, or just reaped a moment ago by the caller's own
-// FindMutable -- left the older stored state untouched, so a later write timestamped between an
-// existing tombstone and this delete's own stamp applied here while every peer that actually held
-// the key already dropped it. Installs the author's own stamp, tombstone bit set, as this key's new
-// tombstone whenever it still beats whatever is stored: `stamp.AsTombstone()` (mvcc.h), never
-// ExpiryTombstoneFor -- this is an EXPLICIT delete the author itself issued against a key it held
-// live, not a value expiring on its own -- and `kTombMetaNone`, since an explicit delete carries no
-// deadline for a later D-27 veto to act on. Re-reads the CURRENT stamp via GetMvcc rather than
-// trusting any pre-FindMutable snapshot a caller took: a lazy reap inside that FindMutable call can
-// have just installed a fresh ExpiryTombstoneFor(S) for this very key, and this call must still
-// beat that (via MergeAccepts) before overwriting it. Journals nothing and never counts as a
-// command-level delete -- every caller reaches this only on its own "nothing here to remove"
-// branch, already returning/continuing without touching its own reply counter or RecordJournal.
-// Callers: OpDelV2 below (DEL/UNLINK, and GETDEL rewritten pre-dispatch to DEL --
-// multimaster_lww.h) for both an absent key and one FindMutable just reaped;
-// Renamer::SerializeSrc's cross-shard RENAME/RENAMENX source and OpRen's same-shard twin; OpMove's
-// source db; and OpStore's SORT ... STORE empty-result destination.
+// drakeydb: P4-5 -- D-20 fix (ISSUE-REGISTER.md), generalized to every server-side removal whose
+// own journaled command GENUINELY IMPLIES the author removed `key`. On a guarded applied entry
+// (LwwGuardActive), a removal of `key` that finds it already absent -- never resident here, or
+// just reaped a moment ago by the caller's own FindMutable -- left the older stored state
+// untouched, so a later write timestamped between an existing tombstone and this delete's own
+// stamp applied here while every peer that actually held the key already dropped it. Installs the
+// author's own stamp, tombstone bit set, as this key's new tombstone whenever it still beats
+// whatever is stored: `stamp.AsTombstone()` (mvcc.h), never ExpiryTombstoneFor -- this call site's
+// own callers only ever reach it for an EXPLICIT delete, not a value expiring on its own -- and
+// `kTombMetaNone`, since an explicit delete carries no deadline for a later D-27 veto to act on.
+// Re-reads the CURRENT stamp via GetMvcc rather than trusting any pre-FindMutable snapshot a
+// caller took: a lazy reap inside that FindMutable call can have just installed a fresh
+// ExpiryTombstoneFor(S) for this very key, and this call must still beat that (via MergeAccepts)
+// before overwriting it. Journals nothing and never counts as a command-level delete -- every
+// caller reaches this only on its own "nothing here to remove" branch, already
+// returning/continuing without touching its own reply counter or RecordJournal.
+//
+// CALLER CONTRACT: only call this when the replayed command's own success at the author
+// PROVES a removal happened -- not merely that this receiver doesn't have `key`. A command that
+// the author journals regardless of outcome (MOVE, D-18) or that can succeed as a genuine no-op
+// against a key it never touches (RENAME/COPY onto/from the same key) fails that proof: the
+// author's own FindMutable still arms and restamps a LIVE key to the wire mvcc through the
+// AutoUpdater even when nothing was actually removed, so a receiver that installs a tombstone for
+// that same stamp ends up tombstoned while the author (and every other receiver still holding the
+// key live) converges on a live value at the identical stamp -- order-equal once the tombstone bit
+// is masked, so a later full sync's own tie permanently favors the WRONG (tombstoned) side. Callers
+// that satisfy the contract: OpDelV2 below (DEL/UNLINK, and GETDEL rewritten pre-dispatch to DEL --
+// multimaster_lww.h) for both an absent key and one FindMutable just reaped; OpRen's same-shard
+// RENAME/RENAMENX source, gated on `from_key != to_key` (a self-rename is always a live no-op);
+// Renamer::SerializeSrc's cross-shard twin, gated on `!do_copy_` (COPY never removes its source);
+// and OpStore's SORT ... STORE empty-result destination. OpMove does NOT call this (see its own
+// comment) -- MOVE is a D-18 recipe precisely because it fails this contract on every outcome.
 void RecordAbsentKeyRemoval(const OpArgs& op_args, DbIndex db_ind, string_view key) {
   const DbContext& db_cntx = op_args.db_cntx;
   if (!LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc))
@@ -427,10 +440,23 @@ void RecordAbsentKeyRemoval(const OpArgs& op_args, DbIndex db_ind, string_view k
   if (!incoming)
     return;
   auto& db_slice = op_args.GetDbSlice();
-  if (!MergeAccepts(db_slice.GetMvcc(db_ind, key), *incoming))
+  const std::optional<MvccStamp> stored = db_slice.GetMvcc(db_ind, key);
+  if (!MergeAccepts(stored, *incoming))
     return;
-  db_slice.InstallAbsentKeyTombstone(db_ind, key, incoming->AsTombstone(), kTombMetaNone,
-                                     db_cntx.time_now_ms);
+  const MvccStamp new_tomb = incoming->AsTombstone();
+  // drakeydb: P4-5 -- a refused (born-expired) install still proves the author's own removal
+  // happened strictly after whatever deadline the EXISTING tombstone's own meta describes (the
+  // MergeAccepts check above already established stored < X): clear that stale D so a later
+  // expired-delta veto can never act on it, even though the tombstone's own stamp keeps its old,
+  // now meta-less value (the install itself is refused, so the stamp cannot advance to X here).
+  // Recomputes the SAME born-expired decision InstallAbsentKeyTombstone makes below (its own
+  // `meta` clamps to itself at kTombMetaNone regardless, so there is nothing to duplicate wrongly)
+  // rather than threading a return value through it.
+  if (stored.has_value() && stored->IsTombstone() &&
+      DbSlice::TombstoneBornExpired(new_tomb, kTombMetaNone, db_cntx.time_now_ms)) {
+    db_slice.SetTombMeta(db_ind, key, kTombMetaNone);
+  }
+  db_slice.InstallAbsentKeyTombstone(db_ind, key, new_tomb, kTombMetaNone, db_cntx.time_now_ms);
 }
 
 class Renamer {
@@ -589,7 +615,11 @@ void Renamer::SerializeSrc(Transaction* t, EngineShard* shard) {
     // drakeydb: P4-5 -- D-20 fix: reached whenever this receiver's own shard count hashes
     // src/dest onto different shards for a RENAME/RENAMENX the author committed same-shard (see
     // RecordAbsentKeyRemoval's own comment, above). OpRen covers the same-shard twin below.
-    RecordAbsentKeyRemoval(t->GetOpArgs(shard), t->GetDbIndex(), src_key_);
+    // Gated on `!do_copy_`: COPY never removes its source, so a COPY replayed against a source
+    // this receiver doesn't have proves nothing about removal -- only that the receiver lacks it,
+    // which may be true for reasons unrelated to this command entirely.
+    if (!do_copy_)
+      RecordAbsentKeyRemoval(t->GetOpArgs(shard), t->GetDbIndex(), src_key_);
     return;
   }
 
@@ -1393,9 +1423,10 @@ OpStatus OpMove(const OpArgs& op_args, string_view key, DbIndex target_db) {
   // Fetch value at key in current db.
   auto from_res = db_slice.FindMutable(op_args.db_cntx, key);
   if (!IsValid(from_res.it)) {
-    // drakeydb: P4-5 -- D-20 fix: install the tombstone in the SOURCE db, where the key is
-    // actually absent (see RecordAbsentKeyRemoval's own comment, above Renamer).
-    RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, key);
+    // drakeydb: P4-5 -- deliberately NO RecordAbsentKeyRemoval call here: MOVE's own hand-journal
+    // (below in this file) fires on every outcome, including KEY_EXISTS/KEY_NOTFOUND, so a
+    // receiver can never tell from this entry alone whether the author's MOVE actually removed
+    // anything -- D-18, ISSUE-REGISTER.md (RecordAbsentKeyRemoval's own comment, above Renamer).
     return OpStatus::KEY_NOTFOUND;
   }
 
@@ -1462,8 +1493,12 @@ OpResult<void> OpRen(const OpArgs& op_args, string_view from_key, string_view to
   if (!IsValid(from_res.it)) {
     // drakeydb: P4-5 -- D-20 fix, the same-shard RENAME/RENAMENX source (see
     // RecordAbsentKeyRemoval's own comment, above Renamer; Renamer::SerializeSrc covers the
-    // cross-shard twin).
-    RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, from_key);
+    // cross-shard twin). Gated on `from_key != to_key`: RENAME k k on a LIVE key at the author
+    // still succeeds (a no-op) and still gets journaled/restamped through FindMutable's own
+    // AutoUpdater, so replaying it against a source this receiver doesn't have proves nothing
+    // about removal.
+    if (from_key != to_key)
+      RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, from_key);
     return OpStatus::KEY_NOTFOUND;
   }
 
@@ -1692,11 +1727,13 @@ OpResult<uint32_t> OpDelV2(const OpArgs& op_args, const ShardArgs& keys, bool as
     it.post_updater.Run();  // Run before Del
 
     if (!IsValid(it.it)) {
-      // drakeydb: P4-5 -- D-20 fix: `key` is absent here either because it never existed (the
-      // split check above only drops a STALE incoming stamp; an absent key has no stored stamp to
-      // be stale against) or because FindMutable just lazily reaped it a line above. Either way,
-      // preserved below: `deleted_cnt` and `journal_args` stay untouched, so an all-absent DEL
-      // still keeps deleted_cnt == 0 and never calls ClearBuffer.
+      // drakeydb: P4-5 -- D-20 fix: `key` is absent here for one of three reasons: it never
+      // existed (GetMvcc returns nullopt, trivially not stale); it already carried an OLDER
+      // tombstone that X beats (the split check above only drops a STALE incoming stamp, and X
+      // passed it -- an absent key can still have a stored stamp, just not a LIVE one); or
+      // FindMutable just lazily reaped it a line above, installing a tombstone the split check
+      // never saw at all. Either way, preserved below: `deleted_cnt` and `journal_args` stay
+      // untouched, so an all-absent DEL still keeps deleted_cnt == 0 and never calls ClearBuffer.
       RecordAbsentKeyRemoval(op_args, db_cntx.db_index, key);
       continue;
     }

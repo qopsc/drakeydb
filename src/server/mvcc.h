@@ -97,7 +97,9 @@ struct MvccStamp {
   // delta RMW applied on a node that already reaped the key -- ties against this tombstone
   // forever, permanently unrepairable once it is GC'd. Every caller mints or advances a stamp
   // strictly greater than the value's before calling this: MvccStamper::Commit's own commit-time
-  // bit-set for an ordinary (non-expiry) delete, and ExpiryTombstoneFor (below) for every expiry
+  // bit-set for an ordinary (non-expiry) delete; RecordAbsentKeyRemoval's own direct call
+  // (generic_family.cc) for a guarded removal replayed against a key already absent here, on the
+  // author's own freshly-minted incoming stamp; and ExpiryTombstoneFor (below) for every expiry
   // tombstone -- local (MvccStamper::CommitOwnTombstone), the member-expiry reaper
   // (DbSlice::DeleteReapedContainer, db_slice.cc), and a merge load's synthetic tombstone for an
   // already-expired incoming key (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc)
@@ -143,8 +145,9 @@ static_assert(alignof(MvccStamp) == 8,
 // live key and explicit tombstone extra bytes for a word only some tombstones ever carry).
 // 0 means no meta: an explicit or legacy tombstone GCs on its own stamp alone, exactly as before
 // this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms) for a value that was
-// an OBJ_STRING -- the one type that can vanish solely through an explicit, guarded, full-state
-// delete, making D a sound veto premise for a later re-create. Bit 63 set marks an ANCHOR: a
+// an OBJ_STRING -- every one of that type's replayed removals installs an explicit tombstone,
+// including one that finds the key already absent here (RecordAbsentKeyRemoval, generic_family.cc,
+// the D-20 fix), making D a sound veto premise for a later re-create. Bit 63 set marks an ANCHOR: a
 // member-TTL reap time R for the member-expiry reaper and the container-emptying helpers, but also
 // a whole-key deadline D for every non-string type's whole-key expiry and elapsed-on-arrival
 // install -- a container can also vanish through an ordinary delta well before D, so its own D is
