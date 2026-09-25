@@ -2670,7 +2670,12 @@ error_code RdbLoader::Load(io::Source* src) {
     }
 
     if (type == RDB_OPCODE_DF_TOMBSTONES) {
-      RETURN_ON_ERR(HandleTombstones());
+      RETURN_ON_ERR(HandleTombstones(/*has_meta=*/false));
+      continue;
+    }
+
+    if (type == RDB_OPCODE_DF_TOMBSTONES_V2) {
+      RETURN_ON_ERR(HandleTombstones(/*has_meta=*/true));
       continue;
     }
 
@@ -4333,18 +4338,23 @@ error_code RdbLoader::HandleShardDocIndex() {
   return kOk;
 }
 
-// drakeydb: P4-3 Task 5 -- read side of RDB_OPCODE_DF_TOMBSTONES (rdb_extensions.h). D-7's single
-// most important compatibility rule applies here exactly as it did to RDB_OPCODE_DF_MVCC (P4-2):
-// this read is UNCONDITIONAL. Every binary loading this stream -- active or not -- must consume
-// every byte of this section before the next opcode, or the stream desyncs the instant an active
-// node's snapshot reaches any other node. Whether a parsed entry is actually installed is a
-// separate, per-entry, active-only decision below.
+// drakeydb: P4-3 Task 5, extended by P4-5 -- read side of RDB_OPCODE_DF_TOMBSTONES (225) and
+// RDB_OPCODE_DF_TOMBSTONES_V2 (rdb_extensions.h). D-7's single most important compatibility rule
+// applies here exactly as it did to RDB_OPCODE_DF_MVCC (P4-2): this read is UNCONDITIONAL. Every
+// binary loading this stream -- active or not -- must consume every byte of this section before
+// the next opcode, or the stream desyncs the instant an active node's snapshot reaches any other
+// node. Whether a parsed entry is actually installed is a separate, per-entry, active-only
+// decision below.
 //
-// Format: [db_index][count][count x {key, packed, origin_hash}] -- db_index/count are
-// RDB-length-encoded, key is an RDB string, and {packed, origin_hash} are the same 16 raw LE
-// bytes RDB_OPCODE_DF_MVCC uses for a per-key stamp (FetchInt<uint64_t> pair below mirrors that
-// opcode's own read, above in this file).
-error_code RdbLoader::HandleTombstones() {
+// Format: [db_index][count][count x {key, packed, origin_hash}], plus a trailing [meta] word per
+// entry when `has_meta` -- db_index/count are RDB-length-encoded, key is an RDB string, and
+// {packed, origin_hash} are the same 16 raw LE bytes RDB_OPCODE_DF_MVCC uses for a per-key stamp
+// (FetchInt<uint64_t> pair below mirrors that opcode's own read, above in this file). `has_meta`
+// is false for a 225 record (meta installs as kTombMetaNone, exactly as before this record kind
+// carried meta at all) and true for a V2 one (meta is this entry's own trailing 8-byte LE word).
+error_code RdbLoader::HandleTombstones(bool has_meta) {
+  const char* const kOpcodeName =
+      has_meta ? "RDB_OPCODE_DF_TOMBSTONES_V2" : "RDB_OPCODE_DF_TOMBSTONES";
   // drakeydb: P4-3 Task 5 review fix (I3) -- mirrors RDB_OPCODE_SELECTDB's own validation
   // (above in this file) exactly: without this, a malformed db_index narrowed silently through
   // SET_OR_RETURN's plain uint64->DbIndex assignment and drove ActivateDb on a db SELECTDB
@@ -4370,6 +4380,13 @@ error_code RdbLoader::HandleTombstones() {
     SET_OR_RETURN(FetchInt<uint64_t>(), packed);
     uint64_t origin_hash;
     SET_OR_RETURN(FetchInt<uint64_t>(), origin_hash);
+    // drakeydb: P4-5 -- the V2 record's one extra wire field, read unconditionally (D-7) exactly
+    // like every other field above: a non-active loader must still consume it in full, or the
+    // next opcode byte desyncs. kTombMetaNone for a 225 record, which carries no such word.
+    uint64_t meta = kTombMetaNone;
+    if (has_meta) {
+      SET_OR_RETURN(FetchInt<uint64_t>(), meta);
+    }
 
     if (!active)
       continue;  // parsed and discarded -- D-7's read-unconditional / install-active-only split.
@@ -4386,8 +4403,8 @@ error_code RdbLoader::HandleTombstones() {
       // A live stamp (bit 63 clear) has no business in the tombstone section -- a malformed
       // file; our own saver never produces this. Diagnostic, not fatal: skip this entry only.
       if (!warned_tombstone_not_flagged_) {
-        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
-                     << "' in DB " << db_index
+        LOG(WARNING) << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
+                     << db_index
                      << " has bit 63 clear (not a tombstone) -- skipping; malformed file";
         warned_tombstone_not_flagged_ = true;
       }
@@ -4405,8 +4422,8 @@ error_code RdbLoader::HandleTombstones() {
       // immortal: never reaped, and the strict minimum of every future merge comparison,
       // blocking a resurrection forever instead of merely delaying it. Reject, never install.
       if (!warned_tombstone_zero_mvcc_) {
-        LOG(WARNING) << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key)
-                     << "' in DB " << db_index
+        LOG(WARNING) << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
+                     << db_index
                      << " has Mvcc() == 0 -- skipping; installing it would be immortal (never "
                         "reaped, always wins future merge comparisons)";
         warned_tombstone_zero_mvcc_ = true;
@@ -4430,7 +4447,7 @@ error_code RdbLoader::HandleTombstones() {
     // every loader, not just under merge_lww_.
     const ShardId sid = Shard(key, shard_set->size());
     auto install =
-        [db_index, key, stamp, merge_lww = merge_lww_] {
+        [db_index, key, stamp, meta, merge_lww = merge_lww_, kOpcodeName] {
           DbSlice& db_slice = GetCurrentDbSlice();
           // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
           // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
@@ -4491,15 +4508,16 @@ error_code RdbLoader::HandleTombstones() {
           // kept only so that second case still falls through to the non-merge behavior below,
           // which is already safe for it.
           if (merge_lww && mvcc_ready) {
-            // drakeydb: P4-5 -- kTombMetaNone: an RDB_OPCODE_DF_TOMBSTONES (225) record carries no
-            // meta on the wire at all yet (the V2 tombstone opcode carries it) -- matches this
-            // function's OTHER, non-merge install of the identical record just below, which also
-            // passes kTombMetaNone explicitly. now_ms is read once here, this lambda's own only use
-            // of the clock: unlike CreateObjectOnShard's merge-load caller (above in this file),
-            // this `install` lambda carries no pre-existing DbContext/batch clock of its own to
-            // reuse, and a meta-less clamp is a no-op regardless of the exact reading passed.
-            ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live,
-                                       kTombMetaNone, GetCurrentTimeMs());
+            // drakeydb: P4-5 -- `meta` is this entry's own wire value: kTombMetaNone for a 225
+            // record (carries none), or the record's own trailing word for a V2 one -- matches
+            // this function's OTHER, non-merge install of the identical record just below, which
+            // reads the same captured `meta`. now_ms is read once here, this lambda's own only
+            // use of the clock: unlike CreateObjectOnShard's merge-load caller (above in this
+            // file), this `install` lambda carries no pre-existing DbContext/batch clock of its
+            // own to reuse; the clamp is a genuine, not merely no-op, use of that reading for a
+            // V2 record carrying a real deadline.
+            ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live, meta,
+                                       GetCurrentTimeMs());
             return;
           }
 
@@ -4522,7 +4540,7 @@ error_code RdbLoader::HandleTombstones() {
           // exactly this).
           if (resident_live) {
             LOG_FIRST_N(WARNING, 1)
-                << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key) << "' in DB "
+                << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
                 << db_index
                 << " names a key that already holds a live, resident value on this node -- keeping "
                    "the resident value and skipping the tombstone";
@@ -4538,13 +4556,13 @@ error_code RdbLoader::HandleTombstones() {
           // function, above) and TombstoneGcStep's own reap predicate both exist to prevent,
           // reached here via a third route this function's other two gates do not cover: a
           // non-merge load (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's
-          // full sync) of a file carrying an opcode 225 tombstone section -- most concretely, this
-          // node's own prior SAVE/BGSAVE output, reloaded after an operator flips
+          // full sync) of a file carrying a tombstone section -- most concretely, this node's own
+          // prior SAVE/BGSAVE output, reloaded after an operator flips
           // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
           // no-op below so the warning fires on the actually-relevant cause when both are true.
           if (!TombstonesEnabled()) {
-            LOG_FIRST_N(WARNING, 1) << "RDB_OPCODE_DF_TOMBSTONES entry for key '"
-                                    << absl::CHexEscape(key) << "' in DB " << db_index
+            LOG_FIRST_N(WARNING, 1) << kOpcodeName << " entry for key '" << absl::CHexEscape(key)
+                                    << "' in DB " << db_index
                                     << " skipped -- tombstoning is disabled on this node "
                                        "(--multi_master_tombstone_ttl=0)";
             return;
@@ -4586,15 +4604,20 @@ error_code RdbLoader::HandleTombstones() {
           if (!cur_table->mvcc) {
             return;
           }
-          // drakeydb: P4-5 -- refuse outright, before even consulting the cap: an
-          // RDB_OPCODE_DF_TOMBSTONES record carries no meta (kTombMetaNone, explicit below), so
-          // this reduces to the stamp's own deadline -- if it is already GC-eligible at this
-          // install-time `now_ms`, installing it would do nothing but cost a slot until the very
-          // next GC step reaps it, same as every other peer-sourced tombstone install.
+          // drakeydb: P4-5 -- refuse outright, before even consulting the cap: `meta`
+          // (kTombMetaNone for a 225 record, its own trailing wire word for a V2 one) plus the
+          // stamp's own deadline together decide GC eligibility (DbSlice::TombstoneBornExpired) --
+          // if this entry is already GC-eligible at this install-time `now_ms`, installing it would
+          // do nothing but cost a slot until the very next GC step reaps it, same as every other
+          // peer-sourced tombstone install. `meta` is clamped against `now_ms` first
+          // (ClampPeerTombMetaDeadline preserves the anchor bit), the same install-time clamp every
+          // other peer-sourced meta install uses -- a hostile or far-future V2 meta can never
+          // outlive what this node's own clock would have produced.
           const uint64_t now_ms = GetCurrentTimeMs();
-          if (DbSlice::TombstoneBornExpired(stamp, kTombMetaNone, now_ms)) {
+          const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, now_ms);
+          if (DbSlice::TombstoneBornExpired(stamp, clamped_meta, now_ms)) {
             ++cur_table->stats.mvcc_tombstones_born_expired;
-            VLOG(2) << "refusing born-expired RDB_OPCODE_DF_TOMBSTONES install: db=" << db_index
+            VLOG(2) << "refusing born-expired " << kOpcodeName << " install: db=" << db_index
                     << " key=" << absl::CHexEscape(key);
             return;
           }
@@ -4602,9 +4625,9 @@ error_code RdbLoader::HandleTombstones() {
           const bool would_grow = !existing.has_value() || !existing->IsTombstone();
           if (!would_grow ||
               cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-            // drakeydb: P4-5 -- kTombMetaNone, explicit: this RDB_OPCODE_DF_TOMBSTONES (225)
-            // record carries no meta on the wire at all yet (the V2 tombstone opcode carries it).
-            db_slice.SetTombstone(db_index, key, stamp, kTombMetaNone);
+            // drakeydb: P4-5 -- the clamped meta computed above: kTombMetaNone for a 225 record
+            // (the clamp is then a no-op), or the V2 record's own clamped deadline/anchor.
+            db_slice.SetTombstone(db_index, key, stamp, clamped_meta);
           } else {
             ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
           }

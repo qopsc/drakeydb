@@ -353,10 +353,10 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
 
 // drakeydb: P4-3 Task 5 -- see the declaration (rdb_save.h) for why this is factored out rather
 // than inlined at each call site: it is the same 16-byte {packed, origin_hash} LE encoding
-// SaveEntry above writes inline for RDB_OPCODE_DF_MVCC, reused verbatim for
-// RDB_OPCODE_DF_TOMBSTONES's per-entry stamp so the two opcodes can never drift apart on wire
-// format. SaveEntry's own inline block is left untouched (not refactored to call this) to avoid
-// touching an already-reviewed, byte-exact-tested path for a two-line saving.
+// SaveEntry above writes inline for RDB_OPCODE_DF_MVCC, reused verbatim for the tombstone
+// opcodes' per-entry stamp so they can never drift apart on wire format. SaveEntry's own inline
+// block is left untouched (not refactored to call this) to avoid touching an already-stable,
+// byte-exact-tested path for a two-line saving.
 error_code RdbSerializer::SaveMvccStampBits(const MvccStamp& stamp) {
   uint8_t buf[16];
   absl::little_endian::Store64(buf, stamp.packed);
@@ -364,30 +364,35 @@ error_code RdbSerializer::SaveMvccStampBits(const MvccStamp& stamp) {
   return WriteRaw(Bytes{buf, sizeof(buf)});
 }
 
-// drakeydb: P4-3 Task 5 review fix (I1) -- see the declaration (rdb_save.h) for the full
-// contract. Mirrors SaveEntry's own StartEntry()/FinishEntry(bool) transaction above exactly:
-// `save_succeeded` starts false, the Cleanup rolls back everything written since StartEntry() if
-// this returns before flipping it to true, and it is only flipped once every field below has
-// been written successfully. That makes a bare opcode with no payload, or a payload short of its
-// own announced `count`, structurally impossible to leave in the buffer -- a mid-section failure
-// removes the whole section, opcode included, rather than leaving a partial one for the next
-// opcode byte to desync against.
-error_code RdbSerializer::SaveTombstoneSection(
-    DbIndex db_index, absl::Span<const std::pair<std::string, MvccStamp>> entries) {
+// drakeydb: P4-5 -- see the declaration (rdb_save.h) for the full contract. Mirrors SaveEntry's
+// own StartEntry()/FinishEntry(bool) transaction above exactly: `save_succeeded` starts false,
+// the Cleanup rolls back everything written since StartEntry() if this returns before flipping
+// it to true, and it is only flipped once every field below has been written successfully. That
+// makes a bare opcode with no payload, or a payload short of its own announced `count`,
+// structurally impossible to leave in the buffer -- a mid-section failure removes the whole
+// section, opcode included, rather than leaving a partial one for the next opcode byte to
+// desync against. Writes RDB_OPCODE_DF_TOMBSTONES_V2 -- the ONLY tombstone opcode an active node
+// emits (RDB_OPCODE_DF_TOMBSTONES/225's own writer is retired, rdb_extensions.h).
+error_code RdbSerializer::SaveTombstoneSectionV2(
+    DbIndex db_index, absl::Span<const std::tuple<std::string, MvccStamp, uint64_t>> entries) {
   mem_buf_controller_.StartEntry();
   bool save_succeeded = false;
   absl::Cleanup cleanup = [&] { mem_buf_controller_.FinishEntry(save_succeeded); };
 
-  if (auto ec = WriteOpcode(RDB_OPCODE_DF_TOMBSTONES); ec)
+  if (auto ec = WriteOpcode(RDB_OPCODE_DF_TOMBSTONES_V2); ec)
     return ec;
   if (auto ec = SaveLen(db_index); ec)
     return ec;
   if (auto ec = SaveLen(entries.size()); ec)
     return ec;
-  for (const auto& [key, stamp] : entries) {
+  for (const auto& [key, stamp, meta] : entries) {
     if (auto ec = SaveString(key); ec)
       return ec;
     if (auto ec = SaveMvccStampBits(stamp); ec)
+      return ec;
+    uint8_t buf[8];
+    absl::little_endian::Store64(buf, meta);
+    if (auto ec = WriteRaw(Bytes{buf, sizeof(buf)}); ec)
       return ec;
   }
 

@@ -129,8 +129,8 @@ void SliceSnapshot::Start(bool stream_journal, SnapshotFlush allow_flush) {
                                   std::bind(&SliceSnapshot::PushSerialized, this, false));
     }
     // drakeydb: P4-3 Task 5 -- unlike serialize_index above (search-specific, version-gated),
-    // this runs unconditionally: RDB_OPCODE_DF_TOMBSTONES's own write-gate (IsActiveReplica() +
-    // non-empty table, checked inside) decides whether anything is actually emitted.
+    // this runs unconditionally: RDB_OPCODE_DF_TOMBSTONES_V2's own write-gate (IsActiveReplica()
+    // + non-empty table, checked inside) decides whether anything is actually emitted.
     this->SerializeTombstones();
     this->IterateBucketsFb(stream_journal);
     UnregisterChangeListener();
@@ -203,7 +203,7 @@ void SliceSnapshot::SerializeTombstones() {
   // drakeydb: P4-3 Task 5 review fix (I2) -- bounds this section's peak RAM to one chunk's worth
   // of tombstones, not the whole db's (a whole-db materialize + single trailing push was ~2
   // copies of every tombstone in RAM at the default cap, with no yield/throttle for the entire
-  // span). Emits one RDB_OPCODE_DF_TOMBSTONES section PER CHUNK instead of one section for the
+  // span). Emits one RDB_OPCODE_DF_TOMBSTONES_V2 section PER CHUNK instead of one section for the
   // whole db; the loader (HandleTombstones, rdb_load.cc) already treats any number of sections
   // per db as ordinary repeats of the same opcode, so a db needing multiple chunks is invisible
   // on the read side. Matches SearchSerializer's own HNSW node batching (serialization_utils.cc,
@@ -215,15 +215,15 @@ void SliceSnapshot::SerializeTombstones() {
     if (!db || !db->mvcc)
       continue;
 
-    std::vector<std::pair<std::string, MvccStamp>> chunk;
-    // drakeydb: P4-3 Task 5 review fix (I1) -- SaveTombstoneSection (rdb_save.h/.cc) writes the
-    // whole chunk as one all-or-nothing unit; on failure it logs and drops just this chunk
-    // (already rolled back out of the buffer by SaveTombstoneSection's own transaction), leaving
-    // no partial opcode/payload behind for the next opcode byte to desync against.
+    std::vector<std::tuple<std::string, MvccStamp, uint64_t>> chunk;
+    // drakeydb: P4-5 -- SaveTombstoneSectionV2 (rdb_save.h/.cc) writes the whole chunk (each
+    // entry's meta word included) as one all-or-nothing unit; on failure it logs and drops just
+    // this chunk (already rolled back out of the buffer by its own transaction), leaving no
+    // partial opcode/payload behind for the next opcode byte to desync against.
     auto flush_chunk = [&] {
       if (chunk.empty())
         return;
-      if (auto ec = serializer_->SaveTombstoneSection(db_indx, chunk); ec)
+      if (auto ec = serializer_->SaveTombstoneSectionV2(db_indx, chunk); ec)
         LOG(ERROR) << "Failed to save tombstone section for db " << db_indx << ": " << ec.message();
       chunk.clear();
       // drakeydb: review fix (I2) -- same push/yield/throttle shape IterateBucketsFb uses after
@@ -263,7 +263,7 @@ void SliceSnapshot::SerializeTombstones() {
           const uint64_t meta = it->first.HasExpire() ? it->first.GetExpireTime() : kTombMetaNone;
           if (TombstoneExpiredAt(it->second, meta, ttl_ms, now_ms))
             return;
-          chunk.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second);
+          chunk.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second, meta);
         });
       }
       if (chunk.size() >= kChunkSize)

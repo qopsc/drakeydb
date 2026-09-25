@@ -87,4 +87,32 @@ constexpr uint8_t RDB_OPCODE_TAGGED_CHUNK = 224;
 // Write side is active-only and skipped for an empty table (D-7); read side (like
 // RDB_OPCODE_DF_MVCC) is UNCONDITIONAL -- every loader must consume this section's bytes in
 // full, whether or not it ends up installing anything (RdbLoader::HandleTombstones).
+//
+// drakeydb: P4-5 -- superseded as a WRITE-side format by RDB_OPCODE_DF_TOMBSTONES_V2 below (an
+// active node no longer emits this opcode at all); the constant and the read side stay, so a file
+// or a peer stream written before this record existed still loads (meta = kTombMetaNone).
 constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES = 225;
+
+// drakeydb: P4-5 -- carries a tombstone's meta word (mvcc.h's kTombMetaNone / kTombMetaAnchorOnly
+// / a whole-key deadline D) alongside the stamp, so the GC deadline a deleted key's expiry earned
+// survives a full sync or restart instead of reverting to stamp.MsPart()+ttl (D-16, which recurs
+// on every restart/sync without this). Payload: [db_index][count][count x {key, packed u64 LE,
+// origin_hash u64 LE, meta u64 LE}] -- identical framing to RDB_OPCODE_DF_TOMBSTONES above, with
+// one more 8-byte LE word appended per entry.
+//
+// Write side: active nodes emit V2 ONLY, using the same IsActiveReplica() gate and per-chunk
+// framing RDB_OPCODE_DF_TOMBSTONES used. RDB_OPCODE_DF_TOMBSTONES is never written again -- an
+// old loader that only understands it is refused at the replication-version handshake instead
+// (kDrakeydbReplVersion, node_identity.h), the same D-7 compatibility rule opcode 221 and 225
+// established: don't extend an already-shipped record in place, or an old loader parsing the
+// extra bytes as something else desyncs silently instead of failing loudly.
+//
+// Read side: UNCONDITIONAL on every node, exactly like 225's own read-unconditional contract --
+// both opcodes are parsed and, on a non-active node, discarded.
+//
+// UPSTREAM-SYNC hazard: chosen well clear of 226, the number upstream's own next sequential DF
+// extension would most likely take next (its own most recent is 224,
+// RDB_OPCODE_TAGGED_CHUNK) -- an upstream opcode later claiming this exact number would silently
+// misparse against this fork's tombstone-V2 reader, or vice versa. Re-verify this constant
+// against upstream's rdb.h/rdb_load.cc before every merge (docs/UPSTREAM-SYNC.md's watchlist).
+constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES_V2 = 230;

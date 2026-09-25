@@ -26,7 +26,11 @@ namespace dfly {
 // stamp floor change to apply semantics: a P4-3-era peer neither drops a stale replicated write
 // nor floors an applied stamp the same way, so a mixed 67/68 mesh must be refused at handshake
 // rather than silently diverging.
-inline constexpr unsigned kDrakeydbReplVersion = 68;
+// P4-5 bumps 68 to 69 because its snapshot stream adds opcode RDB_OPCODE_DF_TOMBSTONES_V2
+// (rdb_extensions.h), carrying each tombstone's meta word (its GC deadline or anchor) so it
+// survives a full sync or restart: a P4-4-era consumer advertising 68 cannot parse that opcode
+// and must be refused before full sync, not admitted and then hard-failed mid-stream.
+inline constexpr unsigned kDrakeydbReplVersion = 69;
 
 inline constexpr char kNodeUuidFileName[] = "drakeydb.uuid";
 

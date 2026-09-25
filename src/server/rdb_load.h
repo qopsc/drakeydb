@@ -547,15 +547,20 @@ class RdbLoader : protected RdbLoaderBase {
   // locals don't accumulate in Load()'s stack frame.
   std::error_code HandleVectorIndex();
   std::error_code HandleShardDocIndex();
-  // drakeydb: P4-3 Task 5 -- read side of RDB_OPCODE_DF_TOMBSTONES (rdb_extensions.h), mirroring
-  // HandleShardDocIndex's shape: always fully consumes the section's bytes (D-7's unconditional
-  // read), installing a tombstone per entry only when active and only on that key's owning
-  // shard's thread. See the .cc for the three reject cases carried over from Task 3's contract.
-  std::error_code HandleTombstones();
+  // drakeydb: P4-3 Task 5, extended by P4-5 -- read side of RDB_OPCODE_DF_TOMBSTONES (225) and
+  // RDB_OPCODE_DF_TOMBSTONES_V2 (rdb_extensions.h), mirroring HandleShardDocIndex's shape: always
+  // fully consumes the section's bytes (D-7's unconditional read), installing a tombstone per
+  // entry only when active and only on that key's owning shard's thread. `has_meta` selects the
+  // wire shape being parsed: false for a 225 record (no trailing word -- installs with
+  // kTombMetaNone, exactly as before this parameter existed), true for a V2 record (one extra
+  // trailing 8-byte LE meta word per entry, read and threaded through to the install). See the
+  // .cc for the three reject cases carried over from Task 3's contract, unchanged for either wire
+  // shape.
+  std::error_code HandleTombstones(bool has_meta);
 
   // drakeydb: P4-3 final fix wave (F-1) -- the single merge-LWW tombstone-apply primitive, shared
   // verbatim by both of this loader's delete sources:
-  //   1. HandleTombstones (above), for an RDB_OPCODE_DF_TOMBSTONES record, and
+  //   1. HandleTombstones (above), for an RDB_OPCODE_DF_TOMBSTONES/V2 record, and
   //   2. CreateObjectOnShard (rdb_load.cc), for an incoming key whose whole-key TTL has ALREADY
   //      elapsed -- on a merge load that IS the peer's delete of that key, not a no-op.
   // Extracted rather than duplicated so the two can never drift: the yield-first FindMutable, the
@@ -571,15 +576,15 @@ class RdbLoader : protected RdbLoaderBase {
   // passes `item->expire_ms` (the peer's whole-key deadline D, tagged as an anchor unless the
   // loaded value's own type is OBJ_STRING -- only a string can vanish solely through an explicit,
   // guarded, full-state delete, so only a string's D is a sound veto premise); HandleTombstones'
-  // own RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- the V2 tombstone opcode
-  // is what will carry meta on the wire for that record kind. Clamped, at each install point below,
-  // against `now_ms` -- the CALLER's own already-known clock reading for CreateObjectOnShard's
-  // merge-load caller (its own db_cntx.time_now_ms, threaded from LoadItemsBuffer's own single
-  // per-batch read); HandleTombstones' own RDB_OPCODE_DF_TOMBSTONES `install` lambda instead reads
-  // a fresh GetCurrentTimeMs() here, having no pre-existing per-key clock of its own to reuse -- a
-  // meta-less clamp is a no-op regardless of which clock feeds it, so this does not matter for that
-  // caller. D <= the reading passed by construction for the expired-incoming caller, so only a
-  // corrupt/hostile value ever actually clamps (mvcc.h's own ClampPeerTombMetaDeadline comment).
+  // own caller passes kTombMetaNone for a 225 record, or the record's own trailing wire word for
+  // a V2 one. Clamped, at each install point below, against `now_ms` -- the CALLER's own
+  // already-known clock reading for CreateObjectOnShard's merge-load caller (its own
+  // db_cntx.time_now_ms, threaded from LoadItemsBuffer's own single per-batch read);
+  // HandleTombstones' own `install` lambda instead reads a fresh GetCurrentTimeMs() here, having
+  // no pre-existing per-key clock of its own to reuse. D <= the reading passed by construction for
+  // the expired-incoming caller, so only a corrupt/hostile value ever actually clamps (mvcc.h's
+  // own ClampPeerTombMetaDeadline comment); for a 225 record the clamp stays a no-op regardless,
+  // since kTombMetaNone clamps to itself.
   static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
                                          const MvccStamp& stamp, bool resident_live, uint64_t meta,
                                          uint64_t now_ms);

@@ -11,6 +11,7 @@ extern "C" {
 }
 
 #include <optional>
+#include <tuple>
 
 #include "base/pod_array.h"
 #include "io/io.h"
@@ -330,19 +331,22 @@ class RdbSerializer {
   // themselves first (see rdb_extensions.h for RDB_OPCODE_DF_TOMBSTONES's payload layout).
   std::error_code SaveMvccStampBits(const MvccStamp& stamp);
 
-  // drakeydb: P4-3 Task 5 review fix (I1) -- writes one COMPLETE RDB_OPCODE_DF_TOMBSTONES section
-  // (opcode, db_index, count, then count x {key, stamp}) as a single all-or-nothing unit, using
-  // the same StartEntry()/FinishEntry(bool) transaction SaveEntry above uses: if any step fails
-  // partway through, FinishEntry(false) rolls the ENTIRE section back out of the buffer,
-  // including the opcode byte already written -- so a caller can never leave a bare opcode with
-  // no payload, or a payload with fewer records than the `count` it already announced, sitting in
-  // the output stream. `entries.size()` is written verbatim as `count` -- callers that want to
-  // bound peak memory / a single section's size should chunk `entries` themselves and call this
-  // once per chunk (SliceSnapshot::SerializeTombstones, snapshot.cc, does exactly that); the
-  // loader (RdbLoader::HandleTombstones) treats any number of sections per db as ordinary
-  // repeats of the same opcode.
-  std::error_code SaveTombstoneSection(DbIndex db_index,
-                                       absl::Span<const std::pair<std::string, MvccStamp>> entries);
+  // drakeydb: P4-5 -- writes one COMPLETE RDB_OPCODE_DF_TOMBSTONES_V2 section (opcode, db_index,
+  // count, then count x {key, stamp, meta}) as a single all-or-nothing unit, using the same
+  // StartEntry()/FinishEntry(bool) transaction SaveEntry above uses: if any step fails partway
+  // through, FinishEntry(false) rolls the ENTIRE section back out of the buffer, including the
+  // opcode byte already written -- so a caller can never leave a bare opcode with no payload, or
+  // a payload with fewer records than the `count` it already announced, sitting in the output
+  // stream. `entries.size()` is written verbatim as `count` -- callers that want to bound peak
+  // memory / a single section's size should chunk `entries` themselves and call this once per
+  // chunk (SliceSnapshot::SerializeTombstones, snapshot.cc, does exactly that); the loader
+  // (RdbLoader::HandleTombstones) treats any number of sections per db as ordinary repeats of
+  // the same opcode. `meta` is each entry's tombstone meta word (mvcc.h's kTombMetaNone /
+  // kTombMetaAnchorOnly / a whole-key deadline), written verbatim as the wire's trailing 8-byte
+  // LE word -- this replaces RDB_OPCODE_DF_TOMBSTONES (225) as the only write-side format; 225's
+  // own writer (which never carried meta) is retired, not kept alongside this one.
+  std::error_code SaveTombstoneSectionV2(
+      DbIndex db_index, absl::Span<const std::tuple<std::string, MvccStamp, uint64_t>> entries);
 
   // This would work for either string or an object.
   // The arg pv is taken from it->second if accessing
