@@ -5730,6 +5730,96 @@ TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombston
          "SetExistingMvcc keys its accounting off the NEW stamp's bit, which is still set";
 }
 
+// drakeydb: P4-5 B3(c) -- if a merge load's synthetic expiry tombstone used `S.AsTombstone()`
+// verbatim (the SAME stamp as the expired value S) instead of `ExpiryTombstoneFor(S)` (one
+// origin_hash tick above it), a third peer's unguarded delta re-create authored at exactly S's
+// own {mvcc, origin_hash} would TIE against it under the masked `operator<` MergeAccepts compares
+// with -- ties favor the stored side, so whichever side later sees the OTHER's data rejects it,
+// permanently: the two nodes diverge with no way for a later merge to repair it. This tie cannot
+// be constructed through an ordinary client command (no command lets a caller pick its own
+// committed author stamp), so both halves are built directly here via the same
+// ApplyReplicatedCommand/SetTombstone primitives the sibling tests above already use: `k1` gets
+// the REJECTED verbatim install and ties; `k2` gets the shipped `ExpiryTombstoneFor` install and
+// does not, at the identical delta author stamp -- a direct, reproducible contrast, not just a
+// hypothetical, even though it does not run through rdb_load.cc's own loader code (which already
+// always uses `ExpiryTombstoneFor`, never `AsTombstone()` verbatim, for exactly this reason -- see
+// that function's own doc comment, mvcc.h).
+TEST_F(MvccStoreTest, MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaRecreate) {
+  constexpr uint32_t kPeerIdx1 = 33;
+  constexpr uint32_t kPeerIdx2 = 34;
+
+  ASSERT_EQ(Run({"set", "k1", "v1"}), "OK");
+  auto s1 = StampOf("k1");
+  ASSERT_TRUE(s1.has_value());
+  ASSERT_FALSE(s1->IsTombstone());
+
+  ASSERT_EQ(Run({"set", "k2", "v1"}), "OK");
+  auto s2 = StampOf("k2");
+  ASSERT_TRUE(s2.has_value());
+
+  // A real DEL first, so `prime` actually loses the key -- SetTombstone below only OVERWRITES
+  // the resulting mvcc-side tombstone's stamp with the exact one under test; it never touches
+  // `prime` itself, so skipping this step would leave a live prime entry underneath a tombstoned
+  // mvcc slot, violating the dense mvcc<->prime invariant (TEST_VerifyMvccTable) immediately.
+  ASSERT_EQ(Run({"del", "k1"}).GetInt(), 1);
+  ASSERT_EQ(Run({"del", "k2"}).GetInt(), 1);
+
+  // k1: the REJECTED design -- tombstone installed verbatim AT S1 (AsTombstone() alone, no tick).
+  shard_set->Await(Shard("k1", shard_set->size()), [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k1"},
+                                                                       s1->AsTombstone());
+  });
+  auto verbatim_tomb = StampOf("k1");
+  ASSERT_TRUE(verbatim_tomb.has_value() && verbatim_tomb->IsTombstone());
+  ASSERT_EQ(verbatim_tomb->Mvcc(), s1->Mvcc());
+  ASSERT_EQ(verbatim_tomb->origin_hash, s1->origin_hash)
+      << "sanity: AsTombstone() verbatim keeps origin_hash unchanged -- only the bit differs";
+
+  // k2: the SHIPPED design -- ExpiryTombstoneFor(S2), one origin_hash tick above.
+  shard_set->Await(Shard("k2", shard_set->size()), [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k2"},
+                                                                       ExpiryTombstoneFor(*s2));
+  });
+  auto real_tomb = StampOf("k2");
+  ASSERT_TRUE(real_tomb.has_value() && real_tomb->IsTombstone());
+  ASSERT_EQ(real_tomb->Mvcc(), s2->Mvcc());
+  ASSERT_EQ(real_tomb->origin_hash, s2->origin_hash + 1);
+
+  // A third peer's delta re-create on each key, authored at exactly S's own {mvcc, origin_hash}
+  // -- register a fresh peer index at the SAME numeric origin_hash S itself carries (this node's
+  // own self origin), simulating a re-create whose author stamp happens to equal S exactly.
+  RegisterPeerOriginHash(kPeerIdx1, s1->origin_hash);
+  RegisterPeerOriginHash(kPeerIdx2, s2->origin_hash);
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"append", "k1", "x"}, kPeerIdx1, s1->Mvcc(), /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(
+      ApplyReplicatedCommand({"append", "k2", "x"}, kPeerIdx2, s2->Mvcc(), /*lww_guard=*/false),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", "k1"}), "x") << "the delta re-create must actually apply";
+  EXPECT_EQ(Run({"get", "k2"}), "x") << "the delta re-create must actually apply";
+
+  auto recreated1 = StampOf("k1");
+  auto recreated2 = StampOf("k2");
+  ASSERT_TRUE(recreated1.has_value() && recreated2.has_value());
+  EXPECT_FALSE(recreated1->IsTombstone());
+  EXPECT_FALSE(recreated2->IsTombstone());
+
+  // k1: TIES the verbatim tombstone's own masked stamp exactly -- the hazard.
+  EXPECT_EQ(recreated1->Mvcc(), verbatim_tomb->Mvcc());
+  EXPECT_EQ(recreated1->origin_hash, verbatim_tomb->origin_hash)
+      << "k1's re-create ties the verbatim tombstone's own {Mvcc, origin_hash} exactly -- "
+         "MergeAccepts is false in BOTH directions (a tie favors the stored side either way), so "
+         "a peer holding either one permanently refuses the other's data";
+
+  // k2: floors to ONE TICK BELOW the real tombstone -- strictly less, not a tie, so a later
+  // merge against that real tombstone still correctly repairs the divergence.
+  EXPECT_EQ(recreated2->Mvcc(), real_tomb->Mvcc());
+  EXPECT_LT(recreated2->origin_hash, real_tomb->origin_hash)
+      << "k2's re-create floors strictly BELOW the real tombstone, never tying it -- "
+         "ExpiryTombstoneFor's one-tick-above margin is exactly what prevents k1's hazard here";
+}
+
 // drakeydb: P4-4 Task A5 -- a LIVE applied write over a TOMBSTONED slot. Before this
 // fix, DbSlice::PostUpdate called EnsureMvcc (which resets a tombstone slot to {0,0} and returns
 // void) BEFORE Arm(), so by the time journal::RecordEntry's Commit() ran, a live lookup of this
