@@ -727,8 +727,8 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   EXPECT_NE(std::string::npos, info.find("connected_masters:0\r\n"));
   EXPECT_EQ(std::string::npos, info.find("master_host:"));
   // drakeydb: P4-5 -- multimaster_expired_delta_dropped joins multimaster_lww_dropped under the
-  // same IsActiveReplica() gate (server_family.cc); nothing here yet drops a delta against a
-  // deadline tombstone, so 0 is the only value it can hold.
+  // same IsActiveReplica() gate (server_family.cc); this test never applies a delta against a
+  // deadline tombstone, so 0 is the only value it can hold here.
   EXPECT_NE(std::string::npos, info.find("multimaster_expired_delta_dropped:0\r\n"));
 
   // drakeydb: review wave 2 (F5, MINOR) -- the positive half of NonActiveInfoHasNoActiveFields
@@ -1001,6 +1001,16 @@ class MvccStoreTest : public BaseFamilyTest {
     std::atomic<uint64_t> total{0};
     shard_set->pool()->AwaitBrief(
         [&](unsigned, auto*) { total += ServerState::tlocal()->stats.multimaster_lww_dropped; });
+    return total.load();
+  }
+
+  // drakeydb: P4-5 -- ServerState::Stats::multimaster_expired_delta_dropped is thread-local, same
+  // shape and reason as TotalLwwDropped above -- the D-27 veto's own key can land on any shard.
+  uint64_t TotalExpiredDeltaDropped() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+      total += ServerState::tlocal()->stats.multimaster_expired_delta_dropped;
+    });
     return total.load();
   }
 
@@ -5060,11 +5070,11 @@ TEST_F(MvccStoreTest, InfoReplicationShowsLwwDroppedSummedAcrossShards) {
 }
 
 // drakeydb: P4-5 -- mirrors InfoReplicationShowsLwwDroppedSummedAcrossShards immediately above,
-// but writes the counter directly (shard_set->Await) instead of driving a real drop: nothing
-// yet vetoes a delta against a whole-key deadline tombstone, so there is no production path to
-// drive through. This still proves the counter's own cross-THREAD aggregation
-// (ServerState::Stats::Add, server_state.cc) sums every thread's contribution rather than
-// reading (or aggregating) just one.
+// but writes the counter directly (shard_set->Await) rather than driving it through a real drop
+// (ExpiredDeltaVeto* below already exercises the production path on a single shard): this test
+// isolates the counter's own cross-THREAD aggregation (ServerState::Stats::Add, server_state.cc),
+// which sums every thread's contribution rather than reading (or aggregating) just one -- a
+// property a single-shard drop test cannot pin on its own.
 //
 // Falsifying: commenting out server_state.cc's `ADD(multimaster_expired_delta_dropped);` line
 // makes the parsed INFO value come back as 0 instead of 2, the same way the sibling test above
@@ -5086,6 +5096,468 @@ TEST_F(MvccStoreTest, InfoReplicationShowsExpiredDeltaDroppedSummedAcrossShards)
   uint64_t parsed = 0;
   ASSERT_TRUE(absl::SimpleAtoi(info.substr(value_start, value_end - value_start), &parsed));
   EXPECT_EQ(parsed, 2u) << "INFO must report the SUM across every shard thread, not just one";
+}
+
+// ---------------------------------------------------------------------------
+// drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md):
+// Transaction::ShouldDropExpiredDelta (transaction.cc), called right after ShouldDropForLww and
+// OR'd into the same lww_dropped local. Fires only for a kUnguarded single-key delta whose target
+// carries a STRING's own whole-key deadline tombstone (a bare meta D -- only a string's own
+// whole-key expiry ever installs one, mvcc.h) and whose author stamp is strictly older than D. A
+// drop leaves the tombstone completely untouched -- no advance: with 3+ nodes, a peer stream
+// carries no cross-link causality, so advancing the tombstone above a re-create authored by a
+// third node this receiver has not yet seen can permanently delete it once a later full sync
+// propagates the advanced stamp everywhere, including back to the node that authored it.
+// ---------------------------------------------------------------------------
+
+// drakeydb: P4-5 -- case (a): an INCR authored strictly before D, arriving after this node
+// already holds the tombstone (a real string PX expiry, lazily reaped by a plain read before the
+// delta ever arrives). Every observable side effect of a drop is pinned here: the tombstone's
+// stamp and meta stay byte-identical, nothing is journaled, the LSN does not move, the counter
+// advances by exactly one, VERIFY stays clean, and mvcc_unstamped_writes does not move either.
+//
+// Falsifying: making ShouldDropExpiredDelta unconditionally `return false;` (transaction.cc) --
+// a global falsification of the whole veto, not only this test -- makes `Run({"exists", key})`
+// below observe 1 instead of 0, with the re-created value carrying no TTL: D-27 itself.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoDropsStringDeltaAuthoredBeforeExistingDeadline) {
+  constexpr uint32_t kPeerIdx = 200;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000200");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_a_before_after";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass -- must be reaped "
+                                                 "before the delta ever arrives";
+
+  auto tomb_before = StampOf(key);
+  ASSERT_TRUE(tomb_before.has_value());
+  ASSERT_TRUE(tomb_before->IsTombstone());
+  ASSERT_EQ(TombMetaOf(key), deadline_ms) << "sanity: a whole-key D, not an anchor or no meta";
+
+  const ShardId sid = Shard(key, shard_set->size());
+  LSN lsn_before = 0;
+  shard_set->Await(sid, [&] { lsn_before = journal::GetLsn(); });
+
+  MsetLwwJournalConsumer consumer;
+  std::vector<uint32_t> consumer_ids(shard_set->size());
+  shard_set->RunBriefInParallel([&](EngineShard* shard) {
+    consumer_ids[shard->shard_id()] = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister_consumer = [&] {
+    shard_set->RunBriefInParallel(
+        [&](EngineShard* shard) { journal::UnregisterConsumer(consumer_ids[shard->shard_id()]); });
+  };
+  size_t pre_entries = 0;
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    pre_entries = consumer.entries.size();
+  }
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  const uint64_t pre_unstamped = TotalUnstampedWrites();
+  // I.MsPart() == deadline_ms - 1, strictly less than D.
+  const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0) << "the delta must be dropped, not re-create the key";
+  EXPECT_EQ(StampOf(key), tomb_before) << "the tombstone's stamp must be UNCHANGED -- no advance";
+  EXPECT_EQ(TombMetaOf(key), deadline_ms) << "the tombstone's meta must be UNCHANGED -- no advance";
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), pre_unstamped);
+
+  LSN lsn_after = 0;
+  shard_set->Await(sid, [&] { lsn_after = journal::GetLsn(); });
+  EXPECT_EQ(lsn_after, lsn_before) << "a dropped delta must never advance the journal's LSN";
+
+  std::move(unregister_consumer).Invoke();
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    EXPECT_EQ(consumer.entries.size(), pre_entries)
+        << "no COMMAND journal entry for a dropped delta";
+  }
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (b): I.MsPart() >= D -- the author's own now already reached the
+// deadline, so this is a genuine re-create; apply verbatim (a fresh key, no prior stamp to floor
+// against).
+//
+// Falsifying: disabling the `incoming->MsPart() >= TombMetaMs(meta)` early-return in
+// ShouldDropExpiredDelta (transaction.cc) -- so every bare-D tombstone is unconditionally dropped
+// regardless of I vs D -- makes every assertion below fail: the key stays absent, no stamp is
+// committed, and the counter wrongly advances (observed).
+TEST_F(MvccStoreTest, ExpiredDeltaVetoAppliesStringDeltaAuthoredAtOrAfterDeadline) {
+  constexpr uint32_t kPeerIdx = 201;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000201");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_b_at_or_after";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(key), deadline_ms);
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  const uint64_t author_mvcc = (deadline_ms + 5) << MvccClock::kCounterBits;
+
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", key}), "1") << "a genuine re-create must actually apply";
+  EXPECT_EQ(Run({"ttl", key}).GetInt(), -1) << "the re-created key must carry no TTL";
+  auto after = StampOf(key);
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*after, (MvccStamp{author_mvcc, peer_hash}))
+      << "a fresh key (no live prior stamp) commits the author's stamp verbatim";
+  EXPECT_EQ(TombMetaOf(key), kTombMetaNone);
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped) << "must not be counted as a drop";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (c): the key's own deadline has elapsed by wall-clock, but nothing has
+// read it yet -- still LIVE in the prime table, the same "still LIVE" state
+// DelLwwOfALazilyReapedKeyOverwritesTheExpiryTombstoneWithTheIncomingStamp (above) establishes the
+// same way: AdvanceTime alone never reaps anything on its own. ShouldDropExpiredDelta's own steps
+// 2-3 must reap FIRST, landing the SAME {S, o+1}+D tombstone a real read would have installed, and
+// only THEN decide -- not let the callback's own FindMutable do the reap AFTER the veto already
+// (wrongly) found nothing to compare against.
+//
+// Falsifying ("apply then expire"): commenting out ShouldDropExpiredDelta's own lazy-reap block
+// (the `PrimeIterator prime_it = ...` / `ExpireIfNeeded` pair, transaction.cc) makes the veto's
+// own GetTombMeta read observe kTombMetaNone (the key is still live at that point), so it returns
+// false and the INCR runs its own callback instead: that callback's own FindMutable/EnsureMvcc
+// reaps INSIDE the apply, then re-creates the key at a stamp FLOORED one tick below the reap's own
+// {S, o+1} -- {S.mvcc, S.origin_hash}, LIVE (no tombstone bit) -- rather than the correct, reap-
+// first {S, o+1} tombstone this test's own assertions pin. See the task report for the exact
+// captured output.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoReapsUnreapedKeyBeforeDroppingDelta) {
+  constexpr uint32_t kPeerIdx = 202;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000202");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_c_unreaped";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+  auto before = StampOf(key);
+  ASSERT_TRUE(before.has_value());
+  AdvanceTime(50);  // elapsed by wall-clock, but nothing has read it -- still LIVE in the table
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  // I < S: one full ms tick below the live value's own stamp (and therefore also < D).
+  ASSERT_GE(before->Mvcc(), 1ULL << MvccClock::kCounterBits);
+  const uint64_t author_mvcc = before->Mvcc() - (1ULL << MvccClock::kCounterBits);
+
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0)
+      << "the delta must be dropped after the lazy reap installs the tombstone";
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_EQ(*tomb, (MvccStamp{before->packed | MvccClock::kTombstoneBit, before->origin_hash + 1}))
+      << "reaping must install {S, o+1} -- the ordinary ExpiryTombstoneFor(S) shape -- BEFORE the "
+         "veto's own decision runs";
+  EXPECT_EQ(TombMetaOf(key), deadline_ms);
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped + 1);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (d): an explicit (meta-less) tombstone is unaffected by this veto -- a
+// delta against it floors or applies exactly as it did before this veto existed. Regression
+// coverage for the pre-existing sj_incr-style "INCR is unguarded" tests (above), which must stay
+// green now that this veto exists.
+//
+// Falsifying: removing the `meta == kTombMetaNone` half of ShouldDropExpiredDelta's own
+// early-return (transaction.cc) has NO observable effect here, and this is provable rather than
+// merely observed: TombMetaMs(kTombMetaNone) is always 0 (mvcc.h), and any real author stamp's
+// own MsPart() is a positive epoch-ms value, so `incoming->MsPart() >= TombMetaMs(meta)` is true
+// regardless -- the "genuine re-create" branch is still taken (confirmed by actually removing
+// that check and re-running: this test stays green). The `meta == kTombMetaNone` term is
+// therefore a fast, explicit early-exit for the common case, not a correctness-load-bearing
+// branch on its own -- the real protection here is structural (a meta-less tombstone can never
+// carry a deadline for anything to compare against).
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnExplicitTombstone) {
+  constexpr uint32_t kPeerIdx = 203;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000203");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_d_explicit";
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  ASSERT_EQ(Run({"del", key}).GetInt(), 1);
+  EXPECT_EQ(TombMetaOf(key), kTombMetaNone) << "sanity: an explicit delete carries no meta";
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  constexpr uint64_t kAnyOldMvcc = 0x1000ULL;  // far smaller than any real HopStamp
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, kAnyOldMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", key}), "1")
+      << "INCR is unguarded -- it must still apply, exactly as before this veto existed";
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped)
+      << "an explicit (meta-less) tombstone must never trigger the D-27 veto";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (e): an anchor-only tombstone from an expired LIST (kTombMetaAnchorOnly |
+// D -- every non-string type's whole-key expiry earns an anchor, never a bare D, mvcc.h's
+// kTombMeta* comment) must never veto -- the anchor bit alone rules it out regardless of I vs the
+// anchor's own ms payload.
+//
+// Falsifying: removing the `(meta & kTombMetaAnchorOnly) != 0` half of ShouldDropExpiredDelta's
+// own early-return (transaction.cc) makes the RPUSH below get wrongly dropped instead of
+// re-creating the list -- `Run({"exists", key})` then observes 0 instead of 1.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnAnchorOnlyTombstone) {
+  constexpr uint32_t kPeerIdx = 204;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000204");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_e_anchor_list";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"rpush", key, "x"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", key, "10"}).GetInt(), 1);
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(key), kTombMetaAnchorOnly | deadline_ms)
+      << "sanity: an anchor, not a bare D";
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;  // I < the anchor's ms
+
+  auto res = ApplyReplicatedCommand({"rpush", key, "y"}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 1) << "the veto must never act on an anchor";
+  EXPECT_THAT(Run({"lrange", key, "0", "-1"}).GetVec(), testing::ElementsAre("y"));
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (f): a guarded DEL of an already-absent key installs an explicit,
+// meta-less tombstone (RecordAbsentKeyRemoval's own D-20 fix), clearing whatever whole-key D an
+// earlier string expiry had left there -- so a delta authored before that OLD D must still apply
+// afterward: nothing survives for the veto to compare against.
+//
+// Falsifying: temporarily removing the RecordAbsentKeyRemoval call at OpDelV2's own absent-key
+// site (generic_family.cc, `!IsValid(it.it)` branch) leaves the OLD D-bearing tombstone in place,
+// and the INCR below is then wrongly dropped by this veto instead of applying.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoAppliesAfterDelOfAbsentKeyClearsMeta) {
+  constexpr uint32_t kPeerIdx = 205;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000205");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_f_del_absent";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(key), deadline_ms) << "sanity: a whole-key D from the earlier string expiry";
+  auto tomb_before = StampOf(key);
+  ASSERT_TRUE(tomb_before.has_value());
+
+  const uint64_t del_author_mvcc = tomb_before->Mvcc() + (1ULL << 30);  // strictly newer
+  auto del_res =
+      ApplyReplicatedCommand({"del", key}, kPeerIdx, del_author_mvcc, /*lww_guard=*/true);
+  ASSERT_EQ(del_res, facade::DispatchResult::OK);
+  ASSERT_EQ(TombMetaOf(key), kTombMetaNone)
+      << "sanity: a guarded DEL of an absent key installs an explicit, meta-less tombstone";
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  // Authored strictly before the OLD deadline -- would be wrongly dropped if D survived the DEL.
+  const uint64_t incr_author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, incr_author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", key}), "1") << "the delta must apply -- no meta survives an explicit DEL";
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (g): the same recipe path via a same-shard RENAME's absent source
+// (OpRen's own RecordAbsentKeyRemoval call) -- the same meta-clearing property as case (f) above,
+// through a different call site.
+//
+// Falsifying: temporarily removing the RecordAbsentKeyRemoval call at OpRen's own absent-source
+// site (generic_family.cc) leaves the OLD D-bearing tombstone on `src`, and the INCR below is then
+// wrongly dropped instead of applying.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoAppliesAfterRenameOfAbsentSourceClearsMeta) {
+  const size_t num_shards = shard_set->size();
+  const std::string src = FindKeyOnShard("evd_g_rename_src_", 0, num_shards);
+  const std::string dst = FindKeyOnShard("evd_g_rename_dst_", 0, num_shards);
+  ASSERT_EQ(Shard(src, num_shards), Shard(dst, num_shards)) << "must be same-shard (OpRen path)";
+
+  constexpr uint32_t kPeerIdx = 206;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000206");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", src, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", src}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(src), deadline_ms);
+  auto tomb_before = StampOf(src);
+  ASSERT_TRUE(tomb_before.has_value());
+
+  const uint64_t rename_author_mvcc = tomb_before->Mvcc() + (1ULL << 30);  // strictly newer
+  auto rename_res = ApplyReplicatedCommand({"rename", src, dst}, kPeerIdx, rename_author_mvcc,
+                                           /*lww_guard=*/true);
+  ASSERT_EQ(rename_res, facade::DispatchResult::OK);
+  ASSERT_EQ(TombMetaOf(src), kTombMetaNone)
+      << "sanity: the same recipe path installs an explicit, meta-less tombstone on `src`";
+  EXPECT_EQ(Run({"exists", dst}).GetInt(), 0)
+      << "the destination must stay untouched -- src never really held a value here";
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  const uint64_t incr_author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+  auto res = ApplyReplicatedCommand({"incr", src}, kPeerIdx, incr_author_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"get", src}), "1") << "the delta must apply -- no meta survives the RENAME recipe";
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (h): with the guard off (lww_guard=false) or on an unguarded link
+// (mvcc=0), IsLwwGuarded() is false and this veto must never engage at all -- the delta re-creates
+// the key with no TTL, reproducing D-27's own original shape (ISSUE-REGISTER.md): correct
+// behaviour off a guarded peer link, not a bug this veto is meant to fix there.
+//
+// Falsifying: removing ShouldDropExpiredDelta's own `if (!IsLwwGuarded()) return false;` early
+// return makes the "lww_guard=false" sub-case below observe the key still absent (dropped)
+// instead of re-created (observed). The "mvcc=0" sub-case still passes even with that removal --
+// IsLwwGuarded() itself (LwwGuardActive, multimaster_lww.h) already fails open on mvcc==0
+// independently of this function's own gate, so it alone cannot regress that half; that half's own
+// protection is exercised by IsLwwGuarded's own existing test coverage, not re-proven here.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverFiresWithGuardOff) {
+  constexpr uint32_t kPeerIdx = 207;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000207");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  {
+    SCOPED_TRACE("lww_guard=false");
+    const std::string key = "evd_h_guard_off";
+    const uint64_t deadline_ms = TEST_current_time_ms + 10;
+    ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+    AdvanceTime(50);
+    ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+    ASSERT_EQ(TombMetaOf(key), deadline_ms);
+
+    const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+    const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+    auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, author_mvcc, /*lww_guard=*/false);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"get", key}), "1") << "the guard is off -- must re-create with no TTL";
+    EXPECT_EQ(Run({"ttl", key}).GetInt(), -1);
+    EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
+  }
+  {
+    SCOPED_TRACE("mvcc=0");
+    const std::string key = "evd_h_mvcc_zero";
+    const uint64_t deadline_ms = TEST_current_time_ms + 10;
+    ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+    AdvanceTime(50);
+    ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+    ASSERT_EQ(TombMetaOf(key), deadline_ms);
+
+    const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+    auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, /*mvcc=*/0, /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(Run({"get", key}), "1") << "mvcc==0 fails open -- never guarded";
+    EXPECT_EQ(Run({"ttl", key}).GetInt(), -1);
+    EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
+  }
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (i): PEXPIREAT and PERSIST -- kUnguarded by ClassifyJournaledCommand's
+// own table (neither name appears in it), so without IsWholeKeyTtlChanging's own deny-list check
+// (multimaster_lww.h) this veto would otherwise treat either one as an ordinary delta and compare
+// it against `key`'s own whole-key deadline tombstone. Both are already no-ops against an absent
+// key regardless of the veto (PEXPIREAT/PERSIST on an absent key do nothing either way), so the
+// counter is the only observable signal a regression here would move.
+//
+// Falsifying: removing IsWholeKeyTtlChanging's own check in ShouldDropExpiredDelta
+// (transaction.cc) makes the counter advance for BOTH sub-cases below instead of staying flat.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnDenyListedTtlCommands) {
+  constexpr uint32_t kPeerIdx = 208;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000208");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  for (std::string_view name : {"pexpireat", "persist"}) {
+    SCOPED_TRACE(name);
+    const std::string key = absl::StrCat("evd_i_denylist_", name);
+    const uint64_t deadline_ms = TEST_current_time_ms + 10;
+    ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+    AdvanceTime(50);
+    ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+    ASSERT_EQ(TombMetaOf(key), deadline_ms);
+
+    const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+    const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+    std::vector<std::string> args{std::string(name), key};
+    if (name == "pexpireat")
+      args.push_back(absl::StrCat(deadline_ms + 100000));
+    auto res = ApplyReplicatedCommand(args, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK);
+
+    EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped)
+        << name << " must never be vetoed by the D-27 rule";
+    EXPECT_EQ(Run({"exists", key}).GetInt(), 0) << name << " on an absent key must stay a no-op";
+  }
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- case (j): a same-shard multi-key delta (SMOVE) is never vetoed --
+// unique_shard_cnt_==1 here (both keys land on the SAME shard), so it is the keys.Size()==1
+// check, not the shard-count one, doing the real work: SMOVE's own ShardArgs on this shard returns
+// BOTH `src` and `dst`. Both keys carry their own whole-key D here specifically so that whichever
+// one `keys.Front()` would return, a missing keys.Size() check would still find SOMETHING to
+// (wrongly) compare against and drop.
+//
+// Falsifying: removing the `keys.Size() != 1u` check in ShouldDropExpiredDelta (transaction.cc)
+// makes the counter advance (observed: by two, one per shard-local hop SMOVE's own multi-key
+// dispatch takes on this shard) instead of staying flat.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnMultiKeySameShardDelta) {
+  const size_t num_shards = shard_set->size();
+  const std::string src = FindKeyOnShard("evd_j_smove_src_", 0, num_shards);
+  const std::string dst = FindKeyOnShard("evd_j_smove_dst_", 0, num_shards);
+  ASSERT_EQ(Shard(src, num_shards), Shard(dst, num_shards));
+
+  const uint64_t src_deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", src, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", src}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(src), src_deadline_ms);
+
+  const uint64_t dst_deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", dst, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", dst}).GetInt(), 0);
+  ASSERT_EQ(TombMetaOf(dst), dst_deadline_ms);
+
+  constexpr uint32_t kPeerIdx = 209;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000209");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const uint64_t min_deadline = std::min(src_deadline_ms, dst_deadline_ms);
+  const uint64_t author_mvcc = (min_deadline - 1) << MvccClock::kCounterBits;
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  auto res = ApplyReplicatedCommand({"smove", src, dst, "member"}, kPeerIdx, author_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped)
+      << "a same-shard multi-key delta must never be vetoed";
+  EXPECT_EQ(TombMetaOf(src), src_deadline_ms) << "the veto must never have touched either key";
+  EXPECT_EQ(TombMetaOf(dst), dst_deadline_ms);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: P4-4 Task A7 -- the headline partial-apply case: k1 is fresh (no stored stamp, so
@@ -11198,6 +11670,20 @@ TEST_F(OriginJournalFamilyTest, ZeroMvccSquashedStubNeverTripsTripwire) {
   EXPECT_EQ(facade::DispatchResult::OK, exec_res);
   EXPECT_EQ("v", Run({"get", "zero-mvcc-squash-key"}));
 }
+
+// drakeydb: P4-5 -- GuardedSquashedStubTripwireFiresInDebug (above) is also this fix's own
+// regression pin, not only ShouldDropForLww's: the OUTER squasher-container transaction's own
+// RunCallback invocation (MultiCommandSquasher::ExecuteSquashed's ScheduleSingleHop) reaches
+// ShouldDropExpiredDelta too -- an UNGUARDED name is the kUnguarded fail-safe default its own
+// classify check looks FOR, unlike ShouldDropForLww's kSingleKey-only reach, so without an
+// explicit guard it does NOT bail before calling GetShardArgs on that container, which DCHECKs
+// against ever being called on one (transaction.cc's own GetShardArgs). Confirmed directly while
+// building this veto: removing ShouldDropExpiredDelta's own `if (multi_ && multi_->role ==
+// SQUASHER) return false;` guard (transaction.cc) makes GuardedSquashedStubTripwireFiresInDebug
+// die with the WRONG message (`Check failed: !multi_ || multi_->role != SQUASHER`, from
+// GetShardArgs) instead of its own expected "multi-master LWW guard reached RunSquashedMultiCb"
+// -- EXPECT_DEBUG_DEATH reports that as "died but not with expected error" -- captured verbatim
+// in the task report.
 
 namespace {
 // drakeydb: Phase 3 T4 -- like OriginCapturingConsumer above, but also captures entry_flags and
