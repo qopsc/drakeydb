@@ -71,11 +71,11 @@ bool WriteStringToFileForTest(const std::string& path, std::string_view content)
 }  // namespace
 
 TEST(NodeIdentity, VersionConstant) {
-  // drakeydb: P4-4 -- bumped 67 -> 68 alongside kDrakeydbReplVersion itself (node_identity.h):
-  // P4-4 adds the streaming LWW guard plus an applied-write stamp floor change to apply
-  // semantics, so a mixed 67/68 mesh must be refused at handshake, not admitted and left to
-  // silently diverge.
-  EXPECT_EQ(68u, kDrakeydbReplVersion);
+  // drakeydb: P4-5 -- bumped 68 -> 69 alongside kDrakeydbReplVersion itself (node_identity.h):
+  // P4-5 adds RDB_OPCODE_DF_TOMBSTONES_V2, carrying each tombstone's meta word so its GC
+  // deadline survives a full sync or restart, so a mixed 68/69 mesh must be refused at
+  // handshake -- a pre-P4-5 consumer cannot parse the new opcode.
+  EXPECT_EQ(69u, kDrakeydbReplVersion);
 }
 
 TEST(NodeUuid, GenerateIsValidV4) {
@@ -620,6 +620,16 @@ TEST_F(ActiveReplicaFamilyTest, ReplconfRefusedWhileActive) {
 // opcode, so it must be rejected at admission rather than failing partway through full sync.
 TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPreMvccSnapshotConsumer) {
   EXPECT_EQ("OK", Run({"replconf", "drakey-version", "65"}));
+  auto resp = Run({"replconf", "capa", "dragonfly"});
+  EXPECT_THAT(resp, ErrArg("active-replica"));
+}
+
+// P4-5 adds RDB_OPCODE_DF_TOMBSTONES_V2. A P4-4-era consumer advertises version 68 and cannot
+// parse that opcode, so it must be rejected at admission rather than failing partway through
+// full sync -- the exact "v69 master refuses a v68 consumer" boundary the version bump exists
+// for (server_family.cc's `rinfo.repl_drakey_version < kDrakeydbReplVersion` check).
+TEST_F(ActiveReplicaFamilyTest, ReplconfRefusesPreTombstoneV2SnapshotConsumer) {
+  EXPECT_EQ("OK", Run({"replconf", "drakey-version", "68"}));
   auto resp = Run({"replconf", "capa", "dragonfly"});
   EXPECT_THAT(resp, ErrArg("active-replica"));
 }

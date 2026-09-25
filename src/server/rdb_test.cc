@@ -16,6 +16,7 @@ extern "C" {
 #include <mimalloc.h>
 
 #include <algorithm>
+#include <tuple>
 
 #include "base/flags.h"
 #include "base/gtest.h"
@@ -1655,6 +1656,28 @@ std::string BuildTombstoneSection(DbIndex db_index,
     uint8_t buf[16];
     absl::little_endian::Store64(buf, stamp.packed);
     absl::little_endian::Store64(buf + 8, stamp.origin_hash);
+    out.append(reinterpret_cast<const char*>(buf), sizeof(buf));
+  }
+  return out;
+}
+
+// drakeydb: P4-5 -- hand-builds an RDB_OPCODE_DF_TOMBSTONES_V2 section byte-for-byte per
+// rdb_extensions.h's format: [db_index][count][count x {key, packed, origin_hash, meta}] -- the
+// same shape BuildTombstoneSection builds above for opcode 225, with one more 8-byte LE `meta`
+// word appended per entry. Used to drive RdbLoader::HandleTombstones' has_meta=true path directly
+// with well-formed AND deliberately malformed/hostile entries.
+std::string BuildTombstoneSectionV2(
+    DbIndex db_index, const std::vector<std::tuple<std::string, MvccStamp, uint64_t>>& entries) {
+  std::string out;
+  out.push_back(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES_V2));
+  AppendLen(&out, db_index);
+  AppendLen(&out, entries.size());
+  for (const auto& [key, stamp, meta] : entries) {
+    AppendString(&out, key);
+    uint8_t buf[24];
+    absl::little_endian::Store64(buf, stamp.packed);
+    absl::little_endian::Store64(buf + 8, stamp.origin_hash);
+    absl::little_endian::Store64(buf + 16, meta);
     out.append(reinterpret_cast<const char*>(buf), sizeof(buf));
   }
   return out;
@@ -3727,6 +3750,11 @@ TEST_F(RdbTest, NoTombstoneOpcodeWhenInactive) {
   const size_t scan_start = SkipAuxSection(bytes, 9);
   ASSERT_NE(scan_start, std::string::npos) << "could not locate the end of the aux section";
   EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES), scan_start), std::string::npos);
+  // drakeydb: P4-5 -- an inactive save must never emit the V2 opcode either: an active node's
+  // write side now emits V2 ONLY (never 225), so this is the write-side proof that stays valid
+  // now that 225 itself is retired as a write-side format.
+  EXPECT_EQ(bytes.find(static_cast<char>(RDB_OPCODE_DF_TOMBSTONES_V2), scan_start),
+            std::string::npos);
 }
 
 // drakeydb: P4-3 Task 5 review fix (I5) -- every tombstone test above uses RdbMvccTest, whose
@@ -6593,6 +6621,425 @@ TEST_F(RdbMvccTest, WithoutMergeLwwBornExpiredTombstoneInstallsNoneAndCounts) {
       << "a born-expired RDB_OPCODE_DF_TOMBSTONES record must be refused, never installed";
   EXPECT_EQ(born_after, born_before + 1);
   EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- the non-merge leg of the V2 round-trip requirement: three tombstone kinds (a
+// whole-key deadline D, a member-TTL/derived anchor, and a meta-less explicit delete) must each
+// keep their exact stamp AND meta across a real SAVE (RDB_OPCODE_DF_TOMBSTONES_V2, the only
+// opcode an active node's save path now emits) and a non-merge LOAD (DEBUG RELOAD), with
+// gc_at_ms (TombstoneGcAtMs, mvcc.h) unchanged too -- not merely "some value survived".
+// Constructed directly via SetTombstone (not a real SET+DEL+wait) so each key's write-time stamp
+// and its meta can be pinned to deterministic, past values instead of racing wall-clock timing.
+//
+// Falsify (D-16 regression): zero the meta word SaveTombstoneSectionV2 writes (rdb_save.cc) --
+// k_deadline's meta reverts to kTombMetaNone after reload, and its gc_at_ms drops from
+// (deadline_ms + ttl_ms) down to (old_write_ms + ttl_ms), the exact D-16 shape: a long-lived
+// key's tombstone GCs on write time instead of its own later expiry deadline.
+TEST_F(RdbMvccTest, TombstoneMetaAndGcDeadlineSurviveDebugReload) {
+  ASSERT_TRUE(IsActiveReplica());
+  ASSERT_EQ(Run({"set", "warmup", "x"}), "OK");  // activates db 0 via the ordinary command path
+
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  const uint64_t old_write_ms = GetCurrentTimeMs() - 60'000;  // 60s ago: this tombstone's own ms
+  const uint64_t deadline_ms = GetCurrentTimeMs() - 1'000;    // 1s ago: a whole-key D > write time
+  const uint64_t anchor_ms = GetCurrentTimeMs() - 2'000;      // 2s ago: a member-TTL/derived R
+
+  const MvccStamp kStampD =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 1, 0xAAAAAAAAULL}.AsTombstone();
+  const MvccStamp kStampAnchor =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 2, 0xBBBBBBBBULL}.AsTombstone();
+  const MvccStamp kStampNone =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 3, 0xCCCCCCCCULL}.AsTombstone();
+  const uint64_t kAnchorMeta = kTombMetaAnchorOnly | anchor_ms;
+
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, std::string_view{"k_deadline"}, kStampD, deadline_ms);
+    db_slice.SetTombstone(0, std::string_view{"k_anchor"}, kStampAnchor, kAnchorMeta);
+    db_slice.SetTombstone(0, std::string_view{"k_none"}, kStampNone);  // meta defaults to none
+  });
+
+  auto snapshot = [&](std::string_view key) {
+    std::optional<MvccStamp> stamp;
+    uint64_t meta = 0;
+    shard_set->Await(0, [&] {
+      auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+      stamp = db_slice.GetMvcc(0, key);
+      meta = db_slice.GetTombMeta(0, key);
+    });
+    return std::make_pair(stamp, meta);
+  };
+
+  const auto [d_stamp_before, d_meta_before] = snapshot("k_deadline");
+  const auto [anchor_stamp_before, anchor_meta_before] = snapshot("k_anchor");
+  const auto [none_stamp_before, none_meta_before] = snapshot("k_none");
+  ASSERT_TRUE(d_stamp_before.has_value() && anchor_stamp_before.has_value() &&
+              none_stamp_before.has_value());
+  ASSERT_EQ(d_meta_before, deadline_ms);
+  ASSERT_EQ(anchor_meta_before, kAnchorMeta);
+  ASSERT_EQ(none_meta_before, kTombMetaNone);
+
+  ASSERT_EQ(Run({"debug", "reload"}), "OK");
+
+  const auto [d_stamp_after, d_meta_after] = snapshot("k_deadline");
+  const auto [anchor_stamp_after, anchor_meta_after] = snapshot("k_anchor");
+  const auto [none_stamp_after, none_meta_after] = snapshot("k_none");
+
+  ASSERT_TRUE(d_stamp_after.has_value()) << "the whole-key-D tombstone must survive the reload";
+  EXPECT_EQ(*d_stamp_after, *d_stamp_before);
+  EXPECT_EQ(d_meta_after, deadline_ms);
+  EXPECT_EQ(TombstoneGcAtMs(*d_stamp_after, d_meta_after, ttl_ms),
+            TombstoneGcAtMs(*d_stamp_before, d_meta_before, ttl_ms));
+  EXPECT_GT(TombstoneGcAtMs(*d_stamp_after, d_meta_after, ttl_ms), old_write_ms + ttl_ms)
+      << "the persisted deadline must still extend the GC window past a bare write-time+ttl bound";
+
+  ASSERT_TRUE(anchor_stamp_after.has_value()) << "the anchor tombstone must survive the reload";
+  EXPECT_EQ(*anchor_stamp_after, *anchor_stamp_before);
+  EXPECT_EQ(anchor_meta_after, kAnchorMeta);
+  EXPECT_NE(anchor_meta_after & kTombMetaAnchorOnly, 0u) << "the anchor bit must survive verbatim";
+  EXPECT_EQ(TombstoneGcAtMs(*anchor_stamp_after, anchor_meta_after, ttl_ms),
+            TombstoneGcAtMs(*anchor_stamp_before, anchor_meta_before, ttl_ms));
+
+  ASSERT_TRUE(none_stamp_after.has_value()) << "the meta-less tombstone must survive the reload";
+  EXPECT_EQ(*none_stamp_after, *none_stamp_before);
+  EXPECT_EQ(none_meta_after, kTombMetaNone);
+  EXPECT_EQ(TombstoneGcAtMs(*none_stamp_after, none_meta_after, ttl_ms),
+            TombstoneGcAtMs(*none_stamp_before, none_meta_before, ttl_ms));
+}
+
+// drakeydb: P4-5 -- the MERGE leg of the same round-trip requirement as the test above: a peer's
+// own well-formed V2 record (hand-built here to stand in for what its SAVE would have produced)
+// must install with its exact stamp and meta via the merge-LWW absent-key path
+// (ApplyMergeTombstoneOnShard -> DbSlice::InstallAbsentKeyTombstone), for all three meta kinds.
+//
+// Falsify (D-16 regression): pass 0 for every entry's meta below -- each gc_at_ms drops from
+// (meta_ms + ttl_ms) down to (write_ms + ttl_ms) for the deadline case, the D-16 shape again,
+// this time reached through the merge install path instead of the non-merge one above.
+TEST_F(RdbMvccTest, MergeLwwInstallPreservesMetaAndGcDeadlineForAllThreeKinds) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  const uint64_t old_write_ms = GetCurrentTimeMs() - 60'000;
+  const uint64_t deadline_ms = GetCurrentTimeMs() - 1'000;
+  const uint64_t anchor_ms = GetCurrentTimeMs() - 2'000;
+  const uint64_t kAnchorMeta = kTombMetaAnchorOnly | anchor_ms;
+
+  const MvccStamp kStampD =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 0x7001, kPeerHash}.AsTombstone();
+  const MvccStamp kStampAnchor =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 0x7002, kPeerHash}.AsTombstone();
+  const MvccStamp kStampNone =
+      MvccStamp{(old_write_ms << MvccClock::kCounterBits) + 0x7003, kPeerHash}.AsTombstone();
+
+  std::string body = BuildTombstoneSectionV2(0, {{"ghost_deadline", kStampD, deadline_ms},
+                                                 {"ghost_anchor", kStampAnchor, kAnchorMeta},
+                                                 {"ghost_none", kStampNone, kTombMetaNone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  auto snapshot = [&](std::string_view key) {
+    std::optional<MvccStamp> stamp;
+    uint64_t meta = 0;
+    shard_set->Await(0, [&] {
+      auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+      stamp = db_slice.GetMvcc(0, key);
+      meta = db_slice.GetTombMeta(0, key);
+    });
+    return std::make_pair(stamp, meta);
+  };
+
+  const auto [d_stamp, d_meta] = snapshot("ghost_deadline");
+  ASSERT_TRUE(d_stamp.has_value());
+  EXPECT_EQ(*d_stamp, kStampD);
+  EXPECT_EQ(d_meta, deadline_ms);
+  EXPECT_GT(TombstoneGcAtMs(*d_stamp, d_meta, ttl_ms), old_write_ms + ttl_ms)
+      << "the persisted deadline must extend the GC window past a bare write-time+ttl bound";
+
+  const auto [anchor_stamp, anchor_meta] = snapshot("ghost_anchor");
+  ASSERT_TRUE(anchor_stamp.has_value());
+  EXPECT_EQ(*anchor_stamp, kStampAnchor);
+  EXPECT_EQ(anchor_meta, kAnchorMeta);
+  EXPECT_NE(anchor_meta & kTombMetaAnchorOnly, 0u) << "the anchor bit must survive verbatim";
+
+  const auto [none_stamp, none_meta] = snapshot("ghost_none");
+  ASSERT_TRUE(none_stamp.has_value());
+  EXPECT_EQ(*none_stamp, kStampNone);
+  EXPECT_EQ(none_meta, kTombMetaNone);
+}
+
+// drakeydb: P4-5 -- reuses the existing 225 builder (BuildTombstoneSection) to prove a
+// legacy/peer stream carrying no meta at all still loads correctly through the has_meta=false
+// path: the stamp round-trips exactly, and the meta reads back as kTombMetaNone -- never an
+// uninitialized or stale value.
+TEST_F(RdbMvccTest, LegacyOpcode225StreamStillLoadsWithNoMeta) {
+  ASSERT_TRUE(IsActiveReplica());
+  const MvccStamp kStamp =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x4000, 0xAAAAULL}.AsTombstone();
+  std::string body = BuildTombstoneSection(0, {{"ghost", kStamp}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_EQ(Run({"get", "after"}), "afterval");
+
+  std::optional<MvccStamp> got_stamp;
+  uint64_t got_meta = 0xFFFFFFFFFFFFFFFFULL;  // sentinel -- must become kTombMetaNone, not linger
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got_stamp = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    got_meta = db_slice.GetTombMeta(0, std::string_view{"ghost"});
+  });
+  ASSERT_TRUE(got_stamp.has_value());
+  EXPECT_EQ(*got_stamp, kStamp);
+  EXPECT_EQ(got_meta, kTombMetaNone)
+      << "a legacy 225 record carries no meta on the wire -- it must install as kTombMetaNone, "
+         "never leak an uninitialized or stale value";
+}
+
+// drakeydb: P4-5 -- the V2 counterpart to RejectsPersistedTombstoneWithZeroMvcc above: a
+// malformed V2 record must be rejected the exact same way a malformed 225 record is -- Mvcc()==0
+// is checked on the reconstructed stamp before `meta` is ever consulted, so the extra trailing
+// wire word changes nothing about this reject case.
+TEST_F(RdbMvccTest, RejectsPersistedTombstoneV2WithZeroMvcc) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  const MvccStamp kZeroMvcc{MvccClock::kTombstoneBit, 0xDEADBEEFULL};  // Mvcc() == 0, bit 63 set.
+  std::string body = BuildTombstoneSectionV2(0, {{"ghost", kZeroMvcc, 12345u}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k2"}), "v2") << "the section's bytes must still be fully consumed";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("ghost", shard_set->size()), [&] {
+    got =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"ghost"});
+  });
+  EXPECT_FALSE(got.has_value()) << "a Mvcc()==0 tombstone must never be installed";
+
+  bool warned = std::any_of(log_capture.logs.begin(), log_capture.logs.end(), [](const auto& l) {
+    return l.find("Mvcc() == 0") != std::string::npos && l.find("ghost") != std::string::npos &&
+           l.find("RDB_OPCODE_DF_TOMBSTONES_V2") != std::string::npos;
+  });
+  EXPECT_TRUE(warned) << "expected a WARNING naming the rejected key, the reason, and V2's opcode";
+}
+
+// drakeydb: P4-5 -- the V2 counterpart to RejectsPersistedTombstoneMissingTombstoneBit above.
+TEST_F(RdbMvccTest, RejectsPersistedTombstoneV2MissingTombstoneBit) {
+  ASSERT_TRUE(IsActiveReplica());
+  ScopedLogCapture log_capture;
+
+  const MvccStamp kLiveLooking{0x0123456789ABCDEFULL & MvccClock::kStampMask, 0xBEEFULL};
+  ASSERT_FALSE(kLiveLooking.IsTombstone());
+  std::string body = BuildTombstoneSectionV2(0, {{"ghost", kLiveLooking, 12345u}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k2"}), "v2") << "the section's bytes must still be fully consumed";
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("ghost", shard_set->size()), [&] {
+    got =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"ghost"});
+  });
+  EXPECT_FALSE(got.has_value()) << "a non-tombstone entry in this section must never be installed";
+
+  bool warned = std::any_of(log_capture.logs.begin(), log_capture.logs.end(), [](const auto& l) {
+    return l.find("bit 63 clear") != std::string::npos && l.find("ghost") != std::string::npos &&
+           l.find("RDB_OPCODE_DF_TOMBSTONES_V2") != std::string::npos;
+  });
+  EXPECT_TRUE(warned) << "expected a WARNING naming the rejected key, the reason, and V2's opcode";
+}
+
+// drakeydb: P4-5 -- a hostile or corrupt V2 record cannot mint a tombstone that outlives what
+// this node's own clock would allow: ClampPeerTombMetaDeadline (mvcc.h) caps a far-future
+// whole-key deadline down to install-time `now`, and separately preserves the anchor bit on a
+// far-future anchor instead of stripping it -- the naive `min(meta, now)` would silently turn an
+// anchor into a bare deadline (see that helper's own comment).
+TEST_F(RdbMvccTest, V2HostileFarFutureMetaIsClampedAnchorStaysAnchorClassed) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  // Just under MvccClock's own 43-bit ms ceiling (kStampMask >> kCounterBits) -- "as far future
+  // as this encoding allows", roughly year 2248.
+  const uint64_t kFarFutureMs = (1ULL << 43) - 1;
+  ASSERT_GT(kFarFutureMs, now_ms);
+
+  const MvccStamp kStampDeadline =
+      MvccStamp{(now_ms << MvccClock::kCounterBits) + 0x8001, kPeerHash}.AsTombstone();
+  const MvccStamp kStampAnchor =
+      MvccStamp{(now_ms << MvccClock::kCounterBits) + 0x8002, kPeerHash}.AsTombstone();
+
+  std::string body = BuildTombstoneSectionV2(
+      0, {{"ghost_deadline", kStampDeadline, kFarFutureMs},
+          {"ghost_anchor", kStampAnchor, kTombMetaAnchorOnly | kFarFutureMs}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_EQ(Run({"get", "after"}), "afterval");
+
+  const uint64_t after_load_ms = GetCurrentTimeMs();
+
+  uint64_t deadline_meta = 0, anchor_meta = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    deadline_meta = db_slice.GetTombMeta(0, std::string_view{"ghost_deadline"});
+    anchor_meta = db_slice.GetTombMeta(0, std::string_view{"ghost_anchor"});
+  });
+
+  EXPECT_EQ(deadline_meta & kTombMetaAnchorOnly, 0u) << "a bare deadline must stay bare";
+  EXPECT_LE(deadline_meta, after_load_ms) << "a far-future deadline must clamp down to now";
+  EXPECT_GE(deadline_meta, now_ms) << "the clamp target is install-time now, not zero";
+
+  EXPECT_NE(anchor_meta & kTombMetaAnchorOnly, 0u)
+      << "the anchor bit must survive the clamp -- a far-future anchor must not decay into a "
+         "bare deadline";
+  EXPECT_LE(anchor_meta & ~kTombMetaAnchorOnly, after_load_ms)
+      << "the anchor's own ms payload must still clamp down to now";
+}
+
+// drakeydb: P4-5 -- proves the V2 read path's born-expired check genuinely uses `meta`, not just
+// the stamp: a tombstone whose write-time stamp alone is well past its own GC deadline (the
+// exact D-16 shape -- a long-lived key's tombstone floors on write time, not the key's own later
+// expiry) is refused via a bare 225 record, exactly as the test above already proves, but the
+// SAME stamp survives via V2 once its own whole-key deadline is attached, because eligibility
+// floors on max(stamp.ms, meta), not stamp.ms alone -- and a V2 record whose own meta is ALSO
+// stale is still refused (meta is a mitigation, never a blanket exemption).
+//
+// Falsify: pass kTombMetaNone for the "rescued" entry's meta below -- it is then refused and
+// counted exactly like the other two, and born_after == born_before + 3 instead of + 2.
+TEST_F(RdbMvccTest, V2MetaRescuesAWholeKeyDeadlineFromTheD16BornExpiredFalseRefusal) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 2);  // seconds; ttl_ms == 2000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  // A write-time ms 5s in the past: with ttl(2s), stamp.ms+ttl is 3s behind now -- born expired
+  // on its own, the same margin WithoutMergeLwwBornExpiredTombstoneInstallsNoneAndCounts uses.
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const uint64_t kRecentDeadlineMs = GetCurrentTimeMs() - 100;  // 100ms ago: extends the window
+                                                                // to ~1.9s past now
+  const MvccStamp kLegacyStamp =
+      MvccStamp{kOldMs << MvccClock::kCounterBits, kPeerHash}.AsTombstone();
+  const MvccStamp kRescuedStamp =
+      MvccStamp{(kOldMs << MvccClock::kCounterBits) + 1, kPeerHash}.AsTombstone();
+  const MvccStamp kStillExpiredStamp =
+      MvccStamp{(kOldMs << MvccClock::kCounterBits) + 2, kPeerHash}.AsTombstone();
+
+  size_t born_before = 0;
+  shard_set->Await(0, [&] {
+    born_before = namespaces->GetDefaultNamespace()
+                      .GetCurrentDbSlice()
+                      .MutableStats(0)
+                      ->mvcc_tombstones_born_expired;
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"legacy_ghost", kLegacyStamp}});
+  body += BuildTombstoneSectionV2(0, {{"rescued_ghost", kRescuedStamp, kRecentDeadlineMs},
+                                      {"still_expired_ghost", kStillExpiredStamp, kOldMs}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  // No SetMergeLww: exercises the non-merge install directly, matching the 225-only born-expired
+  // test above.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> legacy_got, rescued_got, still_expired_got;
+  size_t born_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    legacy_got = db_slice.GetMvcc(0, std::string_view{"legacy_ghost"});
+    rescued_got = db_slice.GetMvcc(0, std::string_view{"rescued_ghost"});
+    still_expired_got = db_slice.GetMvcc(0, std::string_view{"still_expired_ghost"});
+    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+
+  EXPECT_FALSE(legacy_got.has_value())
+      << "the 225 control, carrying no meta, must still be refused as born-expired -- this is "
+         "the D-16 regression V2's own meta word exists to fix";
+  ASSERT_TRUE(rescued_got.has_value())
+      << "the V2 record's own whole-key deadline must rescue it from the same false refusal";
+  EXPECT_EQ(*rescued_got, kRescuedStamp);
+  EXPECT_FALSE(still_expired_got.has_value())
+      << "a V2 record whose own meta is ALSO stale must still be refused -- meta is a mitigation, "
+         "not a blanket exemption";
+  EXPECT_EQ(born_after, born_before + 2)
+      << "exactly two born-expired refusals (the 225 control and the still-expired V2 record) -- "
+         "the rescued V2 record must not count";
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- the V2 counterpart to LoadConsumesAndDiscardsTombstoneSectionWhenInactive
+// above: an inactive loader must still fully consume a well-formed V2 section, meta word
+// included (proved by k2 loading correctly right after it -- if the section were mis-consumed
+// the stream would desync here exactly like that test's own k2), while installing nothing (an
+// inactive node's DbTable::mvcc is always null, table.cc) and never crashing.
+TEST_F(RdbTest, LoadConsumesAndDiscardsTombstoneV2SectionWhenInactive) {
+  ASSERT_FALSE(IsActiveReplica());
+
+  const MvccStamp kStamp{MvccClock::kTombstoneBit | (0x0123456789ULL << MvccClock::kCounterBits),
+                         0xFEDCBA9876543210ULL};
+  std::string body = BuildTombstoneSectionV2(0, {{"ghost", kStamp, 0xABCDEFULL}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k1");
+  AppendString(&body, "v1");
+  // No separator between the tombstone section and k2 either: proves the section's byte count
+  // (not just its opcode) was consumed precisely.
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "k2");
+  AppendString(&body, "v2");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "k1"}), "v1");
+  EXPECT_EQ(Run({"get", "k2"}), "v2");
+
+  std::optional<MvccStamp> got;
+  shard_set->Await(Shard("ghost", shard_set->size()), [&] {
+    got =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, std::string_view{"ghost"});
+  });
+  EXPECT_FALSE(got.has_value())
+      << "an inactive node must never install a tombstone -- GetMvcc must return nullopt, "
+         "proving SetTombstone's own `if (!db.mvcc) return;` guard (db_slice.cc) discarded it";
 }
 
 }  // namespace dfly
