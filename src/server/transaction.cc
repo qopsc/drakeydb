@@ -742,7 +742,12 @@ void Transaction::RunCallback(EngineShard* shard) {
   // own EngineShard*), so the veto decision must never live on the Transaction itself -- doing so
   // would race across shards for a multi-key command. See ShouldDropForLww's own comment
   // (transaction.h) for why the compare runs here, under the key's lock, rather than pre-dispatch.
-  const bool lww_dropped = ShouldDropForLww(shard, db_slice);
+  // drakeydb: P4-5 -- ShouldDropExpiredDelta only ever fires for a kUnguarded name,
+  // ShouldDropForLww only for kSingleKey -- disjoint classifications, so evaluation order does not
+  // matter for correctness; short-circuiting on the more common (guarded full-state write) check
+  // first avoids the second call's own DbTable/tombstone reads on that path.
+  const bool lww_dropped =
+      ShouldDropForLww(shard, db_slice) || ShouldDropExpiredDelta(shard, db_slice);
 
   RunnableResult result;
   try {
@@ -838,6 +843,129 @@ bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const 
     return false;
 
   NoteLwwDrop(cid_->name(), key);
+  return true;
+}
+
+// drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md): drops an unguarded delta
+// (INCR/APPEND/...) authored strictly before a STRING's own whole-key deadline D, once this node
+// already holds (or, after the lazy reap below, comes to hold) a tombstone carrying that D. The
+// tombstone is left completely untouched here -- no advance -- per the owner's 2026-09-25
+// revision of the original design: with 3+ nodes, a peer stream carries no cross-link causality,
+// so advancing this tombstone above a genuine re-create authored by a THIRD node (one this node
+// has not yet seen) can permanently delete that re-create once a later full sync propagates the
+// advanced stamp to every peer, including the one that authored it.
+//
+// Soundness:
+// - If the author itself already saw `key` as expired when it minted `incoming`, its own now was
+//   already >= D, and a fresh mint is never older than the clock that produced it, so
+//   incoming.MsPart() >= D and this function applies the delta rather than dropping it -- this
+//   never drops a genuine re-create, barring a backward clock step on the author.
+// - If incoming.MsPart() < D, the author applied its delta to a value that ALSO expires at D on
+//   the author's own node, so the net effect there is that same value vanishing at D regardless of
+//   what the delta did to it. Dropping the delta here matches that outcome.
+// - This node keeps its own (older) tombstone. The author's own eventual expiry of that same key
+//   mints a NEWER tombstone of its own ({incoming-derived stamp, +1}), which a later full sync's
+//   merge propagates here and converges both sides -- no advance is needed for that to happen.
+// - If the premise is wrong (the author's live key truly has a newer stamp than this reasoning
+//   assumed -- reachable when a third peer's delete reaches the author late, or the author itself
+//   evicted the key under memory pressure), the author's own copy still carries that newer stamp,
+//   and it wins the next full sync the ordinary way. A misfire here can defer a write's visibility
+//   until the next full sync; it can never lose one outright.
+// - Strings only: every other type's whole-key tombstone carries an ANCHOR, never a bare deadline
+//   (mvcc.h's kTombMeta* comment), so the anchor check below already excludes them. Explicit
+//   deletes carry no meta at all (RecordAbsentKeyRemoval, generic_family.cc, installs a meta-less
+//   tombstone for every replayed removal of an already-absent key), so this never acts on one
+//   either.
+bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice) {
+  if (!IsLwwGuarded())
+    return false;
+
+  // drakeydb: P4-5 -- only a genuine delta: a guarded full-state write (kSingleKey) already
+  // compares against the tombstone via ShouldDropForLww above; kMultiKeySelfGuarded (MSET, DEL)
+  // guards itself per-key inside its own Op function.
+  if (ClassifyJournaledCommand(cid_->name()) != LwwClass::kUnguarded)
+    return false;
+
+  // drakeydb: P4-5 -- a TTL-changing name reachable here only from a stale-binary or
+  // mixed-version author (IsWholeKeyTtlChanging's own comment, multimaster_lww.h) -- must apply
+  // exactly like any other unguarded write, never compared against an unrelated deadline.
+  if (IsWholeKeyTtlChanging(cid_->name()))
+    return false;
+
+  // drakeydb: P4-5 -- a technical squasher hop (MultiCommandSquasher's own outer container
+  // transaction over a batch of squashed sub-commands) is not itself a real command with a key
+  // set of its own -- GetShardArgs below DCHECKs against ever being called on one. Its own
+  // synthetic name is never a recognized guarded name either, so it reaches here (kUnguarded is
+  // the fail-safe default for any unrecognized name) unlike ShouldDropForLww above, which only
+  // continues past kSingleKey names and so never reaches its own GetShardArgs call for one. Each
+  // real squashed sub-command still reaches this veto separately, on its own squashed-stub
+  // sub-transaction -- mirrors LogAutoJournalOnShard's own "Ignore technical squasher hops" gate.
+  if (multi_ && multi_->role == SQUASHER)
+    return false;
+
+  // drakeydb: P4-5 -- a multi-key or cross-shard delta (cross-shard LMOVE/SMOVE, a multi-shard
+  // EXEC, ...) has no single key this veto can safely compare against: GetShardArgs below returns
+  // only THIS shard's own slice of the full key set, and picking its first entry would silently
+  // ignore the rest. unique_shard_cnt_==1 rules out cross-shard; keys.Size()==1 below rules out a
+  // same-shard multi-key command.
+  if (unique_shard_cnt_ != 1)
+    return false;
+
+  ShardArgs keys = GetShardArgs(shard->shard_id());
+  if (keys.Size() != 1u)
+    return false;
+
+  const std::optional<MvccStamp> incoming = IncomingStamp(repl_mvcc_, repl_origin_idx_);
+  if (!incoming)
+    return false;  // Unregistered origin; IncomingStamp already DCHECKed this should not happen.
+
+  const std::string_view key = keys.Front();
+
+  // drakeydb: P4-5 -- fast path: nothing in this db can be an unreaped-expired key, and this key's
+  // own slot is not already a meta-bearing tombstone, so there is nothing for the lazy reap below
+  // to do and nothing for the decision after it to read. Skips a second mvcc-table lookup on the
+  // overwhelmingly common case (a db with no TTLs at all, or a key that was never tombstoned).
+  const DbTable* db_table = db_slice.GetDBTable(db_index_);
+  if (db_table->stats.expire_count == 0 && db_slice.GetTombMeta(db_index_, key) == kTombMetaNone)
+    return false;
+
+  // drakeydb: P4-5 -- lazy reap, through the SAME path an ordinary read takes
+  // (DbSlice::ExpireIfNeeded, which itself honours expire_allowed_/replica_delete_expired): a key
+  // whose deadline already elapsed by wall-clock but that nothing has read yet is still LIVE in
+  // the prime table, so without this, the incoming delta would land on that stale live value via
+  // the callback's own FindMutable instead of ever being compared against the deadline it should
+  // already have crossed. Reaping here installs ExpiryTombstoneFor(S) plus the type-classified
+  // meta through the exact same commit path a real read would have taken -- this may itself
+  // journal (a DEL) and yield, so it runs BEFORE the decision below, never after. Works the prime
+  // table directly rather than calling FindMutable/FindReadOnly: this veto runs ahead of every
+  // OBJ_* type's own delta, not only strings, and those two entry points require a known type or
+  // silently drop write-side bookkeeping (IsOmittableWrite) this lookup has no business running.
+  PrimeIterator prime_it = db_slice.GetTables(db_index_)->Find(key);
+  if (IsValid(prime_it) && prime_it->first.HasExpire())
+    db_slice.ExpireIfNeeded(GetDbContext(), DbSlice::Iterator::FromPrime(prime_it));
+
+  // drakeydb: P4-5 -- decide, after the last possible yield above: no preemption point separates
+  // this read from the DROP it may lead to below, so the tombstone/meta pair read here is exactly
+  // what is (or isn't) acted on -- this callback still holds the key's own intent lock throughout
+  // RunCallback, so nothing else can install a new tombstone or clear this one's meta on this key
+  // between this line and the `return true` below.
+  const uint64_t meta = db_slice.GetTombMeta(db_index_, key);
+  if (meta == kTombMetaNone || (meta & kTombMetaAnchorOnly) != 0)
+    return false;  // No meta (live, or an explicit tombstone), or an anchor: neither is a sound
+                   // veto premise (a non-string container can empty via an ordinary delta well
+                   // before its own whole-key deadline), so never veto on either.
+
+  const std::optional<MvccStamp> stored = db_slice.GetMvcc(db_index_, key);
+  if (!stored || !stored->IsTombstone())
+    return false;  // Meta cannot outlive its own tombstone (EnsureMvcc/SetMvcc clear it on reuse).
+
+  if (incoming->MsPart() >= TombMetaMs(meta))
+    return false;  // The author's own now already reached D -- a genuine re-create; apply it.
+
+  // drakeydb: P4-5 -- drop only: `stored`/`meta` are left exactly as read above -- see this
+  // function's own header comment for why advancing the tombstone here (the design's earlier,
+  // reverted shape) can delete a genuine re-create once a later full sync propagates that advance.
+  NoteExpiredDeltaDrop(cid_->name(), key);
   return true;
 }
 

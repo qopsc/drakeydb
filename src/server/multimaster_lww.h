@@ -123,6 +123,26 @@ inline bool LwwShouldDropKey(const std::optional<MvccStamp>& stored, const MvccS
 // LOG(INFO) -- a conflicting workload drops thousands per second.
 void NoteLwwDrop(std::string_view journaled_name, std::string_view key);
 
+// drakeydb: P4-5 -- the expired-delta veto's own deny-list (D-27, ISSUE-REGISTER.md): a JOURNALED
+// name that changes a key's whole-key TTL without also shipping the resulting value. Every one of
+// these classifies kUnguarded above (none of them appear in kJournaledClasses), so without this
+// check Transaction::ShouldDropExpiredDelta (transaction.cc) would otherwise treat one as an
+// ordinary delta and compare it against a string's own whole-key deadline tombstone. An ACTIVE
+// author never journals these six under their own name -- every TTL change normalizes down to a
+// guarded SET/RESTORE/DEL first (see this header's own ClassifyJournaledCommand comment) -- so the
+// only real path that can still reach this table is a stale-binary or mixed-version peer that
+// journals one of them verbatim with a real mvcc attached; that entry must apply exactly as any
+// other unguarded write does (plain arrival order, floored by FloorAppliedStamp when it lands
+// behind the local stamp), never vetoed outright by comparing it to an unrelated deadline.
+bool IsWholeKeyTtlChanging(std::string_view journaled_name);
+
+// Records one delta the D-27 veto dropped: ++ServerState::tlocal()->stats.
+// multimaster_expired_delta_dropped, VLOG(2) with cmd + key, and the same LOG_EVERY_T(INFO, 60)
+// rollup shape as NoteLwwDrop above -- a separate counter (and a separate rollup line) because the
+// two vetoes fire on disjoint command classes (kSingleKey vs kUnguarded) and a mixed rollup would
+// hide which one a spike came from.
+void NoteExpiredDeltaDrop(std::string_view journaled_name, std::string_view key);
+
 // drakeydb: P4-4 -- the single builder for a STRING key's full-state SET, journaled under a
 // guarded name in place of a delta: `SET key value [PXAT abs] [STICK] [_MCFLAGS n]`. Every field
 // is read from `pk`/`pv` -- this key's own, CURRENT, post-write stored state -- never from

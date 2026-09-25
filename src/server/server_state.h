@@ -154,10 +154,10 @@ class ServerState {  // public struct - to allow initialization.
     // silently absorb a same-sized field there without tripping the sizeof() static_assert in
     // Stats::Add.
     uint64_t multimaster_lww_dropped = 0;
-    // drakeydb: P4-5 -- count of an unguarded applied delta RMW (INCR/APPEND/...) that the D-27
-    // rule DROPPED because it targeted a key still covered by a whole-key deadline tombstone.
-    // Placed at the struct end for the same trailing-padding reason as multimaster_lww_dropped
-    // above. Stays 0 until that rule lands.
+    // drakeydb: P4-5 -- count of an unguarded applied delta RMW (INCR/APPEND/...) that
+    // Transaction::ShouldDropExpiredDelta (transaction.cc) DROPPED because it targeted a STRING
+    // key still covered by a whole-key deadline tombstone. Placed at the struct end for the same
+    // trailing-padding reason as multimaster_lww_dropped above.
     uint64_t multimaster_expired_delta_dropped = 0;
   };
 

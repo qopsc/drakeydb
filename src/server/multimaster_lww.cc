@@ -154,4 +154,28 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key) {
                         << " replicated writes so far on this shard";
 }
 
+// drakeydb: P4-5 -- the six names D-27's veto must never act on regardless of what a whole-key
+// deadline tombstone says (see this table's own declaration comment, multimaster_lww.h). Kept as
+// a plain linear scan, not a sorted table like kJournaledClasses above: this list is a fraction of
+// that table's size and is only ever consulted on the veto's own (already narrow) kUnguarded path.
+constexpr std::string_view kWholeKeyTtlChangingNames[] = {"PEXPIREAT", "PEXPIRE", "EXPIRE",
+                                                          "EXPIREAT",  "PERSIST", "GETEX"};
+
+bool IsWholeKeyTtlChanging(std::string_view journaled_name) {
+  const std::string upper = absl::AsciiStrToUpper(journaled_name);
+  return std::find(std::begin(kWholeKeyTtlChangingNames), std::end(kWholeKeyTtlChangingNames),
+                   upper) != std::end(kWholeKeyTtlChangingNames);
+}
+
+void NoteExpiredDeltaDrop(std::string_view journaled_name, std::string_view key) {
+  ServerState::Stats& stats = ServerState::tlocal()->stats;
+  ++stats.multimaster_expired_delta_dropped;
+  VLOG(2) << "multi-master expired-delta veto dropped " << journaled_name << " on key " << key;
+  // Same per-thread caveat as NoteLwwDrop's own rollup above: this is one shard's own running
+  // total, not the cross-shard sum INFO replication and the Prometheus counter report.
+  LOG_EVERY_T(INFO, 60) << "multi-master expired-delta veto has dropped "
+                        << stats.multimaster_expired_delta_dropped
+                        << " replicated deltas so far on this shard";
+}
+
 }  // namespace dfly
