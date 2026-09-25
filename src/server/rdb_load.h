@@ -565,9 +565,17 @@ class RdbLoader : protected RdbLoaderBase {
   //
   // MUST run on the thread of the shard that owns `key`, and `stamp` MUST have bit 63 set
   // (MvccStamp::AsTombstone). `resident_live` is the caller's pre-yield observation of whether
-  // `prime` holds a live entry for `key`. No-op when the resident side wins the compare.
+  // `prime` holds a live entry for `key`.  No-op when the resident side wins the compare.
+  //
+  // drakeydb: P4-5 -- `meta`, mandatory: CreateObjectOnShard's own already-expired-incoming caller
+  // passes `item->expire_ms` (the peer's whole-key deadline D); HandleTombstones' own
+  // RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- that wire format carries no
+  // meta at all yet (a later task's V2 opcode does). Clamped to `min(meta, this call's own "now")`
+  // before either install point below: D <= now by construction for the expired-incoming caller,
+  // so only a corrupt/hostile value ever actually clamps (mvcc.h's own
+  // ClampPeerTombMetaDeadline comment).
   static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
-                                         const MvccStamp& stamp, bool resident_live);
+                                         const MvccStamp& stamp, bool resident_live, uint64_t meta);
 
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.

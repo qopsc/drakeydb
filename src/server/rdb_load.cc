@@ -3288,7 +3288,8 @@ void RdbLoaderBase::CopyStreamId(const StreamID& src, struct streamID* dest) {
 // second, drifting copy of it. Every comment below is Task 6's own, carried over unchanged except
 // where it names its (now two) callers. See rdb_load.h for the preconditions.
 void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, string_view key,
-                                           const MvccStamp& stamp, bool resident_live) {
+                                           const MvccStamp& stamp, bool resident_live,
+                                           uint64_t meta) {
   DCHECK(stamp.IsTombstone());
 
   // drakeydb: carried contract from Task 3 (db_slice.cc's TombstoneGcStep comment), enforced here
@@ -3485,7 +3486,10 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // and nothing between Del() and this call yields, so there is no window for a real Commit()
       // to race this Disarm.
       MvccStamper::tlocal()->Disarm(db_index, key);
-      db_slice->SetTombstone(db_index, key, stamp);
+      // drakeydb: P4-5 -- clamp here, at install (mvcc.h's own ClampPeerTombMetaDeadline comment):
+      // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally.
+      db_slice->SetTombstone(db_index, key, stamp,
+                             ClampPeerTombMetaDeadline(meta, GetCurrentTimeMs()));
     }
     // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone (ttl=0, or
     // the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped already incremented in
@@ -3570,7 +3574,10 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // generic_family.cc) rather than copied a third time; it re-resolves the table fresh via
   // IsDbValid(db_ind) internally, matching this function's own re-resolve-not-reuse discipline
   // above for exactly the same reason (a stale table pointer captured before a yield).
-  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp);
+  // drakeydb: P4-5 -- `meta` unclamped here: InstallAbsentKeyTombstone clamps internally (its own
+  // comment, db_slice.h), the same install-time clamp SetCmd::Set's own InstallAbsentKeyTombstone
+  // caller relies on.
+  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta);
 }
 
 void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice) {
@@ -3823,8 +3830,11 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
       DbTable* table = db_slice->GetDBTable(db_cntx.db_index);
       const bool resident_live =
           table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
+      // drakeydb: P4-5 -- meta = item->expire_ms, the peer's own whole-key deadline D (D-16,
+      // ISSUE-REGISTER.md); ApplyMergeTombstoneOnShard clamps it to now before either install
+      // point.
       ApplyMergeTombstoneOnShard(db_slice, db_cntx.db_index, item->key,
-                                 ExpiryTombstoneFor(incoming), resident_live);
+                                 ExpiryTombstoneFor(incoming), resident_live, item->expire_ms);
       return;
     }
     VLOG(2) << "Expire key on load: " << item->key;
@@ -4381,156 +4391,161 @@ error_code RdbLoader::HandleTombstones() {
     // an earlier version of this comment overclaimed the LWW guarantee held unconditionally for
     // every loader, not just under merge_lww_.
     const ShardId sid = Shard(key, shard_set->size());
-    auto install =
-        [db_index, key, stamp, merge_lww = merge_lww_] {
-          DbSlice& db_slice = GetCurrentDbSlice();
-          // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
-          // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
-          // ActivateDb calls -- a db whose only remaining trace is tombstones (every live key
-          // already deleted) may carry no SELECTDB opcode at all in this shard's stream. ActivateDb
-          // is idempotent (db_slice.h), so calling it unconditionally here is always safe.
-          db_slice.ActivateDb(db_index);
+    auto install = [db_index, key, stamp, merge_lww = merge_lww_] {
+      DbSlice& db_slice = GetCurrentDbSlice();
+      // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
+      // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
+      // ActivateDb calls -- a db whose only remaining trace is tombstones (every live key
+      // already deleted) may carry no SELECTDB opcode at all in this shard's stream. ActivateDb
+      // is idempotent (db_slice.h), so calling it unconditionally here is always safe.
+      db_slice.ActivateDb(db_index);
 
-          // drakeydb: P4-3 Task 5 review fix (I4), extended by Task 6 -- whether a RESIDENT live
-          // key exists is needed by both branches below (the merge-LWW delete-or-guard path, and
-          // the plain skip-and-warn path a non-merge load still uses), so it is computed once,
-          // ahead of the branch. This section is a PROLOGUE, parsed and (if active) installed
-          // before this shard's own key stream even begins, so at this exact moment `table->prime`
-          // can only hold whatever this DbSlice already held BEFORE this file started loading (a
-          // non-flushing load onto an already-populated database, e.g. DEBUG LOAD, or a
-          // merge-mode full sync landing on existing data) -- it can never yet hold a later key
-          // from THIS SAME file, since those haven't been parsed yet.
-          //
-          // The SAME-file case (this file's own later key stream re-creating a key this same file
-          // tombstoned) is a different, legitimate scenario our own saver DOES produce: a key
-          // deleted before the snapshot's PROLOGUE ran, then re-SET while IterateBucketsFb (below
-          // in this file) was still walking buckets, is captured by SerializeTombstones as a
-          // tombstone AND later re-appears in the key stream as a live record. That is not a
-          // same-file collision this guard ever sees: the live record hasn't loaded yet when this
-          // callback runs, so `resident_live` below is false, SetTombstone installs the tombstone,
-          // and the later live record's own CreateObjectOnShard -> SetMvcc (above in this file)
-          // transitions the slot from tombstone to live via SetMvcc's own was_tombstone repair
-          // (db_slice.cc), decrementing mvcc_tombstones and restoring the dense invariant --
-          // self-repairing, correct in this ordering by construction (our own emit order is always
-          // prologue-before-key-stream) without this loader needing to reason about it at all.
-          DbTable* table = db_slice.GetDBTable(db_index);
-          PrimeIterator prime_it;
-          const bool resident_live =
-              table != nullptr && !(prime_it = table->prime.Find(string_view{key})).is_done();
-          // drakeydb: P4-3 Task 6 review fix (M3, Important), Task 12 carried item (d) -- a
-          // DbSlice with no mvcc side table (mvcc_enabled_ false) means GetMvcc always returns
-          // nullopt and MergeAccepts would always (vacuously) accept, so
-          // ApplyMergeTombstoneOnShard refuses that case outright (see its own comment on why it
-          // reads db_slice.mvcc_enabled() rather than table->mvcc). Recomputed here as well
-          // because this lambda must know whether that refusal happened: when it did, the
-          // non-merge skip-and-warn / no-op-SetTombstone path below is the correct fallback, and
-          // it is already safe for this scenario.
-          const bool mvcc_ready = table != nullptr && db_slice.mvcc_enabled();
+      // drakeydb: P4-3 Task 5 review fix (I4), extended by Task 6 -- whether a RESIDENT live
+      // key exists is needed by both branches below (the merge-LWW delete-or-guard path, and
+      // the plain skip-and-warn path a non-merge load still uses), so it is computed once,
+      // ahead of the branch. This section is a PROLOGUE, parsed and (if active) installed
+      // before this shard's own key stream even begins, so at this exact moment `table->prime`
+      // can only hold whatever this DbSlice already held BEFORE this file started loading (a
+      // non-flushing load onto an already-populated database, e.g. DEBUG LOAD, or a
+      // merge-mode full sync landing on existing data) -- it can never yet hold a later key
+      // from THIS SAME file, since those haven't been parsed yet.
+      //
+      // The SAME-file case (this file's own later key stream re-creating a key this same file
+      // tombstoned) is a different, legitimate scenario our own saver DOES produce: a key
+      // deleted before the snapshot's PROLOGUE ran, then re-SET while IterateBucketsFb (below
+      // in this file) was still walking buckets, is captured by SerializeTombstones as a
+      // tombstone AND later re-appears in the key stream as a live record. That is not a
+      // same-file collision this guard ever sees: the live record hasn't loaded yet when this
+      // callback runs, so `resident_live` below is false, SetTombstone installs the tombstone,
+      // and the later live record's own CreateObjectOnShard -> SetMvcc (above in this file)
+      // transitions the slot from tombstone to live via SetMvcc's own was_tombstone repair
+      // (db_slice.cc), decrementing mvcc_tombstones and restoring the dense invariant --
+      // self-repairing, correct in this ordering by construction (our own emit order is always
+      // prologue-before-key-stream) without this loader needing to reason about it at all.
+      DbTable* table = db_slice.GetDBTable(db_index);
+      PrimeIterator prime_it;
+      const bool resident_live =
+          table != nullptr && !(prime_it = table->prime.Find(string_view{key})).is_done();
+      // drakeydb: P4-3 Task 6 review fix (M3, Important), Task 12 carried item (d) -- a
+      // DbSlice with no mvcc side table (mvcc_enabled_ false) means GetMvcc always returns
+      // nullopt and MergeAccepts would always (vacuously) accept, so
+      // ApplyMergeTombstoneOnShard refuses that case outright (see its own comment on why it
+      // reads db_slice.mvcc_enabled() rather than table->mvcc). Recomputed here as well
+      // because this lambda must know whether that refusal happened: when it did, the
+      // non-merge skip-and-warn / no-op-SetTombstone path below is the correct fallback, and
+      // it is already safe for this scenario.
+      const bool mvcc_ready = table != nullptr && db_slice.mvcc_enabled();
 
-          // drakeydb: P4-3 Task 6 -- the merge-LWW gate for a peer-mode full sync (merge_lww is
-          // captured BY VALUE from merge_lww_ above: this lambda can run on a different fiber, and
-          // possibly a different thread, than the one that called SetMergeLww). A non-merge load
-          // (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) never sets
-          // merge_lww_ true (rdb_load.h's own doc comment on SetMergeLww) and falls straight
-          // through to the pre-existing skip-and-warn / unconditional-install behavior below,
-          // completely unchanged -- D-7's compatibility rule for those three loaders.
-          //
-          // drakeydb: P4-3 final fix wave (F-1) -- the apply itself now lives in
-          // RdbLoader::ApplyMergeTombstoneOnShard (above in this file), shared verbatim with
-          // CreateObjectOnShard's already-expired-incoming path so the two can never drift. It
-          // returns without touching anything when the resident side wins the compare, and (per
-          // review fix M3) when this DbSlice has no mvcc side table at all -- `mvcc_ready` here is
-          // kept only so that second case still falls through to the non-merge behavior below,
-          // which is already safe for it.
-          if (merge_lww && mvcc_ready) {
-            ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live);
-            return;
-          }
+      // drakeydb: P4-3 Task 6 -- the merge-LWW gate for a peer-mode full sync (merge_lww is
+      // captured BY VALUE from merge_lww_ above: this lambda can run on a different fiber, and
+      // possibly a different thread, than the one that called SetMergeLww). A non-merge load
+      // (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) never sets
+      // merge_lww_ true (rdb_load.h's own doc comment on SetMergeLww) and falls straight
+      // through to the pre-existing skip-and-warn / unconditional-install behavior below,
+      // completely unchanged -- D-7's compatibility rule for those three loaders.
+      //
+      // drakeydb: P4-3 final fix wave (F-1) -- the apply itself now lives in
+      // RdbLoader::ApplyMergeTombstoneOnShard (above in this file), shared verbatim with
+      // CreateObjectOnShard's already-expired-incoming path so the two can never drift. It
+      // returns without touching anything when the resident side wins the compare, and (per
+      // review fix M3) when this DbSlice has no mvcc side table at all -- `mvcc_ready` here is
+      // kept only so that second case still falls through to the non-merge behavior below,
+      // which is already safe for it.
+      if (merge_lww && mvcc_ready) {
+        // drakeydb: P4-5 -- kTombMetaNone: an RDB_OPCODE_DF_TOMBSTONES (225) record carries no
+        // meta on the wire at all yet (a later task's V2 opcode does) -- matches this
+        // function's OTHER, non-merge install of the identical record just below, which also
+        // passes kTombMetaNone explicitly.
+        ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live, kTombMetaNone);
+        return;
+      }
 
-          // drakeydb: P4-3 Task 5 review fix (I4) -- dense-invariant guard against a RESIDENT live
-          // key, not a same-file one (see `resident_live`'s own comment above for the full
-          // account). Installing a tombstone over a pre-existing resident value would incorrectly
-          // delete it and violate the dense invariant (mvcc->size() - mvcc_tombstones ==
-          // prime.size(), db_slice.cc); skip instead. Reached for a non-merge load (the D-7
-          // compatibility rule: a local RDB file, DEBUG LOAD, and a plain Dragonfly
-          // replica's full sync must never delete a resident value on account of a tombstone
-          // record) -- and, per review fix M3, also for a merge_lww_ load whose DbSlice has no
-          // mvcc side table at all (`!mvcc_ready` above), since the `if (merge_lww && mvcc_ready)`
-          // branch above only ever returns when it actually ran a genuine LWW compare.
-          //
-          // review fix (M6) -- LOG_FIRST_N, not a per-instance bool: this check runs per-key on
-          // whichever shard owns that key (potentially several different shard threads within one
-          // load), so a plain bool member here would race the way the two parsing-thread-only
-          // warnings above (checked before any per-shard dispatch) do not. LOG_FIRST_N's internal
-          // counter is atomic (replica.cc:441's REPLCONF UUID warning is the in-tree precedent for
-          // exactly this).
-          if (resident_live) {
-            LOG_FIRST_N(WARNING, 1)
-                << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key) << "' in DB "
-                << db_index
-                << " names a key that already holds a live, resident value on this node -- keeping "
-                   "the resident value and skipping the tombstone";
-            return;
-          }
+      // drakeydb: P4-3 Task 5 review fix (I4) -- dense-invariant guard against a RESIDENT live
+      // key, not a same-file one (see `resident_live`'s own comment above for the full
+      // account). Installing a tombstone over a pre-existing resident value would incorrectly
+      // delete it and violate the dense invariant (mvcc->size() - mvcc_tombstones ==
+      // prime.size(), db_slice.cc); skip instead. Reached for a non-merge load (the D-7
+      // compatibility rule: a local RDB file, DEBUG LOAD, and a plain Dragonfly
+      // replica's full sync must never delete a resident value on account of a tombstone
+      // record) -- and, per review fix M3, also for a merge_lww_ load whose DbSlice has no
+      // mvcc side table at all (`!mvcc_ready` above), since the `if (merge_lww && mvcc_ready)`
+      // branch above only ever returns when it actually ran a genuine LWW compare.
+      //
+      // review fix (M6) -- LOG_FIRST_N, not a per-instance bool: this check runs per-key on
+      // whichever shard owns that key (potentially several different shard threads within one
+      // load), so a plain bool member here would race the way the two parsing-thread-only
+      // warnings above (checked before any per-shard dispatch) do not. LOG_FIRST_N's internal
+      // counter is atomic (replica.cc:441's REPLCONF UUID warning is the in-tree precedent for
+      // exactly this).
+      if (resident_live) {
+        LOG_FIRST_N(WARNING, 1)
+            << "RDB_OPCODE_DF_TOMBSTONES entry for key '" << absl::CHexEscape(key) << "' in DB "
+            << db_index
+            << " names a key that already holds a live, resident value on this node -- keeping "
+               "the resident value and skipping the tombstone";
+        return;
+      }
 
-          // drakeydb: P4-3 Task 8, controller fix (I4, code defect) -- TombstonesEnabled() must
-          // gate this install exactly like it already gates the merge-branch's own fallthrough
-          // install above (the `if (TombstonesEnabled())` block guarding this function's OTHER
-          // SetTombstone call): --multi_master_tombstone_ttl=0 makes TombstoneGcStep (db_slice.cc)
-          // unconditionally no-op, so a tombstone installed here while disabled can never be
-          // reaped -- immortal, the exact failure class Task 3's Mvcc()==0 rejection (this
-          // function, above) and TombstoneGcStep's own reap predicate both exist to prevent,
-          // reached here via a third route this function's other two gates do not cover: a
-          // non-merge load (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's
-          // full sync) of a file carrying an opcode 225 tombstone section -- most concretely, this
-          // node's own prior SAVE/BGSAVE output, reloaded after an operator flips
-          // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
-          // no-op below so the warning fires on the actually-relevant cause when both are true.
-          if (!TombstonesEnabled()) {
-            LOG_FIRST_N(WARNING, 1) << "RDB_OPCODE_DF_TOMBSTONES entry for key '"
-                                    << absl::CHexEscape(key) << "' in DB " << db_index
-                                    << " skipped -- tombstoning is disabled on this node "
-                                       "(--multi_master_tombstone_ttl=0)";
-            return;
-          }
+      // drakeydb: P4-3 Task 8, controller fix (I4, code defect) -- TombstonesEnabled() must
+      // gate this install exactly like it already gates the merge-branch's own fallthrough
+      // install above (the `if (TombstonesEnabled())` block guarding this function's OTHER
+      // SetTombstone call): --multi_master_tombstone_ttl=0 makes TombstoneGcStep (db_slice.cc)
+      // unconditionally no-op, so a tombstone installed here while disabled can never be
+      // reaped -- immortal, the exact failure class Task 3's Mvcc()==0 rejection (this
+      // function, above) and TombstoneGcStep's own reap predicate both exist to prevent,
+      // reached here via a third route this function's other two gates do not cover: a
+      // non-merge load (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's
+      // full sync) of a file carrying an opcode 225 tombstone section -- most concretely, this
+      // node's own prior SAVE/BGSAVE output, reloaded after an operator flips
+      // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
+      // no-op below so the warning fires on the actually-relevant cause when both are true.
+      if (!TombstonesEnabled()) {
+        LOG_FIRST_N(WARNING, 1) << "RDB_OPCODE_DF_TOMBSTONES entry for key '"
+                                << absl::CHexEscape(key) << "' in DB " << db_index
+                                << " skipped -- tombstoning is disabled on this node "
+                                   "(--multi_master_tombstone_ttl=0)";
+        return;
+      }
 
-          // drakeydb: P4-3 final fix wave (I-1) -- this install honoured TombstonesEnabled()
-          // (above) but NOT the per-(database, shard) cap, unlike its merge twin
-          // (ApplyMergeTombstoneOnShard's own `if (TombstonesEnabled())` block, above in this
-          // file) and unlike PerformDeletionAtomic itself (db_slice.cc). This is the ORDINARY
-          // restart-from-own-RDB path -- a non-merge load of a file this node itself saved -- so
-          // an uncapped install here could restore a tombstone set larger than
-          // --multi_master_max_tombstones would ever have allowed a live delete to build, purely
-          // by reloading, and then keep it: TombstoneGcStep (db_slice.cc) only reaps on age, never
-          // down to the cap.
-          //
-          // `would_grow` mirrors SetTombstone's own `was_tombstone` guard (db_slice.cc) exactly,
-          // the same way the merge twin does: SetTombstone does not increment mvcc_tombstones when
-          // the slot it overwrites is ALREADY a tombstone, so refusing that case at the cap would
-          // be a spurious, miscounted drop AND would strand the older stamp. A genuine at-cap drop
-          // is counted in mvcc_tombstones_dropped, the same visible degradation signal a
-          // capped-out live delete produces (DEBUG MVCC / INFO).
-          //
-          // Re-resolving the table is also what makes the SetTombstone call below safe when this
-          // DbSlice has no mvcc side table at all -- see the D-7 unconditional read comment above;
-          // reachable two ways: `active` above raced with a runtime flag flip (not a supported
-          // scenario for a non-merge load), or (review fix M3) a merge_lww_ load whose
-          // `!mvcc_ready` sent it here instead of into the merge branch above. Either way
-          // SetTombstone's own guard (db_slice.cc) makes this a harmless no-op, and a null table
-          // here simply skips it.
-          DbTable* cur_table = db_slice.GetDBTable(db_index);
-          if (cur_table == nullptr) {
-            return;
-          }
-          const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
-          const bool would_grow = !existing.has_value() || !existing->IsTombstone();
-          if (!would_grow ||
-              cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-            db_slice.SetTombstone(db_index, key, stamp);
-          } else {
-            ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
-          }
-        };
+      // drakeydb: P4-3 final fix wave (I-1) -- this install honoured TombstonesEnabled()
+      // (above) but NOT the per-(database, shard) cap, unlike its merge twin
+      // (ApplyMergeTombstoneOnShard's own `if (TombstonesEnabled())` block, above in this
+      // file) and unlike PerformDeletionAtomic itself (db_slice.cc). This is the ORDINARY
+      // restart-from-own-RDB path -- a non-merge load of a file this node itself saved -- so
+      // an uncapped install here could restore a tombstone set larger than
+      // --multi_master_max_tombstones would ever have allowed a live delete to build, purely
+      // by reloading, and then keep it: TombstoneGcStep (db_slice.cc) only reaps on age, never
+      // down to the cap.
+      //
+      // `would_grow` mirrors SetTombstone's own `was_tombstone` guard (db_slice.cc) exactly,
+      // the same way the merge twin does: SetTombstone does not increment mvcc_tombstones when
+      // the slot it overwrites is ALREADY a tombstone, so refusing that case at the cap would
+      // be a spurious, miscounted drop AND would strand the older stamp. A genuine at-cap drop
+      // is counted in mvcc_tombstones_dropped, the same visible degradation signal a
+      // capped-out live delete produces (DEBUG MVCC / INFO).
+      //
+      // Re-resolving the table is also what makes the SetTombstone call below safe when this
+      // DbSlice has no mvcc side table at all -- see the D-7 unconditional read comment above;
+      // reachable two ways: `active` above raced with a runtime flag flip (not a supported
+      // scenario for a non-merge load), or (review fix M3) a merge_lww_ load whose
+      // `!mvcc_ready` sent it here instead of into the merge branch above. Either way
+      // SetTombstone's own guard (db_slice.cc) makes this a harmless no-op, and a null table
+      // here simply skips it.
+      DbTable* cur_table = db_slice.GetDBTable(db_index);
+      if (cur_table == nullptr) {
+        return;
+      }
+      const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
+      const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+      if (!would_grow ||
+          cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
+        // drakeydb: P4-5 -- kTombMetaNone, explicit: this RDB_OPCODE_DF_TOMBSTONES (225)
+        // record carries no meta on the wire at all yet (a later task's V2 opcode does).
+        db_slice.SetTombstone(db_index, key, stamp, kTombMetaNone);
+      } else {
+        ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly
+      }
+    };
 
     if (EngineShard::tlocal() != nullptr && EngineShard::tlocal()->shard_id() == sid) {
       install();

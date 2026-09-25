@@ -430,6 +430,22 @@ class DbSlice {
   // write, and a later task's RDB tombstone-section apply -- this method just no longer routes
   // through it.
   void SetExistingMvcc(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  // drakeydb: P4-5 -- commits an expiry's own tombstone (always IsTombstone(), DCHECKed) onto a
+  // slot ArmTombstone/PerformDeletionAtomic already prepared, exactly like SetExistingMvcc above,
+  // AND attaches `meta` in the same call. The one caller of each: RecordExpiryBlocking (tx_base.cc,
+  // meta = the expired key's own deadline D), DbSlice::DeleteReapedContainer, SetFamily::
+  // DeleteSetIfEmpty, HSetFamily::DeleteIfEmpty, and OpPop's SPOP-all-expired branch
+  // (set_family.cc) (meta = kTombMetaAnchorOnly | reap-time R) -- every one of them invokes this
+  // from INSIDE MvccStamper::CommitOwnTombstone's own callback, BEFORE that call site's own
+  // journal::RecordEntry (and therefore before AddLogRecord) -- verified once per caller at the
+  // call site itself, not re-derived here. journal.cc's post-AddLogRecord commit callback must
+  // never allocate (its own comment, ~:145-150); SetTombMetaOnSlot's SetExpireTime/ClearExpireTime
+  // below CAN allocate (converting an inline key to SDS_TTL), which is exactly why this is a
+  // SEPARATE method from SetExistingMvcc (allocation-free by contract, for its own, different
+  // caller: journal.cc's generic per-arm sweep, which DOES run after AddLogRecord) rather than a
+  // parameter added to it.
+  void CommitExpiryTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
+                             uint64_t meta);
   // drakeydb: P4-3 Task 2 -- writes a tombstone slot, maintaining mvcc_entries, mvcc_tombstones,
   // and mvcc_key_dup_bytes (the same three SetMvcc maintains, plus mvcc_tombstones, which SetMvcc
   // never touches). Callers: PerformDeletionAtomic's synchronous placeholder write (db_slice.cc)
@@ -467,7 +483,20 @@ class DbSlice {
   // below this call's own ExpiryTombstoneFor(X) for the identical write against an absent key. Not
   // a divergence -- no real stamp falls between the two (floored stamps never go on the wire), and
   // a merge-load raises the lower one. This present-key path predates this call.
-  void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  //
+  // drakeydb: P4-5 -- `meta`, mandatory (no default: every one of this method's four call sites --
+  // SetCmd::Set, OpRestore, Renamer::DeserializeDest, RdbLoader::ApplyMergeTombstoneOnShard's own
+  // no-live-key fallthrough -- now has a real incoming deadline D to supply, never a meta-less
+  // install left over by omission). Clamped to `min(meta, GetCurrentTimeMs())` here, at install,
+  // before being forwarded to SetTombstone: every caller reaches this method because the incoming
+  // deadline has ALREADY elapsed (D <= now by construction), so a genuine D never clamps -- only a
+  // corrupt or hostile peer value claiming a future deadline does, which is exactly the hazard this
+  // guards against (mvcc.h's own ClampPeerTombMetaDeadline comment). A caller with no real deadline
+  // to give (there are none left today) would pass kTombMetaNone explicitly -- clamping 0 against
+  // any now_ms is still 0, a harmless no-op -- never an anchor: no caller of this method installs
+  // one.
+  void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
+                                 uint64_t meta);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   // drakeydb: P4-5 -- reads the tombstone meta word (mvcc.h's kTombMetaNone/kTombMetaAnchorOnly
   // encoding), stored in the mvcc slot's own CompactKey TTL word rather than a third MvccStamp

@@ -119,6 +119,13 @@ class SetCmd {
     optional<StringResult>* prev_val = nullptr;  // if set, previous value will be stored if found
     BackPressureFuture* backpressure = nullptr;
     bool expire_in_past = false;  // the parsed absolute expiration has already elapsed
+    // drakeydb: P4-5 -- the absolute deadline D that made expire_in_past true, valid only when
+    // expire_in_past is (ParseSetParams below sets both together): the incoming PXAT/EXAT/PX/EX
+    // value has already elapsed by the time this SET reaches Set() below, so D itself is <= now
+    // by construction. Set() reads this as the tombstone meta for an already-expired guarded
+    // write's own absent-key install (D-16, ISSUE-REGISTER.md) -- without a separate field,
+    // expire_in_past alone loses D once it collapses the relative/absolute distinction to a bool.
+    uint64_t expire_deadline_ms = 0;
 
     constexpr bool IsConditionalSet() const {
       return flags & SET_IF_NOTEXIST || flags & SET_IF_EXISTS;
@@ -143,7 +150,8 @@ class SetCmd {
 
   OpStatus CachePrevIfNeeded(const SetParams& params, DbSlice::Iterator it);
 
-  OpStatus DeleteExpiredKey(std::string_view key, DbSlice::ItAndUpdater* it_upd);
+  OpStatus DeleteExpiredKey(const SetParams& params, std::string_view key,
+                            DbSlice::ItAndUpdater* it_upd);
 
   OpArgs op_args_;
   bool explicit_journal_;  // call RecordJournal (auto journaling disabled)
@@ -976,7 +984,7 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
     if (params.flags & SET_IF_EXISTS) {
       if (IsValid(find_res.it)) {
         if (params.expire_in_past)
-          return DeleteExpiredKey(key, &find_res);
+          return DeleteExpiredKey(params, key, &find_res);
         return SetExisting(params, value, &find_res);
       } else {
         return OpStatus::SKIPPED;
@@ -1009,12 +1017,15 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
       if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
-          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming));
+          // drakeydb: P4-5 -- meta = D (params.expire_deadline_ms), clamped to now at install
+          // (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
+          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
+                                             params.expire_deadline_ms);
         }
       }
       return OpStatus::OK;
     }
-    return DeleteExpiredKey(key, &find_res);
+    return DeleteExpiredKey(params, key, &find_res);
   }
 
   // Enable journal omits for this operation
@@ -1194,7 +1205,8 @@ void SetCmd::RecordJournal(const SetParams& params, string_view key, string_view
   dfly::RecordJournal(op_args_, "SET", ArgSlice{cmds});
 }
 
-OpStatus SetCmd::DeleteExpiredKey(string_view key, DbSlice::ItAndUpdater* it_upd) {
+OpStatus SetCmd::DeleteExpiredKey(const SetParams& params, string_view key,
+                                  DbSlice::ItAndUpdater* it_upd) {
   auto& db_slice = op_args_.GetDbSlice();
   it_upd->post_updater.Run();  // finalize memory accounting before the delete
 
@@ -1206,6 +1218,21 @@ OpStatus SetCmd::DeleteExpiredKey(string_view key, DbSlice::ItAndUpdater* it_upd
   // SET is NO_AUTOJOURNAL: journal the delete explicitly or the replica keeps the key forever.
   if (op_args_.shard->journal()) {
     dfly::RecordJournal(op_args_, "DEL"sv, ArgSlice{key});
+
+    // drakeydb: P4-5 -- attach meta = D only AFTER the DEL's own journal call (and, inside it,
+    // journal::RecordEntry's post-AddLogRecord commit sweep) have fully RETURNED: that commit
+    // callback must never allocate, and SetTombMeta can (converting the key to SDS_TTL). Gated on
+    // LwwGuardActive: this key's OWN prior stamp X|bit already committed above regardless
+    // (FloorAppliedStamp/verbatim, via the ordinary per-arm sweep) -- a deadline-bearing tombstone
+    // is only worth installing when this delete is itself a guarded, PEER-sourced apply; an
+    // ordinary local SET with an elapsed PXAT/PX has no peer authority to protect this way.
+    // D-16, ISSUE-REGISTER.md.
+    const DbContext& db_cntx = op_args_.db_cntx;
+    if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
+      db_slice.SetTombMeta(
+          db_cntx.db_index, key,
+          ClampPeerTombMetaDeadline(params.expire_deadline_ms, db_cntx.time_now_ms));
+    }
   }
   db_slice.SendExpiredKeyEvent(op_args_.db_cntx, key);
   return OpStatus::OK;
@@ -1272,10 +1299,15 @@ std::variant<SetCmd::SetParams, facade::ErrorReply> ParseSetParams(CmdArgParser 
     auto [rel_ms, abs_ms] = expiry->Calculate(now_ms, true);
     if (abs_ms < 0)
       return facade::ErrorReply{InvalidExpireTime("set")};
-    if (rel_ms <= 0)
+    if (rel_ms <= 0) {
       sparams.expire_in_past = true;
-    else
+      // drakeydb: P4-5 -- D itself, for SetCmd::Set's absent-key tombstone (see SetParams's own
+      // comment on this field). abs_ms >= 0 here (the `abs_ms < 0` overflow case returned an error
+      // just above).
+      sparams.expire_deadline_ms = static_cast<uint64_t>(abs_ms);
+    } else {
       sparams.expire_after_ms = rel_ms;
+    }
   }
 
   auto has_mask = [&](uint16_t m) { return (sparams.flags & m) == m; };

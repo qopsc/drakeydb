@@ -292,6 +292,14 @@ void RecordDerivedDelete(const DbContext& db_cntx, std::string_view key);
 // all, D-29, ISSUE-REGISTER.md -- that literal 0 is what makes journal::RecordEntry mint a fresh
 // LOCAL stamp for the wire entry in that narrow case, never db_cntx.repl_mvcc). See the .cc for
 // the full account, and for why origin_idx deliberately does NOT get any equivalent treatment.
-void RecordExpiryBlocking(const DbContext& db_cntx, std::string_view key);
+//
+// drakeydb: P4-5 -- `tomb_meta` is mandatory (no default), the whole-key deadline D this expiring
+// key's own prime slot carried (its now-stale expire time, read by the caller BEFORE the delete),
+// attached to the tombstone this call commits so it survives roughly until D + ttl instead of
+// T.ms + ttl (D-16, ISSUE-REGISTER.md). A caller with no real deadline to attach -- the two
+// eviction sites (db_slice.cc): a kEvicted delete never earns a tombstone in the first place, so
+// there is nothing for CommitOwnTombstone to find here regardless of what this argument carries --
+// passes kTombMetaNone explicitly, same as before this parameter existed.
+void RecordExpiryBlocking(const DbContext& db_cntx, std::string_view key, uint64_t tomb_meta);
 
 }  // namespace dfly

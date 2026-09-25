@@ -138,6 +138,12 @@ struct RestoreArgs {
   bool sticky = false;
   NonNegativeInt<int64_t> idle_time;
   NonNegativeInt<uint8_t> freq;
+  // drakeydb: P4-5 -- the absolute deadline UpdateExpiration below would install, captured before
+  // it collapses the elapsed branch's `expiration.value` down to the Expired() sentinel (-1) --
+  // callers that must tombstone-meta an ALREADY-elapsed incoming RESTORE/rename (D-16,
+  // ISSUE-REGISTER.md) have no other way to recover it once Expired() is true. Valid only when
+  // Expired() is (UpdateExpiration sets both together).
+  int64_t elapsed_deadline_ms = 0;
 
   RestoreArgs() = default;
 
@@ -169,6 +175,12 @@ struct RestoreArgs {
 
   bool HasExpiration() const {
     return expiration.value != NO_EXPIRATION;
+  }
+
+  // drakeydb: P4-5 -- see elapsed_deadline_ms's own comment above. Only meaningful when Expired().
+  uint64_t ElapsedDeadlineMs() const {
+    DCHECK_GE(elapsed_deadline_ms, 0);
+    return static_cast<uint64_t>(elapsed_deadline_ms);
   }
 
   [[nodiscard]] bool UpdateExpiration(int64_t now_msec);
@@ -260,6 +272,14 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
     int64_t ttl = abs_time ? expiration.value - now_msec : expiration.value;
     if (ttl > kMaxExpireDeadlineMs)
       ttl = kMaxExpireDeadlineMs;
+
+    // drakeydb: P4-5 -- capture the elapsed deadline BEFORE the assignment below overwrites
+    // expiration.value with the -1 sentinel: ttl < 0 never hits the kMaxExpireDeadlineMs clamp
+    // above (that only clamps a too-far-future ttl), so `ttl + now_msec` here is exactly the
+    // original absolute deadline D -- abs_time ? expiration.value (unchanged so far) :
+    // expiration.value + now_msec, algebraically.
+    if (ttl < 0)
+      elapsed_deadline_ms = ttl + now_msec;
 
     expiration.value = ttl < 0 ? -1 : ttl + now_msec;
   }
@@ -605,8 +625,11 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
       if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(dctx.repl_mvcc, dctx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(dctx.db_index, dest_key_), *incoming)) {
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to now at
+          // install (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
           db_slice.InstallAbsentKeyTombstone(dctx.db_index, dest_key_,
-                                             ExpiryTombstoneFor(*incoming));
+                                             ExpiryTombstoneFor(*incoming),
+                                             restore_args.ElapsedDeadlineMs());
         }
       }
     }
@@ -751,7 +774,10 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
-          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming));
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to now at
+          // install (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
+          db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
+                                             restore_args.ElapsedDeadlineMs());
         }
       }
     } else if (op_args.shard->journal() && IsActiveReplica()) {
@@ -764,6 +790,18 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       // back, an mvcc_unstamped_writes leak. Mirrors Renamer::DeserializeDest's identical "old
       // dest key deleted, new value never created" DEL journal, above in this file.
       RecordJournal(op_args, "DEL"sv, ArgSlice{key});
+
+      // drakeydb: P4-5 -- attach meta = D only AFTER the DEL's own journal call above has fully
+      // returned (journal.cc's post-AddLogRecord commit callback must never allocate; SetTombMeta
+      // can). Gated on LwwGuardActive, mirroring SetCmd::DeleteExpiredKey's identical present-key
+      // shape (string_family.cc): this key's own prior stamp already committed above regardless,
+      // and a deadline-bearing tombstone is only worth installing when this delete is itself a
+      // guarded, PEER-sourced apply. D-16, ISSUE-REGISTER.md.
+      if (LwwGuardActive(op_args.db_cntx.repl_lww_guard, op_args.db_cntx.repl_mvcc)) {
+        db_slice.SetTombMeta(op_args.db_cntx.db_index, key,
+                             ClampPeerTombMetaDeadline(restore_args.ElapsedDeadlineMs(),
+                                                       op_args.db_cntx.time_now_ms));
+      }
     }
     return OpStatus::OK;
   }

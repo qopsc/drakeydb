@@ -295,7 +295,10 @@ unsigned PrimeEvictionPolicy::Evict(const PrimeTable::HotBuckets& eb, PrimeTable
 
     // log the evicted keys to journal.
     if (auto journal = db_slice_->shard_owner()->journal(); journal) {
-      RecordExpiryBlocking(cntx_, key);
+      // drakeydb: P4-5 -- kTombMetaNone: a kEvicted delete never earns a tombstone arm
+      // (PerformDeletionAtomic's earns_tombstone branch), so there is nothing for
+      // CommitOwnTombstone to attach a deadline to here regardless.
+      RecordExpiryBlocking(cntx_, key, kTombMetaNone);
     }
     db_slice_->Del(cntx_, DbSlice::Iterator(last_slot_it, StringOrView::FromView(key)), nullptr,
                    false, DbSlice::DeleteReason::kEvicted);
@@ -1678,6 +1681,29 @@ void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& 
     ++db.stats.mvcc_tombstones;
 }
 
+// drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract and the allocation
+// rule. Deliberately NOT delegating to SetExistingMvcc + SetTombMeta as two separate calls: this
+// method's callers all run BEFORE their own journal::RecordEntry, so folding the meta write into
+// this same slot lookup costs nothing extra and keeps the "commit + meta" pairing atomic by
+// construction rather than by caller discipline.
+void DbSlice::CommitExpiryTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp,
+                                    uint64_t meta) {
+  DCHECK(stamp.IsTombstone())
+      << "CommitExpiryTombstone only ever commits an expiry's own tombstone -- a plain write must "
+         "go through SetExistingMvcc instead: db="
+      << db_ind << " key=" << key;
+  auto& db = *db_arr_[db_ind];
+  CHECK(db.mvcc != nullptr);
+  auto it = db.mvcc->Find(key);
+  CHECK(!it.is_done()) << "MVCC slot must be prepared before journal commit: db=" << db_ind
+                       << " key=" << key;
+  const bool was_tombstone = it->second.IsTombstone();
+  it->second = stamp;
+  if (!was_tombstone)
+    ++db.stats.mvcc_tombstones;
+  SetTombMetaOnSlot(db, it, meta);
+}
+
 // drakeydb: P4-3 Task 2 -- see the declaration (db_slice.h) for the full contract. Mirrors
 // SetMvcc's Insert-or-overwrite shape (same three accounted fields) plus mvcc_tombstones, which
 // SetMvcc never touches: SetMvcc is a plain-value overwrite (RDB load, replicated write, ...) and
@@ -1792,14 +1818,19 @@ void DbSlice::TEST_ForceTombMeta(DbIndex db_ind, string_view key, uint64_t meta)
 // Renamer::DeserializeDest all run under an already-scheduled transaction for a real db), but
 // load-bearing for RdbLoader::ApplyMergeTombstoneOnShard's own merge-load caller, which can name a
 // db index this node has never activated for a key arriving from an unfamiliar source.
-void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp,
+                                        uint64_t meta) {
   if (!TombstonesEnabled() || !IsDbValid(db_ind))
     return;
   auto& db = *db_arr_[db_ind];
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
+  // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
+  // corrupt or hostile peer meta must never make this tombstone immortal by claiming a deadline
+  // far in the future.
+  const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, GetCurrentTimeMs());
   if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
-    SetTombstone(db_ind, key, stamp);
+    SetTombstone(db_ind, key, stamp, clamped_meta);
   } else {
     ++db.stats.mvcc_tombstones_dropped;  // at the cap: degrade to no-op, visibly
   }
@@ -2264,7 +2295,12 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
   // unchanged, so what a non-active replica observes on the wire is identical. See
   // PerformDeletionAtomic's own comment (below in this file) for the STOP finding this resolves.
   if (auto journal = owner_->journal(); journal && journal_expiry) {
-    RecordExpiryBlocking(cntx, key);
+    // drakeydb: P4-5 -- meta = D, this key's own now-stale expire time, read (as `expire_time`)
+    // above BEFORE Del() erased it. D-16, ISSUE-REGISTER.md: without this, a key whose TTL exceeds
+    // --multi_master_tombstone_ttl expired into a tombstone that was GC-eligible the moment it was
+    // born, since GC's own eligibility check only ever saw the tombstone's OWN stamp (T.ms), never
+    // the value's much-later deadline.
+    RecordExpiryBlocking(cntx, key, static_cast<uint64_t>(expire_time));
   }
 
   ++events_.expired_keys;
@@ -2746,17 +2782,23 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
     // way RecordExpiryBlocking forwards its own committed tombstone's Mvcc(). When no tombstone
     // was actually committed (TombstonesEnabled() is false, or the tombstone cap was hit),
     // `cntx.repl_mvcc`/`repl_origin_idx` are forwarded unpatched, exactly as before this change.
+    // drakeydb: P4-5 -- meta = kTombMetaAnchorOnly | reap-time R: the member-TTL reaper has no
+    // whole-key deadline to attach (this container's own TTL, if it even has one, is unrelated to
+    // why it just got deleted), so this earns an anchor, never a whole-key D -- D-27 (a later task)
+    // must never veto an applied delta against it.
+    const uint64_t tomb_meta = kTombMetaAnchorOnly | cntx.time_now_ms;
     MvccStamp committed;
     const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
         cntx.db_index, key_owned,
-        [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
-                     const MvccStamp&) {
+        [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st,
+                                bool has_prior_stamp, const MvccStamp&) {
           // drakeydb: P4-4 -- has_prior_stamp false means the reaped container's
           // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
           // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
           if (has_prior_stamp) {
             committed = st;
-            namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+            namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(db, k, st,
+                                                                                        tomb_meta);
           } else {
             namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
           }
@@ -2871,7 +2913,9 @@ finish:
   for (string_view key : keys_to_journal) {
     if (auto journal = owner_->journal(); journal)
       // Won't block because we disabled journal flushing. See first line of this function.
-      RecordExpiryBlocking(cntx, key);
+      // drakeydb: P4-5 -- kTombMetaNone: a kEvicted delete never earns a tombstone arm, so there
+      // is nothing here for CommitOwnTombstone to attach a deadline to.
+      RecordExpiryBlocking(cntx, key, kTombMetaNone);
 
     if (expired_keys_events_recording_ && key_events)
       key_events->emplace_back(key);

@@ -112,9 +112,18 @@ void RecordDerivedDelete(const DbContext& db_cntx, string_view key) {
                        journal::kEntryFlagDerived);
 }
 
-void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
+void RecordExpiryBlocking(const DbContext& db_cntx, string_view key, uint64_t tomb_meta) {
   if (!IsDefaultNamespace(db_cntx))
     return;
+
+  // drakeydb: P4-5 -- a LOCAL expiry's own deadline is already <= now at reap time by construction
+  // (ExpireIfNeeded's own pre-check, db_slice.cc, which runs before this call): DCHECK it rather
+  // than clamp it, unlike a peer-sourced deadline (InstallAbsentKeyTombstone,
+  // RdbLoader::ApplyMergeTombstoneOnShard), which clamps at install because it cannot trust the
+  // sender. kTombMetaNone (the two eviction call sites) trivially satisfies this.
+  DCHECK(tomb_meta == kTombMetaNone || TombMetaMs(tomb_meta) <= db_cntx.time_now_ms)
+      << "a local whole-key deadline used as tombstone meta must never be in the future: key="
+      << key;
 
   // drakeydb: P4-4 -- an expiry is always a local decision, so ITS OWN tombstone arm
   // (PerformDeletionAtomic, db_slice.cc) carries a stamp derived from the expired value's OWN
@@ -143,8 +152,8 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
   MvccStamp committed;
   const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
       db_cntx.db_index, key,
-      [&committed](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
-                   const MvccStamp&) {
+      [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
+                              const MvccStamp&) {
         // drakeydb: P4-4 -- has_prior_stamp false means the expired value never had a real stamp
         // of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot -- no
         // tombstone survives locally for this key -- rather than install an unsafe Mvcc()==0
@@ -159,9 +168,14 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key) {
         // entry: RecordEntry's own call to it is gated on `!(entry_flags & kEntryFlagExpired)`,
         // which this entry sets -- this key's arm is already gone, consumed by CommitOwnTombstone
         // just above, so there is nothing left for a generic Commit() sweep to do here anyway.
+        //
+        // drakeydb: P4-5 -- CommitExpiryTombstone (not SetExistingMvcc) attaches `tomb_meta` in
+        // the same call, allocation-safe here because this callback runs strictly before this
+        // entry's own journal::RecordEntry/AddLogRecord call, below.
         if (has_prior_stamp) {
           committed = st;
-          namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExistingMvcc(db, k, st);
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(db, k, st,
+                                                                                      tomb_meta);
         } else {
           namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
         }
