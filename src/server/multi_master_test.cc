@@ -3454,30 +3454,32 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 fix round 1 -- a container that ALSO carries member-level TTL bookkeeping must
-// earn an ANCHOR (kTombMetaAnchorOnly | D), never a bare whole-key D, when it is whole-key-reaped
-// -- regardless of which reap path (whole-key vs member-emptiness) actually fires. Without this,
-// the meta CLASS a container's tombstone gets would depend on which path wins the race on a given
-// node: the author's own heartbeat might reap it through member emptiness first (an anchor,
-// unaffected by this fix), while a receiver -- slower to run its own heartbeat, or simply reading
-// the key first -- reaps it through the whole-key path instead. If that path minted a bare D, the
-// two nodes would disagree on the meta CLASS for the identical logical event, and the D-27 delta
-// veto (once it lands) would drop a genuine re-create on the side that saw a bare D but not on the
-// side that saw an anchor. This test drives BOTH reap paths from the SAME setup (SADD + FIELDEXPIRE
-// + PEXPIRE) and checks both end up anchor-only, plus a control key with no member TTL at all,
-// which must still get a plain D.
+// drakeydb: P4-5 -- a container that ALSO carries member-level TTL bookkeeping must earn an
+// ANCHOR (kTombMetaAnchorOnly | D), never a bare whole-key D, when it is whole-key-reaped --
+// regardless of which reap path (whole-key vs member-emptiness) actually fires. Without this, the
+// meta CLASS a container's tombstone gets would depend on which path wins the race on a given
+// node: the author's own heartbeat might reap it through member emptiness first (an anchor), while
+// a receiver -- slower to run its own heartbeat, or simply reading the key first -- reaps it
+// through the whole-key path instead. If that path minted a bare D, the two nodes would disagree
+// on the meta CLASS for the identical logical event, and the D-27 delta veto would drop a genuine
+// re-create on the side that saw a bare D but not on the side that saw an anchor. This test drives
+// BOTH reap paths from the SAME setup (SADD + FIELDEXPIRE + PEXPIRE, a single member -- every
+// member present has a TTL) and checks both end up anchor-only, plus a control key with no member
+// TTL at all, which must still get a plain D. A container carrying a member WITHOUT a TTL is a
+// separate case (container_utils::MemberTtlOnlyContainer, the predicate this exercises), covered
+// below.
 //
-// Falsifying: removing the `had_member_expiration` check in DbSlice::ExpireIfNeeded (db_slice.cc)
-// makes the whole-key-reaped key's own TombMetaOf assertion below observe a bare D (the
-// kTombMetaAnchorOnly bit clear) instead of an anchor.
+// Falsifying: removing the `container_utils::MemberTtlOnlyContainer(it->second)` check in
+// DbSlice::ExpireIfNeeded (db_slice.cc) makes the whole-key-reaped key's own TombMetaOf assertion
+// below observe a bare D (the kTombMetaAnchorOnly bit clear) instead of an anchor.
 TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPathFiresFirst) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
   absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
   constexpr uint64_t kTtlMs = 1000;
 
   // Key A: whole-key-reaped AFTER D, via a lazy read (EXISTS), before any heartbeat sweep ever
-  // gets a chance to reap the member TTL first -- the "receiver" side of the race in this fix's
-  // own commit message.
+  // gets a chance to reap the member TTL first -- the "receiver" side of a race between two
+  // nodes reaping the same logical container's expiry through different paths.
   {
     const std::string key = "container-wholekey-reap";
     const uint64_t base_ms = TEST_current_time_ms;
@@ -3533,9 +3535,8 @@ TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPa
   }
 
   // Key B: member-emptied FIRST, via the heartbeat sweep, well before D is ever reached -- the
-  // "author" side of the race. This path (DbSlice::DeleteReapedContainer) already anchored
-  // correctly before this fix; re-pinned here for the side-by-side comparison the finding itself
-  // asks for.
+  // "author" side of the race. This path (DbSlice::DeleteReapedContainer) has always anchored
+  // correctly on its own; re-pinned here for the side-by-side comparison against key A above.
   {
     const std::string key = "container-member-emptied-first";
     ASSERT_EQ(Run({"sadd", key, "m"}).GetInt(), 1);
@@ -3553,13 +3554,14 @@ TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPa
     ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
 
     EXPECT_EQ(TombMetaOf(key), kTombMetaAnchorOnly | reap_ms)
-        << "member-emptied-first must still anchor at the reap time R, unaffected by this fix";
+        << "member-emptied-first must still anchor at the reap time R";
     const std::string body = Run({"debug", "mvcc", key}).GetString();
     EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("gc_at_ms:", reap_ms + kTtlMs))) << body;
   }
 
   // Control: a container with NO member TTL at all must still get a plain D (no anchor bit) on
-  // whole-key expiry -- this fix must not anchor every container's tombstone unconditionally.
+  // whole-key expiry -- meta must not be anchored unconditionally, only for a container the
+  // predicate above actually classifies as member-TTL-only.
   {
     const std::string key = "container-no-member-ttl";
     const uint64_t base_ms = TEST_current_time_ms;
@@ -3575,6 +3577,122 @@ TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPa
     EXPECT_FALSE(TombMetaOf(key) & kTombMetaAnchorOnly);
   }
 
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- HasMemberExpiration() is a STICKY, NODE-LOCAL flag -- only this node's own
+// reaper ever clears it, and only once a "complete clean pass" confirms every member's own TTL is
+// gone. Two nodes given the IDENTICAL history can therefore hold the SAME container's OWN flag in
+// two different states purely because one of them happened to run its heartbeat reaper first: that
+// alone is not a function of replicated state, so a predicate built on it directly is not
+// deterministic across the mesh. This test drives a container with member "a" (has a TTL) and
+// member "b" (no TTL) -- a container that can NEVER be fully "member-TTL-only"
+// (container_utils::MemberTtlOnlyContainer, container_utils.h's own comment) no matter how long it
+// lives, since "b" never expires on its own -- through both
+// reap states on two otherwise-identical keys: one where the heartbeat already reaped "a" away
+// (clearing the sticky flag, since after removing "a" the reaper's OWN "complete clean pass" logic
+// -- db_slice.cc's own ReaperClearMemberExpiration comment -- sees a container with no MORE TTL'd
+// members left and clears it), and one where nothing has touched the container's own flag at all.
+// Both must still classify identically -- a bare D -- because MemberTtlOnlyContainer walks the
+// CURRENT members directly (never consults the sticky flag's own history) and finds "b" lacks a
+// TTL either way.
+//
+// Falsifying: reverting the whole-key expiry site (DbSlice::ExpireIfNeeded, db_slice.cc) back to
+// the sticky-flag predicate (`it->second.HasMemberExpiration()` alone, no member walk) makes the
+// two keys below DISAGREE: the reaped key observes a bare D (the reaper's own clean pass already
+// cleared its flag), but the unreaped key observes an anchor (its flag was never touched).
+TEST_F(MvccStoreTest, ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessOfReapPath) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "the reaped and unreaped keys must land on DIFFERENT shards, or "
+                               "running the heartbeat on one shard would reap both";
+
+  std::string reaped_key, unreaped_key;
+  for (int i = 0; unreaped_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from reaped_key";
+    std::string cand = absl::StrCat("probe", i);
+    if (reaped_key.empty()) {
+      reaped_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(reaped_key, num_shards)) {
+      unreaped_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(reaped_key, num_shards), Shard(unreaped_key, num_shards))
+      << "sanity: the two keys must land on different shards";
+
+  // Identical history on both keys: member "a" gets a TTL, member "b" never does.
+  const uint64_t reaped_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"sadd", reaped_key, "a", "b"}).GetInt(), 2);
+  Run({"fieldexpire", reaped_key, "1", "a"});                   // R = base + 1000, "b" untouched
+  ASSERT_EQ(Run({"pexpire", reaped_key, "5000"}).GetInt(), 1);  // D = base + 5000
+  const uint64_t reaped_deadline_ms = reaped_base_ms + 5000;
+
+  const uint64_t unreaped_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"sadd", unreaped_key, "a", "b"}).GetInt(), 2);
+  Run({"fieldexpire", unreaped_key, "1", "a"});
+  ASSERT_EQ(Run({"pexpire", unreaped_key, "5000"}).GetInt(), 1);
+  const uint64_t unreaped_deadline_ms = unreaped_base_ms + 5000;
+
+  AdvanceTime(1050);  // past R for both; well before either D
+
+  // Reap ONLY reaped_key's own shard: member "a" is removed, leaving only "b" -- and the reaper's
+  // own complete-clean-pass logic clears reaped_key's sticky HasMemberExpiration() flag, since no
+  // TTL'd member remains after that removal.
+  const ShardId reaped_sid = Shard(reaped_key, num_shards);
+  shard_set->Await(reaped_sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
+    db_slice.DeleteExpiredStep(db_cntx, 100000);
+  });
+  ASSERT_EQ(Run({"sismember", reaped_key, "a"}).GetInt(), 0)
+      << "guard against a vacuous pass -- member a must actually be reaped away on reaped_key";
+  // unreaped_key's own shard was never swept (the reap above ran on reaped_sid only, and the two
+  // keys are asserted to be on different shards, above) -- no separate probe needed here: querying
+  // unreaped_key's own membership would itself lazily reap member "a" (SISMEMBER's own
+  // time-aware lookup), defeating the very state this test means to leave untouched.
+
+  AdvanceTime(4000);  // now past D for both (base + 5050 and base + 5050+... comfortably past 5000)
+  ASSERT_EQ(Run({"exists", reaped_key}).GetInt(), 0) << "guard against a vacuous pass";
+  ASSERT_EQ(Run({"exists", unreaped_key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  EXPECT_EQ(TombMetaOf(reaped_key), reaped_deadline_ms)
+      << "a container missing member b's own TTL must get a bare D, never an anchor, even though "
+         "the reaper already ran and cleared its own sticky flag";
+  EXPECT_FALSE(TombMetaOf(reaped_key) & kTombMetaAnchorOnly);
+  EXPECT_EQ(TombMetaOf(unreaped_key), unreaped_deadline_ms)
+      << "the SAME container content, never touched by a reaper, must classify IDENTICALLY to "
+         "reaped_key above -- the meta CLASS must be a function of replicated content, not of "
+         "which node's heartbeat happened to run first";
+  EXPECT_FALSE(TombMetaOf(unreaped_key) & kTombMetaAnchorOnly);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- a hash case for the same predicate (container_utils::MemberTtlOnlyContainer),
+// confirming it is not set-specific: OBJ_HASH (HSET + HEXPIRE) reaches the identical StringMap
+// encoding OBJ_SET's dense form does, just without VisitSet's own StringSet/OAHSet dispatch. Every
+// field carries a TTL here (an all-TTL-members container, the same shape
+// ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPathFiresFirst above pins for a set), so
+// this must anchor via the whole-key-reaped-first path.
+//
+// Falsifying: this test's own job is confirming OBJ_HASH reaches container_utils::
+// MemberTtlOnlyContainer's walk at all, with every field having a TTL -- reverting the whole-key
+// expiry site (DbSlice::ExpireIfNeeded, db_slice.cc) back to the sticky-flag predicate does NOT
+// change this test's own result (a single all-TTL field satisfies both the old and new predicate
+// alike), so ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessOfReapPath (above) is the
+// real falsification target for the walk logic itself, not this test.
+TEST_F(MvccStoreTest, HashWithAllFieldsTtlGetsAnchorOnWholeKeyExpiry) {
+  const std::string key = "hash-all-fields-ttl";
+  const uint64_t base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"hset", key, "f", "v"}).GetInt(), 1);
+  Run({"hexpire", key, "1", "fields", "1", "f"});
+  ASSERT_EQ(Run({"pexpire", key, "5000"}).GetInt(), 1);
+  const uint64_t deadline_ms = base_ms + 5000;
+
+  AdvanceTime(5050);  // past D; no heartbeat sweep has run
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  EXPECT_EQ(TombMetaOf(key), kTombMetaAnchorOnly | deadline_ms)
+      << "an all-TTL-fields hash must earn an anchor on whole-key expiry, exactly like an "
+         "all-TTL-members set";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -3715,7 +3833,7 @@ TEST_F(MvccStoreTest, SpopAllMembersExpiredEarnsExpiryTombstoneAndStaysStamped) 
   // below in this file).
   EXPECT_EQ(TombMetaOf("key"), kTombMetaAnchorOnly | reap_ms);
 
-  // drakeydb: P4-5 fix round 1 -- end-to-end anchor gc_at_ms: TombstoneGcAtMs's own formula,
+  // drakeydb: P4-5 -- end-to-end anchor gc_at_ms: TombstoneGcAtMs's own formula,
   // max(T.ms, TombMetaMs(meta)) + ttl -- with meta an anchor, TombMetaMs strips the tag bit back
   // off, so this reaps at max(T.ms, R) + ttl exactly as a plain deadline would.
   {
@@ -6161,10 +6279,10 @@ TEST_F(MvccStoreTest, InstallAbsentKeyTombstoneClampsHostileFarFutureDeadlineToN
   shard_set->Await(sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     now_ms = GetCurrentTimeMs();
-    // drakeydb: P4-5 fix round 1 -- `now_ms` is THIS call's own clock reading, passed explicitly
-    // (InstallAbsentKeyTombstone no longer reads a fresh GetCurrentTimeMs() internally): this test
-    // IS the caller here, so it supplies its own reading, matching every production caller's own
-    // shape (its transaction's or the loader's own already-known time_now_ms).
+    // drakeydb: P4-5 -- `now_ms` is THIS call's own clock reading, passed explicitly
+    // (InstallAbsentKeyTombstone reads no clock of its own internally): this test IS the caller
+    // here, so it supplies its own reading, matching every production caller's own shape (its
+    // transaction's or the loader's own already-known time_now_ms).
     db_slice.InstallAbsentKeyTombstone(0, key, stamp, kFarFutureMs, now_ms);
   });
 
@@ -6248,10 +6366,14 @@ TEST_F(MvccStoreTest, OpRestoreFoundPrevGuardedAttachesDeadlineMeta) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 fix round 1 -- Renamer::DeserializeDest's own present-destination sibling of the
-// two tests directly above: a guarded cross-shard RENAME whose SOURCE key's absolute TTL has
-// already elapsed, against a DESTINATION this node DOES hold, must attach meta = D too, mirroring
-// SetCmd::DeleteExpiredKey and OpRestore's found_prev branch exactly (generic_family.cc).
+// drakeydb: P4-5 -- Renamer::DeserializeDest's own present-destination sibling of the two tests
+// directly above: a guarded cross-shard RENAME whose SOURCE key's absolute TTL has already
+// elapsed, against a DESTINATION this node DOES hold, must attach meta = D too, mirroring
+// SetCmd::DeleteExpiredKey and OpRestore's found_prev branch exactly (generic_family.cc) -- and,
+// unlike those two, only because MergeAccepts(dest's own prior stamp, the incoming write) holds:
+// RENAME is kUnguarded, so this test's own incoming mvcc is built strictly above the destination's
+// real (wall-clock-derived) prior stamp to satisfy that gate, the same way the guarded present-key
+// tests above build their own incoming mvcc relative to their own key's real prior stamp.
 //
 // Reachable guarded only while expiry is disallowed on the SerializeSrc hop (CLIENT PAUSE,
 // Transaction::Guard, or takeover catch-up) -- otherwise SerializeSrc's own FindReadOnly lazily
@@ -6290,6 +6412,13 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesDeadlineMe
          "degrades to exercising OpRen instead of Renamer::DeserializeDest";
 
   ASSERT_EQ(Run({"set", dest_key, "dest_old"}), "OK");  // dest_found_ = true
+  auto dest_prior_stamp = StampOf(dest_key);
+  ASSERT_TRUE(dest_prior_stamp.has_value());
+  // dest_prior_stamp's own Mvcc() is a real wall-clock-derived mint (MvccClock::Next); the
+  // incoming RENAME's own mvcc must be built strictly above it, or MergeAccepts(dest_prior,
+  // incoming) fails and no meta is attached at all (the new gate this test itself pins).
+  const uint64_t kXMvcc = dest_prior_stamp->Mvcc() + 0x1000000ULL;
+  ASSERT_GT(kXMvcc, dest_prior_stamp->Mvcc()) << "sanity: X is strictly after dest's own prior S";
 
   // src_key's own absolute whole-key deadline D, already elapsed by the time RENAME runs below.
   const uint64_t src_deadline_ms = TEST_current_time_ms + 10;
@@ -6309,7 +6438,7 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesDeadlineMe
     });
   };
 
-  ASSERT_EQ(ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx, 0x9300ULL,
+  ASSERT_EQ(ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx, kXMvcc,
                                    /*lww_guard=*/true),
             facade::DispatchResult::OK);
   std::move(restore_expire).Invoke();
@@ -6323,6 +6452,119 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesDeadlineMe
   EXPECT_EQ(TombMetaOf(dest_key), src_deadline_ms)
       << "meta must be D -- this delete IS a guarded, peer-sourced apply";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- OpRestore's own absent-key sibling of rdb_test.cc's
+// MergeLwwExpiredIncomingAllTtlMembersSetInstallsAnchorTombstone: a guarded RESTORE whose payload
+// is a set with an all-TTL-members shape (a single member, carrying a TTL), and whose ABSOLUTE ttl
+// has already elapsed, must attach an anchor -- not a bare D -- since the payload is not otherwise
+// materialized on this path (OpRestore skips RdbRestoreValue::Add entirely once Expired() is
+// already known), exercising ElapsedRestoreTombMeta's own ParseOnly call (generic_family.cc).
+//
+// Falsifying: reverting ElapsedRestoreTombMeta to always return a bare `deadline_ms`, without the
+// container_utils::MemberTtlOnlyContainer check, makes the EXPECT_EQ below observe a bare deadline
+// (kTombMetaAnchorOnly clear) instead of an anchor.
+TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyAllTtlMembersSetGetsAnchor) {
+  constexpr uint32_t kPeerIdx = 96;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000096");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  // A donor set whose only member carries a TTL (still in the future on the donor itself -- only
+  // the guarded RESTORE's own ABSTTL below has already elapsed).
+  ASSERT_EQ(Run({"sadd", "restore_allttl_donor", "x"}).GetInt(), 1);
+  Run({"fieldexpire", "restore_allttl_donor", "100", "x"});
+  std::string dump = Run({"dump", "restore_allttl_donor"}).GetString();
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  constexpr uint64_t kXMvcc = 0x5000ULL;
+  ASSERT_EQ(ApplyReplicatedCommand({"restore", "k", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  auto tomb = StampOf("k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf("k"), kTombMetaAnchorOnly | 1u)
+      << "an all-TTL-members set payload must anchor, not attach a bare D";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- Renamer::DeserializeDest's own present-destination branch must not attach
+// meta at all when the delete it is about to journal is FLOORED: RENAME is kUnguarded, so unlike
+// a guarded SET/RESTORE this callback runs regardless of any LWW comparison against the
+// destination's own prior stamp -- the incoming write's own stamp X can be OLDER than the
+// destination's prior stamp S, applied (and committed, floored) anyway. A floored commit does not
+// represent a genuine win, so its own tombstone must never carry a deadline implying one --
+// DeserializeDestPresentDestinationGuardedAttachesDeadlineMeta (above) already pins the
+// MergeAccepts-holds case; this pins the opposite.
+//
+// Falsifying: removing the MergeAccepts(dest_prior, incoming) gate in DeserializeDest's
+// dest_found_-and-Expired() branch (generic_family.cc) -- i.e. attaching meta unconditionally
+// whenever LwwGuardActive alone holds -- makes the EXPECT_EQ below observe a real deadline instead
+// of kTombMetaNone.
+TEST_F(MvccStoreTest, DeserializeDestPresentDestinationFlooredWriteAttachesNoMeta) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is exercising the CROSS-shard "
+                               "Renamer::DeserializeDest path, which needs at least 2 shards";
+  constexpr uint32_t kPeerIdx = 97;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000097");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  std::string src_key, dest_key;
+  for (int i = 0; dest_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from src_key";
+    std::string cand = absl::StrCat("ddf", i);
+    if (src_key.empty()) {
+      src_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(src_key, num_shards)) {
+      dest_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(src_key, num_shards), Shard(dest_key, num_shards))
+      << "sanity: src_key and dest_key must land on different shards";
+
+  ASSERT_EQ(Run({"set", dest_key, "dest_old"}), "OK");  // dest_found_ = true
+  auto dest_prior_stamp = StampOf(dest_key);
+  ASSERT_TRUE(dest_prior_stamp.has_value());
+  // X strictly BELOW dest's own prior stamp S -- MergeAccepts(S, X) must fail, floating this
+  // delete as a FLOOR rather than a genuine win.
+  ASSERT_GT(dest_prior_stamp->Mvcc(), 0x1000ULL)
+      << "sanity: dest's own real mint must be well above the floored X used below";
+  constexpr uint64_t kXMvcc = 0x1000ULL;
+
+  // src_key's own absolute deadline elapses too, so DeserializeDest still reaches its own
+  // Expired() branch below -- the meta VALUE it would have attached is irrelevant here, since the
+  // MergeAccepts gate must reject attaching any meta at all.
+  ASSERT_EQ(Run({"set", src_key, "src_val", "px", "10"}), "OK");
+  AdvanceTime(50);  // D has elapsed
+
+  const ShardId src_sid = Shard(src_key, num_shards);
+  shard_set->Await(src_sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(false);
+  });
+  absl::Cleanup restore_expire = [&] {
+    shard_set->Await(src_sid, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(true);
+    });
+  };
+
+  ASSERT_EQ(ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  std::move(restore_expire).Invoke();
+
+  EXPECT_EQ(Run({"exists", dest_key}).GetInt(), 0)
+      << "the already-expired src value must not end up stored at dest, floored or not";
+
+  auto tomb = StampOf(dest_key);
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf(dest_key), kTombMetaNone)
+      << "a FLOORED delete (X < dest's own prior S) must never attach a deadline-bearing meta -- "
+         "it does not represent a genuine win over the destination's own prior value";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 

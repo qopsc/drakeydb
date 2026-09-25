@@ -283,12 +283,12 @@ TEST(TombstoneExpiredAtTest, BoundaryIsInclusiveWhenAnchorMetaIsBelowStampMs) {
   EXPECT_FALSE(TombstoneExpiredAt(tomb, anchor_meta, kTtl, gc_at - 1));
 }
 
-// drakeydb: P4-5 fix round 1 -- ClampPeerTombMetaDeadline (mvcc.h) itself: None stays None, an
-// ordinary D clamps to now, and -- the bug this fix closes -- a HOSTILE, far-future ANCHOR clamps
-// its ms payload to now while KEEPING the anchor bit, never silently degrading into a bare
-// whole-key deadline. The naive `min(meta, now_ms)` formula fails only this last case: an
-// anchor's own bit 63 makes the raw 64-bit word compare far ABOVE any real `now_ms`, so a plain
-// min() always picks `now_ms` verbatim and drops the anchor bit along with it.
+// drakeydb: P4-5 -- ClampPeerTombMetaDeadline (mvcc.h) itself: None stays None, an ordinary D
+// clamps to now, and a HOSTILE, far-future ANCHOR clamps its ms payload to now while KEEPING the
+// anchor bit, never silently degrading into a bare whole-key deadline. The naive `min(meta,
+// now_ms)` formula fails only this last case: an anchor's own bit 63 makes the raw 64-bit word
+// compare far ABOVE any real `now_ms`, so a plain min() always picks `now_ms` verbatim and drops
+// the anchor bit along with it.
 //
 // Falsifying: reverting ClampPeerTombMetaDeadline to `std::min(meta, now_ms)` (the pre-fix
 // formula) makes the hostile-anchor case below observe a bare deadline (kTombMetaAnchorOnly
@@ -309,9 +309,9 @@ TEST(ClampPeerTombMetaDeadlineTest, PreservesMetaClassThroughTheClamp) {
   const uint64_t good_anchor = kTombMetaAnchorOnly | (kNow - 500);
   EXPECT_EQ(ClampPeerTombMetaDeadline(good_anchor, kNow), good_anchor);
 
-  // The bug this fix closes: a HOSTILE anchor claiming a far-future R must clamp its ms payload
-  // to now while KEEPING the anchor bit -- never degrading into a bare whole-key deadline, which
-  // would wrongly expose it to the D-27 delta veto.
+  // A HOSTILE anchor claiming a far-future R must clamp its ms payload to now while KEEPING the
+  // anchor bit -- never degrading into a bare whole-key deadline, which would wrongly expose it
+  // to the D-27 delta veto.
   const uint64_t hostile_anchor = kTombMetaAnchorOnly | (kNow + 999'999'999ULL);
   const uint64_t clamped = ClampPeerTombMetaDeadline(hostile_anchor, kNow);
   EXPECT_TRUE(clamped & kTombMetaAnchorOnly) << "the anchor bit must survive the clamp";
