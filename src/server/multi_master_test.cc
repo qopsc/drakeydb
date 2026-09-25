@@ -3454,24 +3454,22 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- a container that ALSO carries member-level TTL bookkeeping must earn an
-// ANCHOR (kTombMetaAnchorOnly | D), never a bare whole-key D, when it is whole-key-reaped --
-// regardless of which reap path (whole-key vs member-emptiness) actually fires. Without this, the
-// meta CLASS a container's tombstone gets would depend on which path wins the race on a given
-// node: the author's own heartbeat might reap it through member emptiness first (an anchor), while
-// a receiver -- slower to run its own heartbeat, or simply reading the key first -- reaps it
-// through the whole-key path instead. If that path minted a bare D, the two nodes would disagree
-// on the meta CLASS for the identical logical event, and the D-27 delta veto would drop a genuine
-// re-create on the side that saw a bare D but not on the side that saw an anchor. This test drives
-// BOTH reap paths from the SAME setup (SADD + FIELDEXPIRE + PEXPIRE, a single member -- every
-// member present has a TTL) and checks both end up anchor-only, plus a control key with no member
-// TTL at all, which must still get a plain D. A container carrying a member WITHOUT a TTL is a
-// separate case (container_utils::MemberTtlOnlyContainer, the predicate this exercises), covered
-// below.
+// drakeydb: P4-5 -- a non-string value must earn an ANCHOR (kTombMetaAnchorOnly | D), never a bare
+// whole-key D, when it is whole-key-reaped -- regardless of which reap path (whole-key vs
+// member-emptiness) actually fires, and regardless of whether it carries any member-level TTL
+// bookkeeping at all. The meta CLASS is decided by the value's own TYPE (OBJ_STRING -> D, every
+// other type -> anchor|D), never by member-TTL content or local reap history: a set can be emptied
+// by an ordinary delta (SREM, SPOP...) well before its whole-key D and genuinely re-created before
+// D too, which a receiver that only ever observes the later whole-key expiry cannot distinguish
+// from the author's own original value surviving to D -- only a string, which can vanish solely
+// through an explicit, guarded, full-state delete, is a sound veto premise. This test drives BOTH
+// reap paths from the SAME setup (SADD + FIELDEXPIRE + PEXPIRE) and checks both end up
+// anchor-only, plus a control key with NO member TTL at all, which must ALSO get an anchor -- it
+// is still a SET, and the type decides, not the member-TTL bookkeeping.
 //
-// Falsifying: removing the `container_utils::MemberTtlOnlyContainer(it->second)` check in
-// DbSlice::ExpireIfNeeded (db_slice.cc) makes the whole-key-reaped key's own TombMetaOf assertion
-// below observe a bare D (the kTombMetaAnchorOnly bit clear) instead of an anchor.
+// Falsifying: reverting the type check in DbSlice::ExpireIfNeeded (db_slice.cc) to always treat
+// the value as OBJ_STRING makes the whole-key-reaped key's own TombMetaOf assertion below observe
+// a bare D (the kTombMetaAnchorOnly bit clear) instead of an anchor.
 TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPathFiresFirst) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
   absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
@@ -3559,9 +3557,8 @@ TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPa
     EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("gc_at_ms:", reap_ms + kTtlMs))) << body;
   }
 
-  // Control: a container with NO member TTL at all must still get a plain D (no anchor bit) on
-  // whole-key expiry -- meta must not be anchored unconditionally, only for a container the
-  // predicate above actually classifies as member-TTL-only.
+  // Control: a container with NO member TTL at all must STILL get an anchor on whole-key expiry --
+  // the type alone decides (it is a SET either way), never the member-TTL bookkeeping.
   {
     const std::string key = "container-no-member-ttl";
     const uint64_t base_ms = TEST_current_time_ms;
@@ -3572,36 +3569,29 @@ TEST_F(MvccStoreTest, ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPa
     AdvanceTime(50);
     ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
 
-    EXPECT_EQ(TombMetaOf(key), deadline_ms)
-        << "a container with no member TTL bookkeeping must still get a plain D, not an anchor";
-    EXPECT_FALSE(TombMetaOf(key) & kTombMetaAnchorOnly);
+    EXPECT_EQ(TombMetaOf(key), kTombMetaAnchorOnly | deadline_ms)
+        << "a set with no member TTL bookkeeping must still get an anchor -- the TYPE decides, not "
+           "the member-TTL content";
   }
 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: P4-5 -- HasMemberExpiration() is a STICKY, NODE-LOCAL flag -- only this node's own
-// reaper ever clears it, and only once a "complete clean pass" confirms every member's own TTL is
-// gone. Two nodes given the IDENTICAL history can therefore hold the SAME container's OWN flag in
-// two different states purely because one of them happened to run its heartbeat reaper first: that
-// alone is not a function of replicated state, so a predicate built on it directly is not
-// deterministic across the mesh. This test drives a container with member "a" (has a TTL) and
-// member "b" (no TTL) -- a container that can NEVER be fully "member-TTL-only"
-// (container_utils::MemberTtlOnlyContainer, container_utils.h's own comment) no matter how long it
-// lives, since "b" never expires on its own -- through both
-// reap states on two otherwise-identical keys: one where the heartbeat already reaped "a" away
-// (clearing the sticky flag, since after removing "a" the reaper's OWN "complete clean pass" logic
-// -- db_slice.cc's own ReaperClearMemberExpiration comment -- sees a container with no MORE TTL'd
-// members left and clears it), and one where nothing has touched the container's own flag at all.
-// Both must still classify identically -- a bare D -- because MemberTtlOnlyContainer walks the
-// CURRENT members directly (never consults the sticky flag's own history) and finds "b" lacks a
-// TTL either way.
+// reaper ever clears it, and PrimeValue::HasMemberExpiration()'s own member-TTL content can also
+// differ from node to node while local reap state catches up. Neither is what decides a
+// whole-key-expired tombstone's meta CLASS: only the value's own TYPE does (OBJ_STRING -> D, every
+// other type -> anchor|D), which is identical on every node for the identical history regardless of
+// any of that local bookkeeping. This test drives a set with member "a" (has a TTL) and member "b"
+// (no TTL) through two different LOCAL reap states on two otherwise-identical keys: one where the
+// heartbeat already reaped "a" away (leaving only "b"), and one where nothing has touched the
+// container at all. Both must still classify identically -- an anchor -- because the type (SET)
+// never depends on either key's own member-TTL content or local reap history.
 //
-// Falsifying: reverting the whole-key expiry site (DbSlice::ExpireIfNeeded, db_slice.cc) back to
-// the sticky-flag predicate (`it->second.HasMemberExpiration()` alone, no member walk) makes the
-// two keys below DISAGREE: the reaped key observes a bare D (the reaper's own clean pass already
-// cleared its flag), but the unreaped key observes an anchor (its flag was never touched).
-TEST_F(MvccStoreTest, ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessOfReapPath) {
+// Falsifying: reverting the type check in DbSlice::ExpireIfNeeded (db_slice.cc) to always treat
+// the value as OBJ_STRING makes both keys below observe a bare D (the kTombMetaAnchorOnly bit
+// clear) instead of an anchor.
+TEST_F(MvccStoreTest, SetAnchorsByTypeRegardlessOfMemberTtlContentOrReapHistory) {
   const unsigned num_shards = shard_set->size();
   ASSERT_GT(num_shards, 1u) << "the reaped and unreaped keys must land on DIFFERENT shards, or "
                                "running the heartbeat on one shard would reap both";
@@ -3609,7 +3599,7 @@ TEST_F(MvccStoreTest, ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessO
   std::string reaped_key, unreaped_key;
   for (int i = 0; unreaped_key.empty(); ++i) {
     CHECK_LT(i, 10000) << "could not find a key on a different shard from reaped_key";
-    std::string cand = absl::StrCat("probe", i);
+    std::string cand = absl::StrCat("mttlset", i);
     if (reaped_key.empty()) {
       reaped_key = cand;
     } else if (Shard(cand, num_shards) != Shard(reaped_key, num_shards)) {
@@ -3634,65 +3624,96 @@ TEST_F(MvccStoreTest, ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessO
 
   AdvanceTime(1050);  // past R for both; well before either D
 
-  // Reap ONLY reaped_key's own shard: member "a" is removed, leaving only "b" -- and the reaper's
-  // own complete-clean-pass logic clears reaped_key's sticky HasMemberExpiration() flag, since no
-  // TTL'd member remains after that removal.
+  // Reap ONLY reaped_key's own shard: member "a" is removed, leaving only "b". unreaped_key's own
+  // shard is never swept (the two keys are asserted to be on different shards, above), and the
+  // outcome below does not depend on whether this reap step actually ran -- the type (SET) decides
+  // either way, so no precondition guard on the reap's own effect is needed here.
   const ShardId reaped_sid = Shard(reaped_key, num_shards);
   shard_set->Await(reaped_sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
-  ASSERT_EQ(Run({"sismember", reaped_key, "a"}).GetInt(), 0)
-      << "guard against a vacuous pass -- member a must actually be reaped away on reaped_key";
-  // unreaped_key's own shard was never swept (the reap above ran on reaped_sid only, and the two
-  // keys are asserted to be on different shards, above) -- no separate probe needed here: querying
-  // unreaped_key's own membership would itself lazily reap member "a" (SISMEMBER's own
-  // time-aware lookup), defeating the very state this test means to leave untouched.
 
-  AdvanceTime(4000);  // now past D for both (base + 5050 and base + 5050+... comfortably past 5000)
+  // Both keys share the identical base_ms (created back-to-back with no AdvanceTime between them),
+  // so a single AdvanceTime brings both equally far past their own D = base + 5000: current time is
+  // now base + 1050 + 4000 = base + 5050, 50ms past D for both.
+  AdvanceTime(4000);
   ASSERT_EQ(Run({"exists", reaped_key}).GetInt(), 0) << "guard against a vacuous pass";
   ASSERT_EQ(Run({"exists", unreaped_key}).GetInt(), 0) << "guard against a vacuous pass";
 
-  EXPECT_EQ(TombMetaOf(reaped_key), reaped_deadline_ms)
-      << "a container missing member b's own TTL must get a bare D, never an anchor, even though "
-         "the reaper already ran and cleared its own sticky flag";
-  EXPECT_FALSE(TombMetaOf(reaped_key) & kTombMetaAnchorOnly);
-  EXPECT_EQ(TombMetaOf(unreaped_key), unreaped_deadline_ms)
-      << "the SAME container content, never touched by a reaper, must classify IDENTICALLY to "
-         "reaped_key above -- the meta CLASS must be a function of replicated content, not of "
-         "which node's heartbeat happened to run first";
-  EXPECT_FALSE(TombMetaOf(unreaped_key) & kTombMetaAnchorOnly);
+  EXPECT_EQ(TombMetaOf(reaped_key), kTombMetaAnchorOnly | reaped_deadline_ms)
+      << "a set must earn an anchor on whole-key expiry regardless of its own member-TTL content";
+  EXPECT_EQ(TombMetaOf(unreaped_key), kTombMetaAnchorOnly | unreaped_deadline_ms)
+      << "the SAME set type must classify IDENTICALLY to reaped_key above -- the meta CLASS is a "
+         "function of the value's own type, not of which node's heartbeat happened to run first";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- a hash case for the same predicate (container_utils::MemberTtlOnlyContainer),
-// confirming it is not set-specific: OBJ_HASH (HSET + HEXPIRE) reaches the identical StringMap
-// encoding OBJ_SET's dense form does, just without VisitSet's own StringSet/OAHSet dispatch. Every
-// field carries a TTL here (an all-TTL-members container, the same shape
-// ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPathFiresFirst above pins for a set), so
-// this must anchor via the whole-key-reaped-first path.
+// drakeydb: P4-5 -- a hash case for the same type-based rule, confirming it is not set-specific:
+// OBJ_HASH anchors on whole-key expiry exactly like OBJ_SET does, whether or not it carries any
+// field-level TTL at all -- the type alone decides.
 //
-// Falsifying: this test's own job is confirming OBJ_HASH reaches container_utils::
-// MemberTtlOnlyContainer's walk at all, with every field having a TTL -- reverting the whole-key
-// expiry site (DbSlice::ExpireIfNeeded, db_slice.cc) back to the sticky-flag predicate does NOT
-// change this test's own result (a single all-TTL field satisfies both the old and new predicate
-// alike), so ProbeShapeContainerWithOneNonTtlMemberGetsBareDRegardlessOfReapPath (above) is the
-// real falsification target for the walk logic itself, not this test.
-TEST_F(MvccStoreTest, HashWithAllFieldsTtlGetsAnchorOnWholeKeyExpiry) {
-  const std::string key = "hash-all-fields-ttl";
-  const uint64_t base_ms = TEST_current_time_ms;
-  ASSERT_EQ(Run({"hset", key, "f", "v"}).GetInt(), 1);
-  Run({"hexpire", key, "1", "fields", "1", "f"});
-  ASSERT_EQ(Run({"pexpire", key, "5000"}).GetInt(), 1);
-  const uint64_t deadline_ms = base_ms + 5000;
+// Falsifying: reverting the type check in DbSlice::ExpireIfNeeded (db_slice.cc) to always treat
+// the value as OBJ_STRING makes both EXPECT_EQ below observe a bare D instead of an anchor.
+TEST_F(MvccStoreTest, HashAnchorsOnWholeKeyExpiryWithOrWithoutFieldTtl) {
+  const std::string with_ttl_key = "hash-all-fields-ttl";
+  const uint64_t with_ttl_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"hset", with_ttl_key, "f", "v"}).GetInt(), 1);
+  Run({"hexpire", with_ttl_key, "1", "fields", "1", "f"});
+  ASSERT_EQ(Run({"pexpire", with_ttl_key, "5000"}).GetInt(), 1);
+  const uint64_t with_ttl_deadline_ms = with_ttl_base_ms + 5000;
 
-  AdvanceTime(5050);  // past D; no heartbeat sweep has run
-  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
+  const std::string no_ttl_key = "hash-no-field-ttl";
+  const uint64_t no_ttl_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"hset", no_ttl_key, "f", "v"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", no_ttl_key, "5000"}).GetInt(), 1);
+  const uint64_t no_ttl_deadline_ms = no_ttl_base_ms + 5000;
 
-  EXPECT_EQ(TombMetaOf(key), kTombMetaAnchorOnly | deadline_ms)
-      << "an all-TTL-fields hash must earn an anchor on whole-key expiry, exactly like an "
-         "all-TTL-members set";
+  AdvanceTime(5050);  // past D for both; no heartbeat sweep has run
+  ASSERT_EQ(Run({"exists", with_ttl_key}).GetInt(), 0) << "guard against a vacuous pass";
+  ASSERT_EQ(Run({"exists", no_ttl_key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  EXPECT_EQ(TombMetaOf(with_ttl_key), kTombMetaAnchorOnly | with_ttl_deadline_ms)
+      << "a hash must earn an anchor on whole-key expiry, exactly like a set";
+  EXPECT_EQ(TombMetaOf(no_ttl_key), kTombMetaAnchorOnly | no_ttl_deadline_ms)
+      << "a hash with no field TTL at all must ALSO earn an anchor -- the TYPE decides, not the "
+         "field-TTL content";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- the same type-based rule for OBJ_LIST and OBJ_ZSET, neither of which has any
+// member-TTL concept at all (only OBJ_SET/OBJ_HASH's dense encoding does), confirming the rule is
+// not scoped to the two types that happen to carry member TTLs: every non-string type anchors on
+// whole-key expiry, full stop. GC's own D+ttl survival timeline for an anchor is exercised once,
+// generally, by ContainerWithMemberTtlEarnsAnAnchorRegardlessOfWhichReapPathFiresFirst's Key A
+// (above) -- the eligibility formula reads the SAME meta word for every non-string type, so it is
+// not re-pinned per type here.
+//
+// Falsifying: reverting the type check in DbSlice::ExpireIfNeeded (db_slice.cc) to always treat
+// the value as OBJ_STRING makes both EXPECT_EQ below observe a bare D instead of an anchor.
+TEST_F(MvccStoreTest, ListAndZsetAnchorOnWholeKeyExpiry) {
+  const std::string list_key = "list-wholekey";
+  const uint64_t list_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"rpush", list_key, "x"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", list_key, "10"}).GetInt(), 1);
+  const uint64_t list_deadline_ms = list_base_ms + 10;
+
+  const std::string zset_key = "zset-wholekey";
+  const uint64_t zset_base_ms = TEST_current_time_ms;
+  ASSERT_EQ(Run({"zadd", zset_key, "1", "x"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", zset_key, "10"}).GetInt(), 1);
+  const uint64_t zset_deadline_ms = zset_base_ms + 10;
+
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", list_key}).GetInt(), 0) << "guard against a vacuous pass";
+  ASSERT_EQ(Run({"exists", zset_key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  EXPECT_EQ(TombMetaOf(list_key), kTombMetaAnchorOnly | list_deadline_ms)
+      << "a list must earn an anchor on whole-key expiry -- it has no member-TTL concept at all, "
+         "so only the TYPE can be deciding this";
+  EXPECT_EQ(TombMetaOf(zset_key), kTombMetaAnchorOnly | zset_deadline_ms)
+      << "a zset must earn an anchor on whole-key expiry, for the identical reason";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -6457,24 +6478,24 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesDeadlineMe
 
 // drakeydb: P4-5 -- OpRestore's own absent-key sibling of rdb_test.cc's
 // MergeLwwExpiredIncomingAllTtlMembersSetInstallsAnchorTombstone: a guarded RESTORE whose payload
-// is a set with an all-TTL-members shape (a single member, carrying a TTL), and whose ABSOLUTE ttl
-// has already elapsed, must attach an anchor -- not a bare D -- since the payload is not otherwise
-// materialized on this path (OpRestore skips RdbRestoreValue::Add entirely once Expired() is
-// already known), exercising ElapsedRestoreTombMeta's own ParseOnly call (generic_family.cc).
+// is a set, no member TTL at all, whose ABSOLUTE ttl has already elapsed, must still attach an
+// anchor -- not a bare D -- since the payload's own TYPE (not its member-TTL content) is what
+// decides. The payload is not otherwise materialized on this path (OpRestore skips
+// RdbRestoreValue::Add entirely once Expired() is already known), exercising
+// ElapsedRestoreTombMeta's own read of the payload's first byte, the RDB type byte
+// (generic_family.cc; DumpValue's own WriteOpcode(type) call, rdb_save.cc, writes it first).
 //
-// Falsifying: reverting ElapsedRestoreTombMeta to always return a bare `deadline_ms`, without the
-// container_utils::MemberTtlOnlyContainer check, makes the EXPECT_EQ below observe a bare deadline
-// (kTombMetaAnchorOnly clear) instead of an anchor.
-TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyAllTtlMembersSetGetsAnchor) {
+// Falsifying: reverting ElapsedRestoreTombMeta to always return a bare `deadline_ms`, without
+// checking payload[0], makes the EXPECT_EQ below observe a bare deadline (kTombMetaAnchorOnly
+// clear) instead of an anchor.
+TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeySetPayloadGetsAnchor) {
   constexpr uint32_t kPeerIdx = 96;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000096");
   RegisterPeerOriginHash(kPeerIdx, peer_hash);
 
-  // A donor set whose only member carries a TTL (still in the future on the donor itself -- only
-  // the guarded RESTORE's own ABSTTL below has already elapsed).
-  ASSERT_EQ(Run({"sadd", "restore_allttl_donor", "x"}).GetInt(), 1);
-  Run({"fieldexpire", "restore_allttl_donor", "100", "x"});
-  std::string dump = Run({"dump", "restore_allttl_donor"}).GetString();
+  // A donor set with NO member TTL at all -- the type alone must still decide the anchor.
+  ASSERT_EQ(Run({"sadd", "restore_set_donor", "x"}).GetInt(), 1);
+  std::string dump = Run({"dump", "restore_set_donor"}).GetString();
 
   ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
 
@@ -6488,7 +6509,38 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyAllTtlMembersSetGetsAncho
   ASSERT_TRUE(tomb.has_value());
   EXPECT_TRUE(tomb->IsTombstone());
   EXPECT_EQ(TombMetaOf("k"), kTombMetaAnchorOnly | 1u)
-      << "an all-TTL-members set payload must anchor, not attach a bare D";
+      << "a set payload must anchor, not attach a bare D, even with no member TTL at all";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- the same shape, a list payload, confirming the type-byte check is not
+// set-specific: RDB_TYPE_LIST_QUICKLIST_2 (rdb_save.cc's own RdbObjectType) is read from
+// payload[0] exactly like RDB_TYPE_SET_INTSET/RDB_TYPE_SET/RDB_TYPE_SET_WITH_EXPIRY are -- anything
+// other than RDB_TYPE_STRING anchors.
+//
+// Falsifying: reverting ElapsedRestoreTombMeta to always return a bare `deadline_ms` makes the
+// EXPECT_EQ below observe a bare deadline instead of an anchor.
+TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyListPayloadGetsAnchor) {
+  constexpr uint32_t kPeerIdx = 98;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000098");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"rpush", "restore_list_donor", "x"}).GetInt(), 1);
+  std::string dump = Run({"dump", "restore_list_donor"}).GetString();
+
+  ASSERT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "sanity: kl must start absent";
+
+  constexpr uint64_t kXMvcc = 0x5000ULL;
+  ASSERT_EQ(ApplyReplicatedCommand({"restore", "kl", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  auto tomb = StampOf("kl");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf("kl"), kTombMetaAnchorOnly | 1u)
+      << "a list payload must anchor, not attach a bare D";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 

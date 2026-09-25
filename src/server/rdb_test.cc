@@ -4283,27 +4283,26 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
   EXPECT_EQ(mismatches, 0u);
 }
 
-// drakeydb: P4-5 -- the merge-load synthetic tombstone must apply container_utils::
-// MemberTtlOnlyContainer to the LOADED value, exactly like the local whole-key expiry site
-// (DbSlice::ExpireIfNeeded, db_slice.cc): a peer-sourced already-elapsed SET whose only member
-// carries a TTL must anchor, not attach a bare D. The payload is a real DUMP of a live donor set
-// (BuildExpiredEntryFromDump, above), so it round-trips through the identical FromOpaque path a
-// real merge load or RESTORE would use, not a hand-rolled approximation of one.
+// drakeydb: P4-5 -- the merge-load synthetic tombstone must apply the type-based rule to the
+// LOADED value, exactly like the local whole-key expiry site (DbSlice::ExpireIfNeeded,
+// db_slice.cc): a peer-sourced already-elapsed SET, no member TTL at all, must still anchor, not
+// attach a bare D -- the TYPE decides, not the member-TTL content. The payload is a real DUMP of a
+// live donor set (BuildExpiredEntryFromDump, above), so it round-trips through the identical
+// FromOpaque path a real merge load or RESTORE would use, not a hand-rolled approximation of one.
 //
 // Falsifying: reverting CreateObjectOnShard's own ApplyMergeTombstoneOnShard call site
-// (rdb_load.cc) to pass a bare item->expire_ms, without the MemberTtlOnlyContainer(pv) tag, makes
-// the EXPECT_EQ below observe a bare deadline (kTombMetaAnchorOnly clear) instead of an anchor.
-TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAllTtlMembersSetInstallsAnchorTombstone) {
+// (rdb_load.cc) to pass a bare item->expire_ms, without the pv.ObjType() == OBJ_STRING check,
+// makes the EXPECT_EQ below observe a bare deadline (kTombMetaAnchorOnly clear) instead of an
+// anchor.
+TEST_F(RdbMvccTest, MergeLwwExpiredIncomingSetInstallsAnchorTombstone) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
 
   ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
 
-  // A donor set whose only member carries a TTL (still in the future on the donor itself -- only
-  // the WHOLE-KEY deadline embedded in the synthetic entry below is what has already elapsed).
+  // A donor set with NO member TTL at all -- the type alone must still decide the anchor.
   ASSERT_EQ(Run({"sadd", "donor", "x"}).GetInt(), 1);
-  Run({"fieldexpire", "donor", "100", "x"});
   std::string dump = Run({"dump", "donor"}).GetString();
 
   std::string body = BuildExpiredEntryFromDump("k", dump, kIncomingStamp, /*expire_ms=*/2000);
@@ -4332,7 +4331,55 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAllTtlMembersSetInstallsAnchorTombsto
       << "the synthetic tombstone must be installed against the absent key";
   EXPECT_TRUE(got->IsTombstone());
   EXPECT_EQ(got_meta, kTombMetaAnchorOnly | 2000u)
-      << "an all-TTL-members set payload must anchor, not attach a bare D";
+      << "a set payload must anchor, not attach a bare D, even with no member TTL at all";
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- the same shape, a list payload, confirming the type-byte check applies to
+// CreateObjectOnShard's own already-materialized `pv` (pv.ObjType() == OBJ_STRING, rdb_load.cc) the
+// same way it applies to ElapsedRestoreTombMeta's own payload[0] read for RESTORE/rename: every
+// non-string type anchors, regardless of which producer decides it.
+//
+// Falsifying: reverting CreateObjectOnShard's own ApplyMergeTombstoneOnShard call site
+// (rdb_load.cc) to pass a bare item->expire_ms makes the EXPECT_EQ below observe a bare deadline
+// instead of an anchor.
+TEST_F(RdbMvccTest, MergeLwwExpiredIncomingListInstallsAnchorTombstone) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+
+  ASSERT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "sanity: kl must start absent";
+
+  ASSERT_EQ(Run({"rpush", "list_donor", "x"}).GetInt(), 1);
+  std::string dump = Run({"dump", "list_donor"}).GetString();
+
+  std::string body = BuildExpiredEntryFromDump("kl", dump, kIncomingStamp, /*expire_ms=*/2000);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "an already-expired incoming key creates nothing";
+
+  std::optional<MvccStamp> got;
+  uint64_t got_meta = 0;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"kl"});
+    got_meta = db_slice.GetTombMeta(0, std::string_view{"kl"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value())
+      << "the synthetic tombstone must be installed against the absent key";
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(got_meta, kTombMetaAnchorOnly | 2000u)
+      << "a list payload must anchor, not attach a bare D";
   EXPECT_EQ(mismatches, 0u);
 }
 
