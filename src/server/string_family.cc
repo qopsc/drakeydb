@@ -1234,9 +1234,13 @@ OpStatus SetCmd::DeleteExpiredKey(const SetParams& params, string_view key,
           ClampPeerTombMetaDeadline(params.expire_deadline_ms, db_cntx.time_now_ms);
       // drakeydb: P4-5 -- refuse the meta, not the tombstone: the DEL above already committed this
       // key's own tombstone at X (no meta yet), which GCs on X's own schedule regardless of what
-      // happens here. If attaching D would already be born expired (D came from the peer's own
-      // already-elapsed absolute TTL, so it can be arbitrarily stale), it would add no real
-      // protection -- D's own window (D..D+ttl) already closed by `now`. Leave the meta-less
+      // happens here. X is the peer's own stamp, carried verbatim (FloorAppliedStamp/verbatim, via
+      // the ordinary per-arm sweep) -- it can be arbitrarily old itself, e.g. while replaying a
+      // journal backlog, so this does NOT assume X is fresh. It checks the combined tombstone
+      // (X, D) the same way every other site does: TombstoneBornExpired floors on
+      // max(X.MsPart(), D), so refusal only ever fires when max(X,D)+ttl <= now -- at that point D
+      // cannot matter (attaching it would add no real protection: its own window, D..D+ttl, already
+      // closed by `now`), whichever of X or D happens to dominate the max(). Leave the meta-less
       // tombstone exactly as the ordinary DEL commit left it (it still GCs on X's own schedule) and
       // only count the refusal; erasing it here would require re-deriving accounting this delete's
       // own commit already got right.

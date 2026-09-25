@@ -4311,7 +4311,7 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
   EXPECT_EQ(mismatches, 0u);
 }
 
-// drakeydb: P4-5 -- B9: a merge-load's synthetic expiry tombstone that is already GC-eligible
+// drakeydb: P4-5 -- a merge-load's synthetic expiry tombstone that is already GC-eligible
 // (expire_ms + ttl <= now, DbSlice::TombstoneBornExpired, mvcc.h) the instant it would be installed
 // must be refused outright against an ABSENT key, not installed and left for the very next GC step
 // to reap -- and the refusal is counted. --multi_master_tombstone_ttl is set tiny (1s) so a
@@ -4370,7 +4370,7 @@ TEST_F(RdbMvccTest, MergeLwwBornExpiredSyntheticTombstoneAbsentKeyInstallsNoneAn
   EXPECT_EQ(mismatches, 0u);
 }
 
-// drakeydb: P4-5 -- B9: the resident-LIVE-key sibling of the absent-key test above. The delete
+// drakeydb: P4-5 -- the resident-LIVE-key sibling of the absent-key test above. The delete
 // still applies (the peer's write genuinely superseded the resident value), but the born-expired
 // tombstone itself is refused: the placeholder Del() left is erased instead of overwritten, so no
 // tombstone survives and the dense invariant (mvcc->size() - mvcc_tombstones == prime.size())
@@ -4392,14 +4392,31 @@ TEST_F(RdbMvccTest, MergeLwwBornExpiredSyntheticTombstoneDeletesResidentButInsta
   const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
   const MvccStamp kIncomingStamp{kOldMs << MvccClock::kCounterBits, kPeerHash};
 
-  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  // drakeydb: P4-5 -- longer than CompactObj::kInlineLen (16 bytes) so the mvcc side table's own
+  // duplicated key copy is a REAL heap allocation: a 1-character key never exercises
+  // mvcc_key_dup_bytes at all (SetTombMetaOnSlot's own byte-delta accounting, db_slice.cc), so an
+  // accounting bug there would go unnoticed with one.
+  const std::string key = "resident-born-expired-key";
+
+  size_t entries_baseline = 0, dup_bytes_baseline = 0, tombstones_baseline = 0,
+         mvcc_size_baseline = 0;
   shard_set->Await(0, [&] {
-    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+    auto* stats = namespaces->GetDefaultNamespace().GetCurrentDbSlice().MutableStats(0);
+    entries_baseline = stats->mvcc_entries;
+    dup_bytes_baseline = stats->mvcc_key_dup_bytes;
+    tombstones_baseline = stats->mvcc_tombstones;
+    mvcc_size_baseline =
+        namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetDBTable(0)->mvcc->size();
+  });
+
+  ASSERT_EQ(Run({"set", key, "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{key},
                                                                   kResidentStamp);
   });
 
   const uint64_t expire_ms = kOldMs;  // D + ttl(1s) is well past "now"
-  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp, expire_ms);
+  std::string body = BuildExpiredStringEntry(key, "incoming_v", kIncomingStamp, expire_ms);
   const std::string rdb = WrapInRdb(body);
   io::BytesSource src{io::Buffer(rdb)};
   RdbLoadContext load_context;
@@ -4419,32 +4436,43 @@ TEST_F(RdbMvccTest, MergeLwwBornExpiredSyntheticTombstoneDeletesResidentButInsta
   });
   ASSERT_FALSE(ec) << ec.message();
 
-  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+  EXPECT_THAT(Run({"get", key}), kMatchNil)
       << "the delete must still apply regardless of the tombstone refusal";
 
   std::optional<MvccStamp> got;
-  size_t born_after = 0, mismatches = 0, tombstones_after = 0;
+  size_t born_after = 0, mismatches = 0, entries_after = 0, dup_bytes_after = 0,
+         tombstones_after = 0, mvcc_size_after = 0;
   shard_set->Await(0, [&] {
     auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
-    got = db_slice.GetMvcc(0, std::string_view{"k"});
-    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
-    tombstones_after = db_slice.MutableStats(0)->mvcc_tombstones;
+    got = db_slice.GetMvcc(0, std::string_view{key});
+    auto* stats = db_slice.MutableStats(0);
+    born_after = stats->mvcc_tombstones_born_expired;
+    entries_after = stats->mvcc_entries;
+    dup_bytes_after = stats->mvcc_key_dup_bytes;
+    tombstones_after = stats->mvcc_tombstones;
+    mvcc_size_after = db_slice.GetDBTable(0)->mvcc->size();
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   EXPECT_FALSE(got.has_value())
       << "a born-expired tombstone must not be installed over the resident delete -- the "
          "placeholder Del() left must be erased instead of overwritten";
   EXPECT_EQ(born_after, born_before + 1);
-  EXPECT_EQ(tombstones_after, 0u)
+  EXPECT_EQ(entries_after, entries_baseline)
+      << "EraseMvcc must release the placeholder's own slot entirely, back to baseline";
+  EXPECT_EQ(dup_bytes_after, dup_bytes_baseline)
+      << "EraseMvcc must release the long key's own heap-duplicated bytes, back to baseline";
+  EXPECT_EQ(tombstones_after, tombstones_baseline)
       << "the placeholder's own mvcc_tombstones credit must be released, not leaked";
+  EXPECT_EQ(mvcc_size_after, mvcc_size_baseline)
+      << "the mvcc side table itself must shrink back to baseline, not just the stats mirroring it";
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold: erased, not tombstoned";
 }
 
-// drakeydb: P4-5 -- B9's own boundary control: the SAME tiny ttl as the two born-expired tests
-// above, but a deadline only 100ms in the past -- D + ttl(1s) is still ~900ms ahead of "now", so
-// this tombstone is NOT yet GC-eligible and must install exactly as it always has. Proves the new
-// refusal is not overly aggressive (a not-yet-eligible tombstone survives), the mirror image of the
-// two tests above.
+// drakeydb: P4-5 -- the boundary control: the SAME tiny ttl as the two born-expired tests above,
+// but a deadline only 100ms in the past -- D + ttl(1s) is still ~900ms ahead of "now", so this
+// tombstone is NOT yet GC-eligible and must install exactly as it always has. Proves the refusal
+// is not overly aggressive (a not-yet-eligible tombstone survives), the mirror image of the two
+// tests above.
 TEST_F(RdbMvccTest, MergeLwwNotYetBornExpiredSyntheticTombstoneStillInstalls) {
   ASSERT_TRUE(IsActiveReplica());
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
@@ -4487,8 +4515,7 @@ TEST_F(RdbMvccTest, MergeLwwNotYetBornExpiredSyntheticTombstoneStillInstalls) {
     born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
-  ASSERT_TRUE(got.has_value())
-      << "a not-yet-eligible tombstone must still install, exactly as before this task";
+  ASSERT_TRUE(got.has_value()) << "a not-yet-eligible tombstone must still install unconditionally";
   EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
   EXPECT_EQ(got_meta, expire_ms);
   EXPECT_EQ(born_after, born_before) << "a not-yet-eligible install must never be counted";
@@ -6513,7 +6540,7 @@ TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
 }
 
-// drakeydb: P4-5 -- B9's opcode-225 case: an RDB_OPCODE_DF_TOMBSTONES record whose own stamp is
+// drakeydb: P4-5 -- the opcode-225 case: an RDB_OPCODE_DF_TOMBSTONES record whose own stamp is
 // already GC-eligible (TombstoneBornExpired, mvcc.h) must be refused outright, before the cap is
 // even consulted, and counted -- installing it would do nothing but cost a slot until the very next
 // GC step reaps it. No SetMergeLww call: exercises the NON-merge install directly (the ordinary

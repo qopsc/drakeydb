@@ -4578,11 +4578,19 @@ error_code RdbLoader::HandleTombstones() {
           if (cur_table == nullptr) {
             return;
           }
+          // drakeydb: P4-5 -- checked before the born-expired refusal below: SetTombstone's own
+          // `if (!db.mvcc) return;` (db_slice.cc) is what makes this call harmless when this
+          // DbSlice has no mvcc side table (the D-7 unconditional-read comment above), but without
+          // this same guard here, a refusal would still get COUNTED for a tombstone that could
+          // never have been installed regardless -- not a real refusal.
+          if (!cur_table->mvcc) {
+            return;
+          }
           // drakeydb: P4-5 -- refuse outright, before even consulting the cap: an
           // RDB_OPCODE_DF_TOMBSTONES record carries no meta (kTombMetaNone, explicit below), so
           // this reduces to the stamp's own deadline -- if it is already GC-eligible at this
           // install-time `now_ms`, installing it would do nothing but cost a slot until the very
-          // next GC step reaps it, same as every other peer-sourced install this task guards.
+          // next GC step reaps it, same as every other peer-sourced tombstone install.
           const uint64_t now_ms = GetCurrentTimeMs();
           if (DbSlice::TombstoneBornExpired(stamp, kTombMetaNone, now_ms)) {
             ++cur_table->stats.mvcc_tombstones_born_expired;

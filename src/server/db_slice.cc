@@ -1836,6 +1836,13 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   if (!TombstonesEnabled() || !IsDbValid(db_ind))
     return;
   auto& db = *db_arr_[db_ind];
+  // drakeydb: P4-5 -- checked before the born-expired refusal below (not left to SetTombstone's
+  // own `if (!db.mvcc) return;`, further down): without this, a DbSlice whose table predates an
+  // active-replica flip (table->mvcc allocated null, TombstonesEnabled() gated on the ttl flag
+  // alone, not on active mode) would count a refusal for a tombstone that could never have been
+  // installed here regardless -- not a real refusal, so not a real count.
+  if (!db.mvcc)
+    return;
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
   // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
@@ -1861,8 +1868,20 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   }
 }
 
-// drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract.
+// drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract. false whenever
+// tombstones are disabled (--multi_master_tombstone_ttl=0), never true: at ttl=0,
+// TombstoneExpiredAt's own sum degenerates to `max(stamp.MsPart(), meta) <= now_ms`, which almost
+// every real stamp/meta satisfies (they are minted at or before "now" by construction) -- without
+// this guard, "born expired" would fire for nearly everything the moment tombstoning is turned
+// off. Most call sites already gate on TombstonesEnabled() before ever reaching here (peer-sourced
+// installs, which no-op when disabled; local expiry, which never arms a tombstone to commit when
+// disabled), so this is redundant there -- but the present-key elapsed-on-arrival sites
+// (SetCmd::DeleteExpiredKey, OpRestore's found_prev, Renamer::DeserializeDest's dest_found_) find
+// their tombstone via the ordinary per-arm DEL commit, which is NOT itself gated on
+// TombstonesEnabled(), so this guard is load-bearing there specifically.
 bool DbSlice::TombstoneBornExpired(const MvccStamp& stamp, uint64_t meta, uint64_t now_ms) {
+  if (!TombstonesEnabled())
+    return false;
   const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
   return TombstoneExpiredAt(stamp, meta, ttl_ms, now_ms);
 }

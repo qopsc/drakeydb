@@ -521,15 +521,23 @@ class DbSlice {
   // never re-derived per call site.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
-  // drakeydb: P4-5 -- names, once, the rule every peer-sourced install site refuses against and
-  // every local expiry commit site counts against: a tombstone (`stamp` plus `meta`) is "born
-  // expired" when it is already GC-eligible (TombstoneExpiredAt, mvcc.h) the instant it would be
-  // installed, at `now_ms`. Reads --multi_master_tombstone_ttl the same way TombstoneGcStep
-  // (db_slice.cc) and the save filter (snapshot.cc) do, so every caller shares one definition of
-  // "born expired" instead of re-deriving the ttl flag itself. Static: no instance state needed,
-  // and callable from a file that only has a stamp/meta/clock triple in hand (rdb_load.cc's
-  // opcode-225 install, which never resolves a live DbSlice::InstallAbsentKeyTombstone call for
-  // that record).
+  // drakeydb: P4-5 -- names, once, the rule every call site below shares: a tombstone (`stamp`
+  // plus `meta`) is "born expired" when it is already GC-eligible (TombstoneExpiredAt, mvcc.h) the
+  // instant it would be installed, at `now_ms`. Three shapes of caller: a peer-sourced absent-key
+  // or resident-live-key install refuses the tombstone outright and counts it; a present-key
+  // elapsed-on-arrival apply (SetCmd::DeleteExpiredKey, OpRestore's found_prev, Renamer::
+  // DeserializeDest's dest_found_) refuses only the deadline meta -- the DEL already committed a
+  // meta-less tombstone, which stays as committed -- and counts that instead; a local expiry
+  // commit site never refuses and only counts. Reads --multi_master_tombstone_ttl the same way
+  // TombstoneGcStep (db_slice.cc) and the save filter (snapshot.cc) do, so every caller shares one
+  // definition of "born expired" instead of re-deriving the ttl flag itself. Static: no instance
+  // state needed, and callable from a file that only has a stamp/meta/clock triple in hand
+  // (rdb_load.cc's opcode-225 install, which never resolves a live
+  // DbSlice::InstallAbsentKeyTombstone call for that record).
+  //
+  // drakeydb: P4-5 -- always false when tombstones are disabled (--multi_master_tombstone_ttl=0),
+  // never true: see the definition's own comment (db_slice.cc) for why a ttl=0 caller would
+  // otherwise see almost every real stamp/meta as "born expired".
   static bool TombstoneBornExpired(const MvccStamp& stamp, uint64_t meta, uint64_t now_ms);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   // drakeydb: P4-5 -- reads the tombstone meta word (mvcc.h's kTombMetaNone/kTombMetaAnchorOnly

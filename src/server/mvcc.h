@@ -147,11 +147,10 @@ static_assert(alignof(MvccStamp) == 8,
 // delete, making D a sound veto premise for a later re-create. Bit 63 set marks an ANCHOR: a
 // member-TTL reap time R for the member-expiry reaper and the container-emptying helpers, but also
 // a whole-key deadline D for every non-string type's whole-key expiry and elapsed-on-arrival
-// install
-// -- a container can also vanish through an ordinary delta well before D, so its own D is not a
-// sound veto premise and gets tagged anchor-only precisely to say so. TombMetaMs still exposes the
-// ms value either way; a caller outside GC eligibility must only ever treat a BARE (non-anchor)
-// meta as a genuine whole-key deadline.
+// install -- a container can also vanish through an ordinary delta well before D, so its own D is
+// not a sound veto premise and gets tagged anchor-only precisely to say so. TombMetaMs still
+// exposes the ms value either way; a caller outside GC eligibility must only ever treat a BARE
+// (non-anchor) meta as a genuine whole-key deadline.
 constexpr uint64_t kTombMetaNone = 0;
 constexpr uint64_t kTombMetaAnchorOnly = 1ULL << 63;
 

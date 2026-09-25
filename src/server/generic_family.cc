@@ -224,10 +224,6 @@ std::optional<RdbLoaderBase::OpaqueObj> RdbRestoreValue::Parse(io::Source* sourc
   return std::optional<OpaqueObj>(std::move(obj));
 }
 
-// drakeydb: P4-5 -- ParseOnly's own body, inlined back here (matching upstream's shape, see
-// commit 25593412's own parent for the pre-split original): once the meta-class decision moved to
-// ElapsedRestoreTombMeta (above in this file), which reads the payload's own type byte directly
-// rather than a full deserialize, Add() became this method's only remaining caller.
 OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_view data,
                                                      const DbContext& cntx, const RestoreArgs& args,
                                                      DbSlice* db_slice) {

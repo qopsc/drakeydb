@@ -3396,17 +3396,7 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
   auto before = StampOf(key);
   ASSERT_TRUE(before.has_value());
 
-  const uint64_t before_born_expired = [&] {
-    uint64_t total = 0;
-    shard_set->RunBriefInParallel([&](EngineShard* shard) {
-      total += namespaces->GetDefaultNamespace()
-                   .GetDbSlice(shard->shard_id())
-                   .GetStats()
-                   .db_stats[0]
-                   .mvcc_tombstones_born_expired;
-    });
-    return total;
-  }();
+  const uint64_t before_born_expired = TotalMvccTombstonesBornExpired();
 
   AdvanceTime(kPxMs + 50);  // past T.ms + ttl (kPxMs - kTtlMs) but well before D + ttl
   Run({"get", key});        // triggers lazy expiry
@@ -3453,17 +3443,7 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
   }
   EXPECT_FALSE(StampOf(key).has_value()) << "once past D + ttl, the tombstone must be reaped";
 
-  const uint64_t after_born_expired = [&] {
-    uint64_t total = 0;
-    shard_set->RunBriefInParallel([&](EngineShard* shard) {
-      total += namespaces->GetDefaultNamespace()
-                   .GetDbSlice(shard->shard_id())
-                   .GetStats()
-                   .db_stats[0]
-                   .mvcc_tombstones_born_expired;
-    });
-    return total;
-  }();
+  const uint64_t after_born_expired = TotalMvccTombstonesBornExpired();
   // Informational only, not a falsification target of this test: a local expiry commit DOES count
   // (never refuse) a born-expired tombstone (DbSlice::CommitExpiryTombstone, db_slice.cc), but this
   // test's own tombstone is deliberately NOT born-expired at its own reap time -- that is exactly
@@ -3475,7 +3455,7 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- B9: the genuinely born-expired counterpart to the test directly above -- a
+// drakeydb: P4-5 -- the genuinely born-expired counterpart to the test directly above -- a
 // tiny --multi_master_tombstone_ttl and a lazy reap delayed well past D + ttl, so the tombstone
 // this local expiry commits is already GC-eligible the instant it is minted. Unlike a peer-sourced
 // install, a local expiry NEVER refuses its own key: the tombstone is still committed (GC reaps it
@@ -3486,7 +3466,14 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
 // advancing by one.
 TEST_F(MvccStoreTest, LocalExpiryBornExpiredKeepsTombstoneAndCounts) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
-  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+  // drakeydb: P4-5 -- zero the idle-task GC budget until the explicit TombstoneGcStep call below:
+  // without this, the heartbeat's own idle GC sweep could reap the born-expired tombstone before
+  // the assertions on it below ever run, flaking this test on a slow or loaded run.
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  absl::Cleanup restore_ttl = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
 
   const std::string key = "local-born-expired";
   const uint64_t deadline_ms = TEST_current_time_ms + 10;
@@ -3495,9 +3482,9 @@ TEST_F(MvccStoreTest, LocalExpiryBornExpiredKeepsTombstoneAndCounts) {
   const uint64_t before_born = TotalMvccTombstonesBornExpired();
 
   // Push "now" well past D + ttl (10ms + 1000ms) before the lazy reap ever runs, so the reap's own
-  // now already exceeds the tombstone's own GC deadline the instant it is minted -- the reap
-  // "lagged by at least the ttl" case the brief's own Why section names as the only way a local
-  // commit can be born expired.
+  // now already exceeds the tombstone's own GC deadline the instant it is minted -- a local commit
+  // is born expired only when the reap itself lagged by at least the tombstone ttl, since a local
+  // reap's own now is otherwise always >= the deadline it just crossed.
   AdvanceTime(2000);
   Run({"get", key});  // triggers lazy expiry
   ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
@@ -3510,6 +3497,9 @@ TEST_F(MvccStoreTest, LocalExpiryBornExpiredKeepsTombstoneAndCounts) {
   EXPECT_EQ(TotalMvccTombstonesBornExpired(), before_born + 1);
 
   // The very next GC step must reap it -- born expired means eligible now, not merely eventually.
+  // Restore a real budget first: the zero set above (to keep the idle sweep from racing the
+  // assertions above) would also make this explicit step itself a guaranteed no-op.
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
   const ShardId sid = Shard(key, shard_set->size());
   shard_set->Await(sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
@@ -6310,7 +6300,7 @@ TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOld
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
-// drakeydb: P4-5 -- B9: the SET test's own born-expired sibling -- a guarded write whose own mint
+// drakeydb: P4-5 -- the SET test's own born-expired sibling -- a guarded write whose own mint
 // is old enough that, at a tiny --multi_master_tombstone_ttl, the tombstone this write would
 // install is already GC-eligible the instant it would be installed. Refused outright and counted,
 // unlike the not-born-expired case above, which installs and protects against a later, older
@@ -6486,6 +6476,59 @@ TEST_F(MvccStoreTest, SetCmdDeleteExpiredKeyGuardedPresentKeyAttachesDeadlineMet
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: P4-5 -- the present-key sibling of the born-expired tests above: SetCmd::
+// DeleteExpiredKey's own DEL already commits a tombstone at X (the peer's own stamp, carried
+// verbatim, no meta yet) before this branch ever runs. X is not assumed fresh -- it is the peer's
+// own stamp and can be arbitrarily old itself (e.g. while replaying a journal backlog well behind
+// "now"), so both S (the resident's prior stamp) and X are pinned old here, with X only a small
+// tick above S to admit the guard. When the combined tombstone (X, D) is already GC-eligible
+// (max(X, D) + ttl <= now), the deadline D is refused -- D cannot matter once that holds, since its
+// own window (D..D+ttl) already closed by "now" -- and the meta-less tombstone the DEL's ordinary
+// commit already left in place survives untouched.
+//
+// Falsifying: removing the count (or attaching clamped_meta unconditionally) in SetCmd::
+// DeleteExpiredKey (string_family.cc) makes the assertions below fail: TombMetaOf observes D (1u)
+// instead of kTombMetaNone, and/or TotalMvccTombstonesBornExpired() stays at before_born.
+TEST_F(MvccStoreTest, SetCmdDeleteExpiredKeyPresentKeyBornExpiredLeavesTombstoneMetaLessAndCounts) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; the smallest usable ttl
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint32_t kPeerIdx = 101;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-0000000000a1");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "present_born_k", "old"}), "OK");
+
+  // S, this key's resident prior stamp, forced old -- 5s in the past, well beyond ttl(1s).
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const MvccStamp kResidentStamp{kOldMs << MvccClock::kCounterBits, kSelfHash};
+  shard_set->Await(Shard("present_born_k", shard_set->size()), [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(
+        0, std::string_view{"present_born_k"}, kResidentStamp);
+  });
+
+  // X: the peer's own guarded write, strictly above S (the guard's own admission requirement) but
+  // otherwise just as old as S -- not a fresh mint.
+  const uint64_t kXMvcc = (kOldMs << MvccClock::kCounterBits) + 0x1000;
+  const uint64_t before_born = TotalMvccTombstonesBornExpired();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "present_born_k", "new_val", "PXAT", "1"}, kPeerIdx,
+                                   kXMvcc, /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "present_born_k"}).GetInt(), 0)
+      << "the already-expired write must still delete the present key";
+
+  auto tomb = StampOf("present_born_k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb, (MvccStamp{kXMvcc | MvccClock::kTombstoneBit, peer_hash}))
+      << "the DEL's own ordinary commit must stamp the tombstone X|bit, with the peer's origin";
+  EXPECT_EQ(TombMetaOf("present_born_k"), kTombMetaNone)
+      << "a born-expired deadline must be refused, leaving the tombstone meta-less";
+  EXPECT_EQ(TotalMvccTombstonesBornExpired(), before_born + 1);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 // drakeydb: P4-5 -- OpRestore's own guarded, found_prev sibling of the SET test directly above:
 // a guarded RESTORE ... REPLACE whose absolute TTL has already elapsed, against a key this node
 // DOES hold, must attach meta = D too.
@@ -6518,6 +6561,59 @@ TEST_F(MvccStoreTest, OpRestoreFoundPrevGuardedAttachesDeadlineMeta) {
   EXPECT_EQ(TombMetaOf("restore_present_k"), 1u)
       << "meta must be D -- this delete IS a guarded, peer-sourced apply";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- the born-expired sibling of the test directly above, the RESTORE ... REPLACE
+// ABSTTL counterpart to SetCmdDeleteExpiredKeyPresentKeyBornExpiredLeavesTombstoneMetaLessAndCounts
+// (same file): OpRestore's found_prev branch already commits a tombstone at X (the peer's own
+// stamp, carried verbatim) before ever reaching the meta-attach decision. X is pinned old here too
+// -- not assumed fresh -- so the combined tombstone (X, D) is already GC-eligible
+// (max(X, D) + ttl <= now), and the deadline D must be refused while the meta-less tombstone the
+// DEL's ordinary commit already left survives untouched.
+//
+// Falsifying: removing the count (or attaching clamped_meta unconditionally) in OpRestore's
+// found_prev branch (generic_family.cc) makes the assertions below fail: TombMetaOf observes D
+// (1u) instead of kTombMetaNone, and/or TotalMvccTombstonesBornExpired() stays at before_born.
+TEST_F(MvccStoreTest, OpRestoreFoundPrevPresentKeyBornExpiredLeavesTombstoneMetaLessAndCounts) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; the smallest usable ttl
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint32_t kPeerIdx = 102;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-0000000000a2");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "restore_present_born_donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "restore_present_born_donor"}).GetString();
+  ASSERT_EQ(Run({"set", "restore_present_born_k", "old"}), "OK");
+
+  // S, this key's resident prior stamp, forced old -- 5s in the past, well beyond ttl(1s).
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const MvccStamp kResidentStamp{kOldMs << MvccClock::kCounterBits, kSelfHash};
+  shard_set->Await(Shard("restore_present_born_k", shard_set->size()), [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(
+        0, std::string_view{"restore_present_born_k"}, kResidentStamp);
+  });
+
+  // X: the peer's own guarded write, strictly above S but otherwise just as old -- not fresh.
+  const uint64_t kXMvcc = (kOldMs << MvccClock::kCounterBits) + 0x1000;
+  const uint64_t before_born = TotalMvccTombstonesBornExpired();
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"restore", "restore_present_born_k", "1", dump, "REPLACE", "ABSTTL"},
+                             kPeerIdx, kXMvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "restore_present_born_k"}).GetInt(), 0)
+      << "the already-expired write must still delete the present key";
+
+  auto tomb = StampOf("restore_present_born_k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(*tomb, (MvccStamp{kXMvcc | MvccClock::kTombstoneBit, peer_hash}))
+      << "the DEL's own ordinary commit must stamp the tombstone X|bit, with the peer's origin";
+  EXPECT_EQ(TombMetaOf("restore_present_born_k"), kTombMetaNone)
+      << "a born-expired deadline must be refused, leaving the tombstone meta-less";
+  EXPECT_EQ(TotalMvccTombstonesBornExpired(), before_born + 1);
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
