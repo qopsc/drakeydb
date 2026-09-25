@@ -1687,7 +1687,7 @@ void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& 
 // this same slot lookup costs nothing extra and keeps the "commit + meta" pairing atomic by
 // construction rather than by caller discipline.
 void DbSlice::CommitExpiryTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp,
-                                    uint64_t meta) {
+                                    uint64_t meta, uint64_t now_ms) {
   DCHECK(stamp.IsTombstone())
       << "CommitExpiryTombstone only ever commits an expiry's own tombstone -- a plain write must "
          "go through SetExistingMvcc instead: db="
@@ -1702,6 +1702,15 @@ void DbSlice::CommitExpiryTombstone(DbIndex db_ind, string_view key, const MvccS
   if (!was_tombstone)
     ++db.stats.mvcc_tombstones;
   SetTombMetaOnSlot(db, it, meta);
+  // drakeydb: P4-5 -- COUNT only, never refuse: a local expiry always commits its own tombstone
+  // (GC reaps it normally on the next step), unlike a peer-sourced install, which refuses outright
+  // (InstallAbsentKeyTombstone below). Almost never true in practice -- a local reap's own `now_ms`
+  // is always >= the deadline it just crossed -- so this only fires when the reap itself lagged by
+  // at least the tombstone ttl.
+  if (TombstoneBornExpired(stamp, meta, now_ms)) {
+    ++db.stats.mvcc_tombstones_born_expired;
+    VLOG(2) << "local expiry tombstone born expired: db=" << db_ind << " key=" << key;
+  }
 }
 
 // drakeydb: P4-3 Task 2 -- see the declaration (db_slice.h) for the full contract. Mirrors
@@ -1834,11 +1843,28 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   // far in the future. Against `now_ms`, the CALLER's own already-known clock reading, never a
   // fresh read taken here.
   const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, now_ms);
+  // drakeydb: P4-5 -- refuse, never install, a tombstone that is already GC-eligible the instant it
+  // would be installed: it would do nothing but cost a slot and cap budget until the very next GC
+  // step reaps it, and can let a stale peer tombstone evict a useful one at the cap in the
+  // meantime. Checked against the stamp and meta this call WOULD install, using the caller's own
+  // `now_ms`.
+  if (TombstoneBornExpired(stamp, clamped_meta, now_ms)) {
+    ++db.stats.mvcc_tombstones_born_expired;
+    VLOG(2) << "refusing born-expired peer-sourced tombstone install: db=" << db_ind
+            << " key=" << key;
+    return;
+  }
   if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
     SetTombstone(db_ind, key, stamp, clamped_meta);
   } else {
     ++db.stats.mvcc_tombstones_dropped;  // at the cap: degrade to no-op, visibly
   }
+}
+
+// drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract.
+bool DbSlice::TombstoneBornExpired(const MvccStamp& stamp, uint64_t meta, uint64_t now_ms) {
+  const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
+  return TombstoneExpiredAt(stamp, meta, ttl_ms, now_ms);
 }
 
 // drakeydb: P4-3 Task 2 review fix (I3) -- see the declaration (db_slice.h) for the full contract.
@@ -2813,18 +2839,19 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
     // why it just got deleted), so this earns an anchor, never a whole-key D -- the D-27 delta veto
     // must never fire against it.
     const uint64_t tomb_meta = kTombMetaAnchorOnly | cntx.time_now_ms;
+    const uint64_t now_ms = cntx.time_now_ms;
     MvccStamp committed;
     const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
         cntx.db_index, key_owned,
-        [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st,
-                                bool has_prior_stamp, const MvccStamp&) {
+        [&committed, tomb_meta, now_ms](DbIndex db, string_view k, const MvccStamp& st,
+                                        bool has_prior_stamp, const MvccStamp&) {
           // drakeydb: P4-4 -- has_prior_stamp false means the reaped container's
           // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
           // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
           if (has_prior_stamp) {
             committed = st;
-            namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(db, k, st,
-                                                                                        tomb_meta);
+            namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(
+                db, k, st, tomb_meta, now_ms);
           } else {
             namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
           }

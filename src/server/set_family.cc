@@ -1056,15 +1056,16 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
         // member-expiry emptiness earns (DbSlice::DeleteReapedContainer, db_slice.cc;
         // SetFamily::DeleteSetIfEmpty above): this is member-TTL-caused, not a whole-key deadline.
         const uint64_t tomb_meta = kTombMetaAnchorOnly | op_args.db_cntx.time_now_ms;
+        const uint64_t now_ms = op_args.db_cntx.time_now_ms;
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
             op_args.db_cntx.db_index, key,
-            [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st,
-                                    bool has_prior_stamp, const MvccStamp&) {
+            [&committed, tomb_meta, now_ms](DbIndex db, string_view k, const MvccStamp& st,
+                                            bool has_prior_stamp, const MvccStamp&) {
               if (has_prior_stamp) {
                 committed = st;
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(
-                    db, k, st, tomb_meta);
+                    db, k, st, tomb_meta, now_ms);
               } else {
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
               }
@@ -1756,18 +1757,19 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
         // whole-key deadline, so it earns an anchor, never a D the D-27 delta veto could fire
         // against.
         const uint64_t tomb_meta = kTombMetaAnchorOnly | db_cntx.time_now_ms;
+        const uint64_t now_ms = db_cntx.time_now_ms;
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
             db_cntx.db_index, key,
-            [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st,
-                                    bool has_prior_stamp, const MvccStamp&) {
+            [&committed, tomb_meta, now_ms](DbIndex db, string_view k, const MvccStamp& st,
+                                            bool has_prior_stamp, const MvccStamp&) {
               // drakeydb: P4-4 -- has_prior_stamp false means the set's own
               // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
               // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
               if (has_prior_stamp) {
                 committed = st;
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(
-                    db, k, st, tomb_meta);
+                    db, k, st, tomb_meta, now_ms);
               } else {
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
               }

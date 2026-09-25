@@ -2904,8 +2904,7 @@ string ServerFamily::FormatInfoMetrics(
       // mvcc_tombstones_dropped (table.h) for why this must stay visible rather than a silent,
       // unbounded fallback to pre-Task-2 resurrection-on-full-sync behavior.
       append("mvcc_tombstones_dropped", total.mvcc_tombstones_dropped);
-      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h). Stays 0 until
-      // the peer-sourced install refusal that increments it lands.
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h).
       append("mvcc_tombstones_born_expired", total.mvcc_tombstones_born_expired);
     }
     append("small_string_bytes", m.small_string_bytes);

@@ -1360,8 +1360,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       // instead), but this aggregate never surfaced the per-shard count an operator would need to
       // tell WHICH shard is degrading. Same DbTableStats field INFO reads, summed the same way.
       size_t tombstones_dropped = 0;
-      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h). Stays 0 until
-      // the peer-sourced install refusal that increments it lands.
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h).
       size_t tombstones_born_expired = 0;
       size_t bytes = 0;
       uint64_t clock_last = 0;

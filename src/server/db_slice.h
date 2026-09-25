@@ -433,19 +433,26 @@ class DbSlice {
   // drakeydb: P4-5 -- commits an expiry's own tombstone (always IsTombstone(), DCHECKed) onto a
   // slot ArmTombstone/PerformDeletionAtomic already prepared, exactly like SetExistingMvcc above,
   // AND attaches `meta` in the same call. The one caller of each: RecordExpiryBlocking (tx_base.cc,
-  // meta = the expired key's own deadline D), DbSlice::DeleteReapedContainer, SetFamily::
-  // DeleteSetIfEmpty, HSetFamily::DeleteIfEmpty, and OpPop's SPOP-all-expired branch
-  // (set_family.cc) (meta = kTombMetaAnchorOnly | reap-time R) -- every one of them invokes this
-  // from INSIDE MvccStamper::CommitOwnTombstone's own callback, BEFORE that call site's own
-  // journal::RecordEntry (and therefore before AddLogRecord) -- verified once per caller at the
-  // call site itself, not re-derived here. journal.cc's post-AddLogRecord commit callback must
-  // never allocate (its own comment, ~:145-150); SetTombMetaOnSlot's SetExpireTime/ClearExpireTime
-  // below CAN allocate (converting an inline key to SDS_TTL), which is exactly why this is a
-  // SEPARATE method from SetExistingMvcc (allocation-free by contract, for its own, different
-  // caller: journal.cc's generic per-arm sweep, which DOES run after AddLogRecord) rather than a
-  // parameter added to it.
+  // meta = the expired key's own deadline D for a string, kTombMetaAnchorOnly | D otherwise),
+  // DbSlice::DeleteReapedContainer, SetFamily::DeleteSetIfEmpty, HSetFamily::DeleteIfEmpty, and
+  // OpPop's SPOP-all-expired branch (set_family.cc) (meta = kTombMetaAnchorOnly | reap-time R) --
+  // every one of them invokes this from INSIDE MvccStamper::CommitOwnTombstone's own callback,
+  // BEFORE that call site's own journal::RecordEntry (and therefore before AddLogRecord) --
+  // verified once per caller at the call site itself, not re-derived here. journal.cc's
+  // post-AddLogRecord commit callback must never allocate (its own comment, ~:145-150);
+  // SetTombMetaOnSlot's SetExpireTime/ClearExpireTime below CAN allocate (converting an inline key
+  // to SDS_TTL), which is exactly why this is a SEPARATE method from SetExistingMvcc
+  // (allocation-free by contract, for its own, different caller: journal.cc's generic per-arm
+  // sweep, which DOES run after AddLogRecord) rather than a parameter added to it.
+  //
+  // drakeydb: P4-5 -- `now_ms`, the caller's own already-known clock reading (never a fresh read
+  // taken here): every local expiry commit is COUNTED, never refused, when TombstoneBornExpired
+  // (below) says the committed stamp+meta is already GC-eligible -- unlike a peer-sourced install,
+  // which refuses outright (InstallAbsentKeyTombstone below). Local expiry is almost never
+  // born-expired (the reap's own now is always >= the deadline it just crossed), so this only ever
+  // fires when the reap itself lagged by at least the tombstone ttl.
   void CommitExpiryTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
-                             uint64_t meta);
+                             uint64_t meta, uint64_t now_ms);
   // drakeydb: P4-3 Task 2 -- writes a tombstone slot, maintaining mvcc_entries, mvcc_tombstones,
   // and mvcc_key_dup_bytes (the same three SetMvcc maintains, plus mvcc_tombstones, which SetMvcc
   // never touches). Callers: PerformDeletionAtomic's synchronous placeholder write (db_slice.cc)
@@ -504,8 +511,26 @@ class DbSlice {
   // GetCurrentTimeMs() here: reusing the SAME reading the caller already used to decide this write
   // had elapsed makes the clamp provably inert for a genuine D, rather than racing a fresh read
   // taken microseconds later (across any yield the caller took) against the same deadline.
+  //
+  // drakeydb: P4-5 -- refuses the install outright, counting it in
+  // DbTableStats::mvcc_tombstones_born_expired instead, when TombstoneBornExpired (below) says the
+  // tombstone this call would install (`stamp` plus the CLAMPED meta) is already GC-eligible: it
+  // would do nothing but cost a slot and cap budget, and let a peer-sourced stale tombstone evict a
+  // useful one at the cap. This is the one shared choke point for every peer-sourced absent-key
+  // install (merge-load, and the streaming elapsed-on-arrival callers below), so the refusal is
+  // never re-derived per call site.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
+  // drakeydb: P4-5 -- names, once, the rule every peer-sourced install site refuses against and
+  // every local expiry commit site counts against: a tombstone (`stamp` plus `meta`) is "born
+  // expired" when it is already GC-eligible (TombstoneExpiredAt, mvcc.h) the instant it would be
+  // installed, at `now_ms`. Reads --multi_master_tombstone_ttl the same way TombstoneGcStep
+  // (db_slice.cc) and the save filter (snapshot.cc) do, so every caller shares one definition of
+  // "born expired" instead of re-deriving the ttl flag itself. Static: no instance state needed,
+  // and callable from a file that only has a stamp/meta/clock triple in hand (rdb_load.cc's
+  // opcode-225 install, which never resolves a live DbSlice::InstallAbsentKeyTombstone call for
+  // that record).
+  static bool TombstoneBornExpired(const MvccStamp& stamp, uint64_t meta, uint64_t now_ms);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   // drakeydb: P4-5 -- reads the tombstone meta word (mvcc.h's kTombMetaNone/kTombMetaAnchorOnly
   // encoding), stored in the mvcc slot's own CompactKey TTL word rather than a third MvccStamp

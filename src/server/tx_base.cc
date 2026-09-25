@@ -150,10 +150,11 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key, uint64_t to
   // (see that call's own comment), so it survives armed until the enclosing command's own,
   // later journal entry commits it with whatever stamp that entry actually carries.
   MvccStamp committed;
+  const uint64_t now_ms = db_cntx.time_now_ms;
   const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
       db_cntx.db_index, key,
-      [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st, bool has_prior_stamp,
-                              const MvccStamp&) {
+      [&committed, tomb_meta, now_ms](DbIndex db, string_view k, const MvccStamp& st,
+                                      bool has_prior_stamp, const MvccStamp&) {
         // drakeydb: P4-4 -- has_prior_stamp false means the expired value never had a real stamp
         // of its own (see CommitOwnTombstone's own comment, mvcc.h): erase the slot -- no
         // tombstone survives locally for this key -- rather than install an unsafe Mvcc()==0
@@ -174,8 +175,8 @@ void RecordExpiryBlocking(const DbContext& db_cntx, string_view key, uint64_t to
         // entry's own journal::RecordEntry/AddLogRecord call, below.
         if (has_prior_stamp) {
           committed = st;
-          namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(db, k, st,
-                                                                                      tomb_meta);
+          namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(
+              db, k, st, tomb_meta, now_ms);
         } else {
           namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
         }

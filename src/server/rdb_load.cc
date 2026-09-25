@@ -3499,8 +3499,25 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // makes the clamp provably inert for a genuine D (D <= that reading by construction), rather
       // than racing a fresh read taken after this function's own yield (FindMutable's
       // PreUpdateBlocking, above) against the same deadline.
-      db_slice->SetTombstone(db_index, key, stamp,
-                             ClampPeerTombMetaDeadline(meta, db_cntx.time_now_ms));
+      const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, db_cntx.time_now_ms);
+      // drakeydb: P4-5 -- the delete above is correct regardless of whether the incoming tombstone
+      // itself is worth keeping: the peer's write genuinely superseded the resident value, so it
+      // must go either way. Only the TOMBSTONE is refused when it is already born expired --
+      // installing it would just cost a slot until the very next GC step reaps it. EraseMvcc
+      // releases the placeholder's own mvcc_tombstones/mvcc_entries credit Del() just wrote,
+      // leaving the net result identical to an ordinary delete that never earned a tombstone at
+      // all: a later write for this key wins outright (GetMvcc returns nullopt, MergeAccepts always
+      // accepts).
+      if (DbSlice::TombstoneBornExpired(stamp, clamped_meta, db_cntx.time_now_ms)) {
+        db_slice->EraseMvcc(db_index, key);
+        DbTable* table = db_slice->GetDBTable(db_index);
+        if (table != nullptr)
+          ++table->stats.mvcc_tombstones_born_expired;
+        VLOG(2) << "refusing born-expired merge tombstone over a deleted resident key: db="
+                << db_index << " key=" << key;
+      } else {
+        db_slice->SetTombstone(db_index, key, stamp, clamped_meta);
+      }
     }
     // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone (ttl=0, or
     // the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped already incremented in
@@ -4559,6 +4576,18 @@ error_code RdbLoader::HandleTombstones() {
           // here simply skips it.
           DbTable* cur_table = db_slice.GetDBTable(db_index);
           if (cur_table == nullptr) {
+            return;
+          }
+          // drakeydb: P4-5 -- refuse outright, before even consulting the cap: an
+          // RDB_OPCODE_DF_TOMBSTONES record carries no meta (kTombMetaNone, explicit below), so
+          // this reduces to the stamp's own deadline -- if it is already GC-eligible at this
+          // install-time `now_ms`, installing it would do nothing but cost a slot until the very
+          // next GC step reaps it, same as every other peer-sourced install this task guards.
+          const uint64_t now_ms = GetCurrentTimeMs();
+          if (DbSlice::TombstoneBornExpired(stamp, kTombMetaNone, now_ms)) {
+            ++cur_table->stats.mvcc_tombstones_born_expired;
+            VLOG(2) << "refusing born-expired RDB_OPCODE_DF_TOMBSTONES install: db=" << db_index
+                    << " key=" << absl::CHexEscape(key);
             return;
           }
           const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);

@@ -195,13 +195,6 @@ class RdbRestoreValue : protected RdbLoaderBase {
   OpResult<DbSlice::ItAndUpdater> Add(string_view key, string_view payload, const DbContext& cntx,
                                       const RestoreArgs& args, DbSlice* db_slice);
 
-  // drakeydb: P4-5 -- parses `payload` into a materialized PrimeValue without installing it
-  // anywhere. Add() below is the sole caller: it parses via this, then installs the result. Kept
-  // as its own method (rather than inlined into Add()) so the parse and the install stay two
-  // separately-named steps; ElapsedRestoreTombMeta (below in this file) does NOT call this -- the
-  // meta-class decision there only needs the payload's own type byte, never a full deserialize.
-  OpResult<PrimeValue> ParseOnly(string_view payload);
-
  private:
   std::optional<OpaqueObj> Parse(io::Source* source);
   int rdb_type_ = -1;
@@ -231,8 +224,14 @@ std::optional<RdbLoaderBase::OpaqueObj> RdbRestoreValue::Parse(io::Source* sourc
   return std::optional<OpaqueObj>(std::move(obj));
 }
 
-OpResult<PrimeValue> RdbRestoreValue::ParseOnly(string_view payload) {
-  InMemSource data_src(payload);
+// drakeydb: P4-5 -- ParseOnly's own body, inlined back here (matching upstream's shape, see
+// commit 25593412's own parent for the pre-split original): once the meta-class decision moved to
+// ElapsedRestoreTombMeta (above in this file), which reads the payload's own type byte directly
+// rather than a full deserialize, Add() became this method's only remaining caller.
+OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_view data,
+                                                     const DbContext& cntx, const RestoreArgs& args,
+                                                     DbSlice* db_slice) {
+  InMemSource data_src(data);
   PrimeValue pv;
   bool first_parse = true;
   do {
@@ -264,18 +263,7 @@ OpResult<PrimeValue> RdbRestoreValue::ParseOnly(string_view payload) {
     }
   } while (pending_read_.remaining > 0);
 
-  return pv;
-}
-
-OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_view data,
-                                                     const DbContext& cntx, const RestoreArgs& args,
-                                                     DbSlice* db_slice) {
-  auto pv_res = ParseOnly(data);
-  if (!pv_res) {
-    return pv_res.status();
-  }
-
-  auto res = db_slice->AddOrUpdate(cntx, key, std::move(*pv_res), args.ExpirationTime());
+  auto res = db_slice->AddOrUpdate(cntx, key, std::move(pv), args.ExpirationTime());
   if (res) {
     res->it->first.SetSticky(args.Sticky());
     AddKeyToIndexesIfNeeded(key, cntx, res->it->second, db_slice->shard_owner());
@@ -293,12 +281,15 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
 // the RDB type byte, with no need to deserialize the rest to read it. `version` being present (a
 // GetRdbVersion success, at either producer of this payload -- SerializeSrc for rename/copy, or the
 // client's own RESTORE argument) already guarantees `payload.size() > DUMP_FOOTER_SIZE`, so
-// `payload[0]` is always safe to read here; a missing version falls back to a bare deadline, the
-// same meta a plain string always gets anyway.
+// `payload[0]` is always safe to read here; a missing version or an empty payload (both
+// unreachable in production -- see this method's own callers, each of which already has a real
+// version and a non-empty payload by construction) falls back to the ANCHOR class, never a bare
+// deadline: with no type byte to read, the conservative assumption is "not provably a string",
+// the same class every non-string type gets.
 uint64_t ElapsedRestoreTombMeta(string_view payload, optional<RdbVersion> version,
                                 uint64_t deadline_ms) {
   if (!version || payload.empty())
-    return deadline_ms;
+    return kTombMetaAnchorOnly | deadline_ms;
   return static_cast<uint8_t>(payload[0]) == RDB_TYPE_STRING ? deadline_ms
                                                              : (kTombMetaAnchorOnly | deadline_ms);
 }
@@ -659,8 +650,22 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
           const uint64_t tagged_meta =
               ElapsedRestoreTombMeta(serialized_value_->value, serialized_value_->version,
                                      restore_args.ElapsedDeadlineMs());
-          db_slice.SetTombMeta(op_args.db_cntx.db_index, dest_key_,
-                               ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms));
+          const uint64_t clamped_meta =
+              ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms);
+          // drakeydb: P4-5 -- refuse the meta, not the tombstone, mirroring SetCmd::
+          // DeleteExpiredKey's identical present-key shape (string_family.cc): the DEL above
+          // already committed dest_key_'s own tombstone, which GCs on its own schedule regardless.
+          const std::optional<MvccStamp> tomb =
+              db_slice.GetMvcc(op_args.db_cntx.db_index, dest_key_);
+          if (tomb.has_value() &&
+              DbSlice::TombstoneBornExpired(*tomb, clamped_meta, op_args.db_cntx.time_now_ms)) {
+            ++db_slice.MutableStats(op_args.db_cntx.db_index)->mvcc_tombstones_born_expired;
+            VLOG(2) << "refusing born-expired deadline meta on a present-destination RENAME "
+                       "delete: db="
+                    << op_args.db_cntx.db_index << " key=" << dest_key_;
+          } else {
+            db_slice.SetTombMeta(op_args.db_cntx.db_index, dest_key_, clamped_meta);
+          }
         }
       }
     }
@@ -879,8 +884,20 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       if (LwwGuardActive(op_args.db_cntx.repl_lww_guard, op_args.db_cntx.repl_mvcc)) {
         const uint64_t tagged_meta =
             ElapsedRestoreTombMeta(payload, rdb_version, restore_args.ElapsedDeadlineMs());
-        db_slice.SetTombMeta(op_args.db_cntx.db_index, key,
-                             ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms));
+        const uint64_t clamped_meta =
+            ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms);
+        // drakeydb: P4-5 -- refuse the meta, not the tombstone, mirroring SetCmd::
+        // DeleteExpiredKey's identical present-key shape (string_family.cc): the DEL above already
+        // committed this key's own tombstone, which GCs on its own schedule regardless.
+        const std::optional<MvccStamp> tomb = db_slice.GetMvcc(op_args.db_cntx.db_index, key);
+        if (tomb.has_value() &&
+            DbSlice::TombstoneBornExpired(*tomb, clamped_meta, op_args.db_cntx.time_now_ms)) {
+          ++db_slice.MutableStats(op_args.db_cntx.db_index)->mvcc_tombstones_born_expired;
+          VLOG(2) << "refusing born-expired deadline meta on a present-key RESTORE delete: db="
+                  << op_args.db_cntx.db_index << " key=" << key;
+        } else {
+          db_slice.SetTombMeta(op_args.db_cntx.db_index, key, clamped_meta);
+        }
       }
     }
     return OpStatus::OK;

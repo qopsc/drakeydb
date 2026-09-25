@@ -1230,9 +1230,25 @@ OpStatus SetCmd::DeleteExpiredKey(const SetParams& params, string_view key,
     // D-16, ISSUE-REGISTER.md.
     const DbContext& db_cntx = op_args_.db_cntx;
     if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
-      db_slice.SetTombMeta(
-          db_cntx.db_index, key,
-          ClampPeerTombMetaDeadline(params.expire_deadline_ms, db_cntx.time_now_ms));
+      const uint64_t clamped_meta =
+          ClampPeerTombMetaDeadline(params.expire_deadline_ms, db_cntx.time_now_ms);
+      // drakeydb: P4-5 -- refuse the meta, not the tombstone: the DEL above already committed this
+      // key's own tombstone at X (no meta yet), which GCs on X's own schedule regardless of what
+      // happens here. If attaching D would already be born expired (D came from the peer's own
+      // already-elapsed absolute TTL, so it can be arbitrarily stale), it would add no real
+      // protection -- D's own window (D..D+ttl) already closed by `now`. Leave the meta-less
+      // tombstone exactly as the ordinary DEL commit left it (it still GCs on X's own schedule) and
+      // only count the refusal; erasing it here would require re-deriving accounting this delete's
+      // own commit already got right.
+      const std::optional<MvccStamp> tomb = db_slice.GetMvcc(db_cntx.db_index, key);
+      if (tomb.has_value() &&
+          DbSlice::TombstoneBornExpired(*tomb, clamped_meta, db_cntx.time_now_ms)) {
+        ++db_slice.MutableStats(db_cntx.db_index)->mvcc_tombstones_born_expired;
+        VLOG(2) << "refusing born-expired deadline meta on a present-key elapsed delete: db="
+                << db_cntx.db_index << " key=" << key;
+      } else {
+        db_slice.SetTombMeta(db_cntx.db_index, key, clamped_meta);
+      }
     }
   }
   db_slice.SendExpiredKeyEvent(op_args_.db_cntx, key);

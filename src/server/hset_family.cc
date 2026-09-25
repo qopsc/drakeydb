@@ -1701,18 +1701,19 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
         // SetFamily::DeleteSetIfEmpty (set_family.cc) and DbSlice::DeleteReapedContainer
         // (db_slice.cc): member-TTL-caused emptiness earns an anchor, never a whole-key D.
         const uint64_t tomb_meta = kTombMetaAnchorOnly | db_cntx.time_now_ms;
+        const uint64_t now_ms = db_cntx.time_now_ms;
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
             db_cntx.db_index, key,
-            [&committed, tomb_meta](DbIndex db, string_view k, const MvccStamp& st,
-                                    bool has_prior_stamp, const MvccStamp&) {
+            [&committed, tomb_meta, now_ms](DbIndex db, string_view k, const MvccStamp& st,
+                                            bool has_prior_stamp, const MvccStamp&) {
               // drakeydb: P4-4 -- has_prior_stamp false means the hash's own
               // pre-delete stamp was never real (see CommitOwnTombstone's own comment, mvcc.h):
               // erase the slot rather than install an unsafe Mvcc()==0 tombstone.
               if (has_prior_stamp) {
                 committed = st;
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().CommitExpiryTombstone(
-                    db, k, st, tomb_meta);
+                    db, k, st, tomb_meta, now_ms);
               } else {
                 namespaces->GetDefaultNamespace().GetCurrentDbSlice().EraseMvcc(db, k);
               }

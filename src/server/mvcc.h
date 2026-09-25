@@ -142,9 +142,16 @@ static_assert(alignof(MvccStamp) == 8,
 // CompactKey TTL word, not a third MvccStamp field: widening MvccStamp itself would cost every
 // live key and explicit tombstone extra bytes for a word only some tombstones ever carry).
 // 0 means no meta: an explicit or legacy tombstone GCs on its own stamp alone, exactly as before
-// this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms). Bit 63 set marks
-// an anchor-only meta (a reap time, never a whole-key deadline) -- TombMetaMs still exposes its ms
-// value here, but a caller outside GC eligibility must never treat it as D.
+// this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms) for a value that was
+// an OBJ_STRING -- the one type that can vanish solely through an explicit, guarded, full-state
+// delete, making D a sound veto premise for a later re-create. Bit 63 set marks an ANCHOR: a
+// member-TTL reap time R for the member-expiry reaper and the container-emptying helpers, but also
+// a whole-key deadline D for every non-string type's whole-key expiry and elapsed-on-arrival
+// install
+// -- a container can also vanish through an ordinary delta well before D, so its own D is not a
+// sound veto premise and gets tagged anchor-only precisely to say so. TombMetaMs still exposes the
+// ms value either way; a caller outside GC eligibility must only ever treat a BARE (non-anchor)
+// meta as a genuine whole-key deadline.
 constexpr uint64_t kTombMetaNone = 0;
 constexpr uint64_t kTombMetaAnchorOnly = 1ULL << 63;
 
