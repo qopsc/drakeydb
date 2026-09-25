@@ -5101,13 +5101,14 @@ TEST_F(MvccStoreTest, InfoReplicationShowsExpiredDeltaDroppedSummedAcrossShards)
 // ---------------------------------------------------------------------------
 // drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md):
 // Transaction::ShouldDropExpiredDelta (transaction.cc), called right after ShouldDropForLww and
-// OR'd into the same lww_dropped local. Fires only for a kUnguarded single-key delta whose target
-// carries a STRING's own whole-key deadline tombstone (a bare meta D -- only a string's own
-// whole-key expiry ever installs one, mvcc.h) and whose author stamp is strictly older than D. A
-// drop leaves the tombstone completely untouched -- no advance: with 3+ nodes, a peer stream
-// carries no cross-link causality, so advancing the tombstone above a re-create authored by a
-// third node this receiver has not yet seen can permanently delete it once a later full sync
-// propagates the advanced stamp everywhere, including back to the node that authored it.
+// OR'd into the same lww_dropped local. Fires only for a delta on IsStringOnlyDelta's own
+// allow-list (multimaster_lww.h/.cc) whose target carries a STRING's own whole-key deadline
+// tombstone (a bare meta D -- only a string's own whole-key expiry ever installs one, mvcc.h) and
+// whose author stamp is strictly older than D. A drop leaves the tombstone completely untouched
+// -- no advance: with 3+ nodes, a peer stream carries no cross-link causality, so advancing the
+// tombstone above a re-create authored by a third node this receiver has not yet seen can
+// permanently delete it once a later full sync propagates the advanced stamp everywhere, including
+// back to the node that authored it.
 // ---------------------------------------------------------------------------
 
 // drakeydb: P4-5 -- case (a): an INCR authored strictly before D, arriving after this node
@@ -5233,8 +5234,7 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoAppliesStringDeltaAuthoredAtOrAfterDeadlin
 // false and the INCR runs its own callback instead: that callback's own FindMutable/EnsureMvcc
 // reaps INSIDE the apply, then re-creates the key at a stamp FLOORED one tick below the reap's own
 // {S, o+1} -- {S.mvcc, S.origin_hash}, LIVE (no tombstone bit) -- rather than the correct, reap-
-// first {S, o+1} tombstone this test's own assertions pin. See the task report for the exact
-// captured output.
+// first {S, o+1} tombstone this test's own assertions pin.
 TEST_F(MvccStoreTest, ExpiredDeltaVetoReapsUnreapedKeyBeforeDroppingDelta) {
   constexpr uint32_t kPeerIdx = 202;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000202");
@@ -5306,11 +5306,15 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnExplicitTombstone) {
 // drakeydb: P4-5 -- case (e): an anchor-only tombstone from an expired LIST (kTombMetaAnchorOnly |
 // D -- every non-string type's whole-key expiry earns an anchor, never a bare D, mvcc.h's
 // kTombMeta* comment) must never veto -- the anchor bit alone rules it out regardless of I vs the
-// anchor's own ms payload.
+// anchor's own ms payload. The delta under test here is INCR -- an allow-listed string-only
+// delta (IsStringOnlyDelta, multimaster_lww.h/.cc) -- not RPUSH: RPUSH is not allow-listed, so it
+// would now be excluded before ever reaching the anchor check at all, pinning nothing about that
+// check specifically; INCR reaches every earlier check (it IS allow-listed) and is excluded ONLY
+// by the anchor bit, isolating that one check the way this case is meant to.
 //
 // Falsifying: removing the `(meta & kTombMetaAnchorOnly) != 0` half of ShouldDropExpiredDelta's
-// own early-return (transaction.cc) makes the RPUSH below get wrongly dropped instead of
-// re-creating the list -- `Run({"exists", key})` then observes 0 instead of 1.
+// own early-return (transaction.cc) makes the INCR below get wrongly dropped instead of
+// re-creating the key as a fresh string -- `Run({"exists", key})` then observes 0 instead of 1.
 TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnAnchorOnlyTombstone) {
   constexpr uint32_t kPeerIdx = 204;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000204");
@@ -5328,11 +5332,11 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnAnchorOnlyTombstone) {
   const uint64_t pre_dropped = TotalExpiredDeltaDropped();
   const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;  // I < the anchor's ms
 
-  auto res = ApplyReplicatedCommand({"rpush", key, "y"}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+  auto res = ApplyReplicatedCommand({"incr", key}, kPeerIdx, author_mvcc, /*lww_guard=*/true);
   EXPECT_EQ(res, facade::DispatchResult::OK);
 
   EXPECT_EQ(Run({"exists", key}).GetInt(), 1) << "the veto must never act on an anchor";
-  EXPECT_THAT(Run({"lrange", key, "0", "-1"}).GetVec(), testing::ElementsAre("y"));
+  EXPECT_EQ(Run({"get", key}), "1") << "must re-create as a fresh string, not stay dropped";
   EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped);
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
@@ -5476,14 +5480,22 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverFiresWithGuardOff) {
 }
 
 // drakeydb: P4-5 -- case (i): PEXPIREAT and PERSIST -- kUnguarded by ClassifyJournaledCommand's
-// own table (neither name appears in it), so without IsWholeKeyTtlChanging's own deny-list check
-// (multimaster_lww.h) this veto would otherwise treat either one as an ordinary delta and compare
-// it against `key`'s own whole-key deadline tombstone. Both are already no-ops against an absent
-// key regardless of the veto (PEXPIREAT/PERSIST on an absent key do nothing either way), so the
-// counter is the only observable signal a regression here would move.
+// own table (neither name appears in it), so without a further check this veto would otherwise
+// treat either one as an ordinary delta and compare it against `key`'s own whole-key deadline
+// tombstone. Two independent checks exclude them today: IsStringOnlyDelta's own allow-list
+// (multimaster_lww.h/.cc) runs FIRST and already excludes both (neither is a string-only delta
+// name), which makes IsWholeKeyTtlChanging's own deny-list check unreachable for these two names
+// in practice -- it would only ever matter if the allow-list were someday extended to a name that
+// is ALSO a TTL change, which none of its current entries are. Both are already no-ops against an
+// absent key regardless of either check (PEXPIREAT/PERSIST on an absent key do nothing either
+// way), so the counter is the only observable signal a regression here would move.
 //
-// Falsifying: removing IsWholeKeyTtlChanging's own check in ShouldDropExpiredDelta
-// (transaction.cc) makes the counter advance for BOTH sub-cases below instead of staying flat.
+// Falsifying: removing BOTH checks together (IsStringOnlyDelta's own early-return AND
+// IsWholeKeyTtlChanging's, ShouldDropExpiredDelta, transaction.cc) makes the counter advance for
+// BOTH sub-cases below instead of staying flat -- removing either ALONE has no observable effect
+// here, since the other still excludes them (confirmed directly: removing only
+// IsWholeKeyTtlChanging's check left this test green, because IsStringOnlyDelta's own check ran
+// first and already excluded both names).
 TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnDenyListedTtlCommands) {
   constexpr uint32_t kPeerIdx = 208;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000208");
@@ -5513,16 +5525,23 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnDenyListedTtlCommands) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- case (j): a same-shard multi-key delta (SMOVE) is never vetoed --
-// unique_shard_cnt_==1 here (both keys land on the SAME shard), so it is the keys.Size()==1
-// check, not the shard-count one, doing the real work: SMOVE's own ShardArgs on this shard returns
-// BOTH `src` and `dst`. Both keys carry their own whole-key D here specifically so that whichever
-// one `keys.Front()` would return, a missing keys.Size() check would still find SOMETHING to
-// (wrongly) compare against and drop.
+// drakeydb: P4-5 -- case (j): a same-shard multi-key delta (SMOVE) is never vetoed. On a real
+// peer link SMOVE never reaches here in this multi-key shape at all -- it is NO_AUTOJOURNAL and
+// hand-journals its own two single-key halves instead (set_family.cc's own SREM/SADD
+// RecordJournal pair), each already single-key by the time it would reach this veto -- so
+// IsStringOnlyDelta's own allow-list (multimaster_lww.h/.cc; neither SREM nor SADD nor SMOVE is on
+// it) is what excludes them in practice. This test dispatches the literal, undecomposed "SMOVE"
+// name directly (ApplyReplicatedCommand, not a real peer flow) specifically to exercise the
+// unique_shard_cnt_/keys.Size() gate as its own, second, independent line of defense: both keys
+// carry their own whole-key D here so that whichever one `keys.Front()` would return, a missing
+// keys.Size() check would still find SOMETHING to (wrongly) compare against and drop, if it were
+// ever reached.
 //
-// Falsifying: removing the `keys.Size() != 1u` check in ShouldDropExpiredDelta (transaction.cc)
-// makes the counter advance (observed: by two, one per shard-local hop SMOVE's own multi-key
-// dispatch takes on this shard) instead of staying flat.
+// Falsifying: removing BOTH the allow-list check AND the `keys.Size() != 1u` check together
+// (ShouldDropExpiredDelta, transaction.cc) makes the counter advance (observed: by two, one per
+// shard-local hop SMOVE's own multi-key dispatch takes on this shard) instead of staying flat --
+// removing only `keys.Size()` has no observable effect on its own, since the allow-list already
+// excludes "SMOVE" first.
 TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnMultiKeySameShardDelta) {
   const size_t num_shards = shard_set->size();
   const std::string src = FindKeyOnShard("evd_j_smove_src_", 0, num_shards);
@@ -5557,6 +5576,65 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnMultiKeySameShardDelta) {
       << "a same-shard multi-key delta must never be vetoed";
   EXPECT_EQ(TombMetaOf(src), src_deadline_ms) << "the veto must never have touched either key";
   EXPECT_EQ(TombMetaOf(dst), dst_deadline_ms);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- the Critical regression this allow-list exists to fix: gating the veto on
+// kUnguarded alone (its original shape) let it drop ANY single-key unguarded handler's callback,
+// including container-element deltas that were never a string in the first place. Against a
+// STRING's own whole-key deadline tombstone with I.ms < D, a container delta targeting that SAME
+// key name is a guaranteed misfire if ever vetoed -- the author's own copy could only have
+// journaled it against a value that was not the expiring string -- and at least two of the five
+// handlers below crash outright on the resulting skipped callback rather than merely misapplying:
+// BF.ADD (bloom_family.cc) and LPOP (list_family.cc) each unconditionally dereference an empty
+// vector on the default-constructed OpResult<vector<...>> a skipped callback leaves behind. None
+// of the five below is on IsStringOnlyDelta's own allow-list (multimaster_lww.h/.cc), so all five
+// must apply normally here, never vetoed, never crashing.
+//
+// Falsifying: removing IsStringOnlyDelta's own check in ShouldDropExpiredDelta (transaction.cc)
+// reproduces the crash directly over this same in-process path: BF.ADD and LPOP crash the whole
+// test binary outright (not merely fail an assertion) the instant either is wrongly vetoed, so
+// this falsification is run in isolation, by name, one command at a time.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNonStringContainerDeltasApplySafelyAgainstStringTombstone) {
+  constexpr uint32_t kPeerIdx = 210;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000210");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  struct Case {
+    std::string_view name;
+    std::vector<std::string> extra_args;
+  };
+  const std::vector<Case> cases = {
+      {"lpop", {}}, {"rpush", {"y"}}, {"bf.add", {"item"}}, {"sadd", {"m"}}, {"hset", {"f", "v"}},
+  };
+
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    const std::string key = absl::StrCat("evd_nonstring_", absl::AsciiStrToLower(c.name));
+    const uint64_t deadline_ms = TEST_current_time_ms + 10;
+    ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+    AdvanceTime(50);
+    ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
+    ASSERT_EQ(TombMetaOf(key), deadline_ms) << "sanity: a whole-key D, I.ms below will be < it";
+
+    const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+    const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;
+    std::vector<std::string> args{std::string(c.name), key};
+    args.insert(args.end(), c.extra_args.begin(), c.extra_args.end());
+
+    auto res = ApplyReplicatedCommand(args, kPeerIdx, author_mvcc, /*lww_guard=*/true);
+    EXPECT_EQ(res, facade::DispatchResult::OK) << "must apply, not crash";
+    EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped) << c.name << " must never be vetoed";
+  }
+
+  EXPECT_EQ(Run({"exists", "evd_nonstring_rpush"}).GetInt(), 1);
+  EXPECT_THAT(Run({"lrange", "evd_nonstring_rpush", "0", "-1"}).GetVec(),
+              testing::ElementsAre("y"));
+  EXPECT_EQ(Run({"bf.exists", "evd_nonstring_bf.add", "item"}).GetInt(), 1);
+  EXPECT_EQ(Run({"sismember", "evd_nonstring_sadd", "m"}).GetInt(), 1);
+  EXPECT_EQ(Run({"hget", "evd_nonstring_hset", "f"}), "v");
+  // LPOP against an absent key is a normal no-op (nil) either way -- its own regression signal is
+  // purely "did not crash and was not counted as a drop", both already asserted in the loop above.
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -11619,6 +11697,27 @@ TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
 //       Result: failed to die.
 //    Error msg:
 //   [  DEATH   ]
+//
+// drakeydb: P4-5 -- also the regression pin for ShouldDropExpiredDelta's own SQUASHER-role guard
+// (transaction.cc): the OUTER squasher-container transaction's own RunCallback invocation
+// (MultiCommandSquasher::ExecuteSquashed's own ScheduleSingleHop) reaches ShouldDropExpiredDelta
+// too, built over the client's own EXEC command here -- never a string-only delta name -- unlike
+// ShouldDropForLww, which never reaches its own GetShardArgs call for a squasher's own name at all
+// (never kSingleKey either). IsStringOnlyDelta's own allow-list check already excludes "EXEC" on
+// its own (checked before the SQUASHER guard), so removing the SQUASHER guard ALONE, with the
+// allow-list intact, changes nothing observable here -- confirmed directly: this test still
+// passes with only that guard removed. Removing BOTH checks together is what reaches GetShardArgs
+// on the squasher container itself, which DCHECKs against exactly that (transaction.cc's own
+// GetShardArgs) -- this test then died with the WRONG message (`Check failed: !multi_ ||
+// multi_->role != SQUASHER`) instead of the one asserted above, and EXPECT_DEBUG_DEATH reported
+// that as "died but not with expected error". The SQUASHER guard remains as an independent second
+// layer against any OTHER squasher caller's own outer name (MultiCommandSquasher has two others,
+// the EVAL-squash and pipeline-batch paths, main_service.cc) ever landing on the allow-list, which
+// none of today's do. The squashed-stub sub-transaction itself never reaches either veto
+// regardless of any of this: it runs through RunSquashedMultiCb, not RunCallback, and that path
+// consults neither veto at all -- a guarded stub trips its own DFATAL tripwire above instead, and
+// an unguarded one (mvcc==0, the only shape a classic Redis/KeyDB link's own squashed EVAL can
+// carry) never needed comparing in the first place.
 TEST_F(OriginJournalFamilyTest, GuardedSquashedStubTripwireFiresInDebug) {
   ::testing::FLAGS_gtest_death_test_style = "threadsafe";
   constexpr uint32_t kPeerOrigin = 11;
@@ -11670,20 +11769,6 @@ TEST_F(OriginJournalFamilyTest, ZeroMvccSquashedStubNeverTripsTripwire) {
   EXPECT_EQ(facade::DispatchResult::OK, exec_res);
   EXPECT_EQ("v", Run({"get", "zero-mvcc-squash-key"}));
 }
-
-// drakeydb: P4-5 -- GuardedSquashedStubTripwireFiresInDebug (above) is also this fix's own
-// regression pin, not only ShouldDropForLww's: the OUTER squasher-container transaction's own
-// RunCallback invocation (MultiCommandSquasher::ExecuteSquashed's ScheduleSingleHop) reaches
-// ShouldDropExpiredDelta too -- an UNGUARDED name is the kUnguarded fail-safe default its own
-// classify check looks FOR, unlike ShouldDropForLww's kSingleKey-only reach, so without an
-// explicit guard it does NOT bail before calling GetShardArgs on that container, which DCHECKs
-// against ever being called on one (transaction.cc's own GetShardArgs). Confirmed directly while
-// building this veto: removing ShouldDropExpiredDelta's own `if (multi_ && multi_->role ==
-// SQUASHER) return false;` guard (transaction.cc) makes GuardedSquashedStubTripwireFiresInDebug
-// die with the WRONG message (`Check failed: !multi_ || multi_->role != SQUASHER`, from
-// GetShardArgs) instead of its own expected "multi-master LWW guard reached RunSquashedMultiCb"
-// -- EXPECT_DEBUG_DEATH reports that as "died but not with expected error" -- captured verbatim
-// in the task report.
 
 namespace {
 // drakeydb: Phase 3 T4 -- like OriginCapturingConsumer above, but also captures entry_flags and
