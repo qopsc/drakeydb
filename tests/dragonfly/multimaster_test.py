@@ -2506,6 +2506,72 @@ async def test_stamps_survive_full_sync_and_restart(df_factory, tmp_path):
         ), f"{key}: restart changed the origin: {stamp_after} != {stamps_before[key]}"
 
 
+# drakeydb: P4-5 -- end-to-end proof that a tombstone's own whole-key deadline D (its "meta" word,
+# mvcc.h) survives both an in-process DEBUG RELOAD and a real SAVE+restart, carried by
+# RDB_OPCODE_DF_TOMBSTONES_V2 (rdb_extensions.h) -- the legacy opcode 225 carries no meta at all,
+# so without V2 this would regress to D-16 (ISSUE-REGISTER.md): a long-lived key's tombstone GC
+# deadline floors on its own write-time stamp instead of its own later expiry, starving the
+# resurrection-protection window `--multi_master_tombstone_ttl` is meant to provide.
+#
+# `--multi_master_tombstone_ttl` is set well BELOW the key's own PX here specifically so the
+# regression would be externally observable, not just a wrong number: without meta, this
+# tombstone would be born already GC-eligible (write_time + tiny_ttl is behind the key's own,
+# much later expiry) and the idle-task GC could reap it before this test ever gets to look.
+async def test_tombstone_meta_survives_debug_reload_and_restart(df_factory, tmp_path):
+    ttl_seconds = 5
+    a_args = active_args(
+        dir=str(tmp_path / "a"),
+        dbfilename="dump",
+        multi_master_tombstone_ttl=ttl_seconds,
+    )
+    a = df_factory.create(**a_args)
+    a.start()
+    c_a = a.client()
+
+    key_px_ms = 1500
+    await c_a.execute_command("set", "k", "v", "px", key_px_ms)
+    # The exact absolute deadline D this key's own expiry will tombstone at -- read back rather
+    # than approximated from a wall-clock sample taken around the SET, so the assertions below
+    # compare against the server's own authoritative value, not a racy estimate of it.
+    deadline_ms = int(await c_a.execute_command("pexpiretime", "k"))
+    assert deadline_ms > 0
+
+    @assert_eventually(timeout=30)
+    async def tombstoned():
+        fields = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+        assert fields["state"] == "tombstone", fields
+
+    await tombstoned()
+    assert not await _exists(c_a, "k")
+
+    def _check_tombstone_fields(fields: dict, where: str):
+        assert fields["state"] == "tombstone", f"{where}: {fields}"
+        assert int(fields["meta"]) == deadline_ms, f"{where}: meta drifted from D: {fields}"
+        assert int(fields["gc_at_ms"]) == deadline_ms + ttl_seconds * 1000, (
+            f"{where}: gc_at_ms must be D + ttl, not a bare write-time+ttl floor "
+            f"(the D-16 shape): {fields}"
+        )
+
+    fields_before = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    _check_tombstone_fields(fields_before, "before any round trip")
+
+    # Leg 1: an in-process DEBUG RELOAD (SAVE into memory, flush, LOAD back) on the same node.
+    assert await c_a.execute_command("debug", "reload")
+    fields_after_reload = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    _check_tombstone_fields(fields_after_reload, "after DEBUG RELOAD")
+
+    # Leg 2: a real SAVE, then a full process restart against the SAME --dir/--dbfilename, so the
+    # auto-loaded snapshot at boot is the one this test just wrote -- the actual RDB_OPCODE_DF_
+    # TOMBSTONES_V2 bytes on disk, not merely an in-memory round trip.
+    assert await c_a.execute_command("SAVE")
+    a.stop()
+    a.start()
+    c_a2 = a.client()
+    await wait_available_async(c_a2)
+    fields_after_restart = _parse_mvcc(await c_a2.execute_command("debug", "mvcc", "k"))
+    _check_tombstone_fields(fields_after_restart, "after SAVE + restart")
+
+
 # ---- Phase 4: streaming LWW guard (P4-4, Task A13) ----
 #
 # End-to-end, socket-level proof of the streaming (stable-sync) LWW guard: the per-link bit
