@@ -6256,15 +6256,18 @@ TEST_F(MvccStoreTest,
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- D-20 fix, a same-shard SORT ... STORE empty result (OpStore's `len == 0`
-// branch, generic_family.cc): an empty result deletes only a LIVE destination; when the
-// destination is already absent, this fix installs the tombstone instead.
+// drakeydb: P4-5 -- SORT ... STORE no longer calls RecordAbsentKeyRemoval at all (OpStore's own
+// comment, generic_family.cc): this receiver's own empty result comes from RECOMPUTING the sort
+// against its OWN copy of the source, so it proves nothing about the author's own result -- a
+// member-TTL expiry during lag, or a third peer's write to the source combined with a LIMIT, can
+// make the author's own result non-empty (dst LIVE at X there) while this receiver's own
+// recompute is empty. Installing a tombstone here would tie with that live value once the
+// tombstone bit is masked, favoring the WRONG side on a later full sync. SORT ... STORE is a
+// D-18 recipe, like MOVE.
 //
-// Falsifying: commenting out the RecordAbsentKeyRemoval call in OpStore's `len == 0` branch
-// (the `else` arm, generic_family.cc) makes the `StampOf(dst)` assertion below observe no
-// tombstone at all.
-TEST_F(MvccStoreTest,
-       SortStoreLwwOfAnAbsentEmptyResultDestinationInstallsAnExplicitTombstoneAtTheIncomingStamp) {
+// Falsifying: restoring the RecordAbsentKeyRemoval call in OpStore's `len == 0` branch (the
+// `else` arm, generic_family.cc) makes `EXPECT_FALSE(StampOf(dst).has_value())` below fail.
+TEST_F(MvccStoreTest, SortStoreLwwOfAnAbsentEmptyResultDestinationInstallsNoTombstone) {
   const size_t num_shards = shard_set->size();
   const std::string src = FindKeyOnShard("sort_lww_src_", 0, num_shards);
   const std::string dst = FindKeyOnShard("sort_lww_dst_", 0, num_shards);
@@ -6272,8 +6275,8 @@ TEST_F(MvccStoreTest,
   Run({"del", src, dst});
   // `src` must actually EXIST as a container, or OpFetchSortEntries returns KEY_NOTFOUND and
   // SortGeneric replies with an empty array WITHOUT ever calling OpStore at all (generic_family.cc
-  // ~:2965-2973) -- this fix is unreachable that way. `LIMIT 0 0` instead shrinks GetSortRange's
-  // own [start_it, end_it) to nothing AFTER a successful, non-empty fetch, so OpStore itself still
+  // ~:2965-2973) -- unreachable that way. `LIMIT 0 0` instead shrinks GetSortRange's own
+  // [start_it, end_it) to nothing AFTER a successful, non-empty fetch, so OpStore itself still
   // runs and takes its own len==0 branch.
   Run({"rpush", src, "3", "1", "2"});
   ASSERT_EQ(Run({"exists", dst}).GetInt(), 0);
@@ -6285,11 +6288,10 @@ TEST_F(MvccStoreTest,
   // (above) for why a tiny raw counter gets refused as "born expired".
   const uint64_t kAuthorMvcc = (TEST_current_time_ms << MvccClock::kCounterBits) + 0x1300;
 
-  // Unlike RENAME/RENAMENX above, this SORT ... STORE genuinely SUCCEEDS (an empty result is
-  // still a valid outcome, not an error) -- so, unlike a failed command, its own auto-journal
-  // (revived by SortGeneric for the same-shard case) still fires and forwards this receiver's own
-  // verbatim "SORT ... STORE" entry downstream. That pre-existing forwarding re-journal is
-  // asserted directly below, in place of a zero-entries check.
+  // The command still genuinely SUCCEEDS (an empty result is a valid outcome, not an error), so
+  // its own auto-journal (revived by SortGeneric for the same-shard case) still fires and forwards
+  // this receiver's own verbatim "SORT ... STORE" entry downstream -- a pre-existing forwarding
+  // re-journal, unrelated to (and unaffected by) removing the tombstone install.
   MsetLwwJournalConsumer consumer;
   std::vector<uint32_t> consumer_ids(shard_set->size());
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
@@ -6303,20 +6305,33 @@ TEST_F(MvccStoreTest,
   auto res = ApplyReplicatedCommand({"sort", src, "LIMIT", "0", "0", "STORE", dst}, kPeerIdx,
                                     kAuthorMvcc, /*lww_guard=*/true);
   EXPECT_EQ(res, facade::DispatchResult::OK);
-
-  auto tomb = StampOf(dst);
-  ASSERT_TRUE(tomb.has_value());
-  EXPECT_EQ(*tomb, (MvccStamp{kAuthorMvcc, peer_hash}).AsTombstone());
-  EXPECT_EQ(TombMetaOf(dst), kTombMetaNone);
+  EXPECT_FALSE(StampOf(dst).has_value())
+      << "SORT ... STORE must never install a tombstone -- this receiver's own recompute proves "
+         "nothing about the author's own result";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 
   std::move(unregister_consumer).Invoke();
-  util::fb2::LockGuard lk(consumer.mu_);
-  ASSERT_EQ(consumer.entries.size(), 1u)
-      << "the receiver's own pre-existing forwarding re-journal of the successful SORT command "
-         "itself -- unrelated to, and not journaled by, RecordAbsentKeyRemoval's own install";
-  EXPECT_EQ(consumer.entries[0].args[0], "SORT");
+  {
+    util::fb2::LockGuard lk(consumer.mu_);
+    ASSERT_EQ(consumer.entries.size(), 1u)
+        << "the receiver's own pre-existing forwarding re-journal of the successful SORT command "
+           "itself -- unrelated to any tombstone install";
+    EXPECT_EQ(consumer.entries[0].args[0], "SORT");
+  }
+
+  // An older in-flight write to dst must still apply -- there is no tombstone to (wrongly) reject
+  // it against.
+  constexpr uint32_t kWriterIdx = 94;
+  const uint64_t writer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000094");
+  RegisterPeerOriginHash(kWriterIdx, writer_hash);
+  const uint64_t older_mvcc = kAuthorMvcc - 1000;
+  auto w_res =
+      ApplyReplicatedCommand({"set", dst, "w"}, kWriterIdx, older_mvcc, /*lww_guard=*/true);
+  EXPECT_EQ(w_res, facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"get", dst}), "w") << "no phantom tombstone must block this write";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
 // drakeydb: P4-5 -- an unguarded link must leave today's behaviour EXACTLY unchanged:
@@ -6348,16 +6363,19 @@ TEST_F(MvccStoreTest, RecordAbsentKeyRemovalInstallsNothingWhenTheGuardIsOff) {
 }
 
 // drakeydb: P4-5 -- the mvcc==0 sibling of the test above, on its OWN key: a classic Redis/KeyDB
-// link, or a DFLY link to a non-active peer, never carries a real author stamp, and
-// LwwGuardActive fails open on that regardless of the guard bit. IncomingStamp's own `mvcc == 0`
-// check (multimaster_lww.cc) is what protects this case -- pre-existing, independently tested --
-// not RecordAbsentKeyRemoval's own LwwGuardActive check, so this is its own test rather than a
-// second sub-case sharing a key with the test above (whose own falsification would otherwise
-// leave a stray tombstone behind for this one to trip over too).
+// link, or a DFLY link to a non-active peer, never carries a real author stamp. TWO independent,
+// pre-existing checks both cover this case: LwwGuardActive's own `incoming_mvcc != 0` clause
+// (multimaster_lww.h, checked first, inside RecordAbsentKeyRemoval itself) and IncomingStamp's
+// own `mvcc == 0` early return (multimaster_lww.cc, reached only if the first check somehow did
+// not fire) -- so this is its own test rather than a second sub-case sharing a key with the test
+// above (whose own falsification would otherwise leave a stray tombstone behind for this one to
+// trip over too).
 //
-// Falsifying: N/A as a revert of THIS helper's own code -- IncomingStamp's mvcc==0 guard belongs
-// to earlier (P4-4) work and is exercised directly by UnstampedIncomingNeverGuarded elsewhere in
-// this file; this test instead pins that RecordAbsentKeyRemoval correctly relies on it.
+// Falsifying: bypassing ONLY ONE of the two checks leaves the other one covering it -- observed
+// directly below. Bypassing BOTH simultaneously (and also the born-expired refusal, since a
+// Mvcc()==0 stamp's own MsPart() is 0, always born-expired against any real wall clock, so it
+// would otherwise refuse the install for an unrelated reason) makes
+// `EXPECT_FALSE(StampOf(key).has_value())` fail.
 TEST_F(MvccStoreTest, RecordAbsentKeyRemovalInstallsNothingForAnUnstampedIncomingMvcc) {
   const std::string key = FindKeyOnShard("del_lww_mvcc_zero_", 0, shard_set->size());
   ASSERT_EQ(Run({"exists", key}).GetInt(), 0);
@@ -6453,7 +6471,15 @@ TEST_F(MvccStoreTest, CopyOfAnAbsentSourceInstallsNoTombstone) {
 // makes `EXPECT_EQ(TombMetaOf(key), kTombMetaNone)` below fail -- the stale deadline survives.
 TEST_F(MvccStoreTest, DelLwwBornExpiredRefusalClearsStaleDeadlineMetaOnTheExistingTombstone) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
-  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+  // drakeydb: P4-5 -- zero the idle-task GC budget, like LocalExpiryBornExpiredKeepsTombstoneAnd-
+  // Counts above: without this, the heartbeat's own idle GC sweep could reap the tombstone this
+  // test builds (already GC-eligible after the AdvanceTime below) before the assertions on it run,
+  // flaking this test on a slow or loaded run.
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);
+  absl::Cleanup restore_ttl = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
 
   const std::string key = FindKeyOnShard("del_lww_born_expired_meta_", 0, shard_set->size());
   const uint64_t deadline_ms = TEST_current_time_ms + 10;
@@ -6490,6 +6516,51 @@ TEST_F(MvccStoreTest, DelLwwBornExpiredRefusalClearsStaleDeadlineMetaOnTheExisti
       << "the refused install must not change the existing tombstone's own stamp";
   EXPECT_EQ(TombMetaOf(key), kTombMetaNone)
       << "the author's own removal at X still proves the deadline no longer describes this key";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- a debug-build DCHECK crash: within ONE guarded command that lists the same
+// key twice (e.g. `DEL k k`), the first occurrence's own Del() call arms PerformDeletionAtomic's
+// zero-authority placeholder ({kTombstoneBit, 0}) for `k`, still uncommitted (this whole
+// command's own journal commit hasn't run yet -- it runs once, after the per-key loop). The
+// second occurrence then finds `k` absent (already deleted) and reaches RecordAbsentKeyRemoval's
+// own born-expired branch against that SAME placeholder: without `stored->Mvcc() != 0` in the
+// guard, `SetTombMeta` would run against it and hit its own DCHECK, which requires a genuinely
+// committed tombstone -- the placeholder is not one yet.
+//
+// Falsifying: removing the `stored->Mvcc() != 0` clause from RecordAbsentKeyRemoval's own
+// born-expired guard reproduces the DCHECK failure this test would otherwise catch (a debug-build
+// abort, not an ordinary gtest failure -- the exact crash text is captured verbatim alongside
+// this test's own falsification record).
+TEST_F(MvccStoreTest, DelLwwOfADuplicateKeyWithABornExpiredXDoesNotCrash) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);        // seconds; ttl_ms == 1000
+  absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 0);  // see the born-expired test above
+  absl::Cleanup restore_ttl = [] {
+    absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600);
+    absl::SetFlag(&FLAGS_multi_master_tombstone_gc_budget, 64);
+  };
+
+  const std::string key = FindKeyOnShard("del_lww_dup_key_born_expired_", 0, shard_set->size());
+  ASSERT_EQ(Run({"set", key, "v"}), "OK");
+  auto s_stamp = StampOf(key);
+  ASSERT_TRUE(s_stamp.has_value());
+  AdvanceTime(2000);  // now is 2000ms past S's own mint -- X (minted ~S) will be born-expired.
+
+  constexpr uint32_t kPeerIdx = 95;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a8a8-4000-8000-000000000095");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+  const uint64_t kXMvcc = s_stamp->Mvcc() + 100;  // strictly newer than S; still S's own ms bucket.
+
+  auto res = ApplyReplicatedCommand({"del", key, key}, kPeerIdx, kXMvcc, /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 0);
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value()) << "the first occurrence's own genuine delete must still commit";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_NE(tomb->Mvcc(), 0u)
+      << "must be a real committed tombstone, never the zero-authority placeholder";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }

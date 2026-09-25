@@ -499,12 +499,13 @@ class DbSlice {
   // OpRestore, Renamer::DeserializeDest, RdbLoader::ApplyMergeTombstoneOnShard's own no-live-key
   // fallthrough, and RecordAbsentKeyRemoval (generic_family.cc) -- must each consciously decide
   // what to supply, not fall back to a meta-less install by omission). Most callers supply a real
-  // incoming deadline D (tagged as an anchor unless the value's own type is OBJ_STRING -- every
-  // replayed removal of a string leaves an explicit tombstone, including one that finds the
-  // receiver had already lost the key itself (RecordAbsentKeyRemoval, the D-20 fix), so only a
-  // string's own D is a sound veto premise for a later re-create); RecordAbsentKeyRemoval's own
-  // calls pass kTombMetaNone instead -- an explicit delete carries no deadline for that veto to
-  // act on. ApplyMergeTombstoneOnShard's own fallthrough is itself
+  // incoming deadline D (tagged as an anchor unless the value's own type is OBJ_STRING -- most
+  // replayed removals of a string install an explicit tombstone, including one that finds the
+  // receiver had already lost the key itself (RecordAbsentKeyRemoval, the D-20 fix) -- MOVE and a
+  // same-shard SORT ... STORE are named exceptions that never call it, D-18, ISSUE-REGISTER.md --
+  // so only a string's own D is a sound veto premise for a later re-create);
+  // RecordAbsentKeyRemoval's own calls pass kTombMetaNone instead -- an explicit delete carries no
+  // deadline for that veto to act on. ApplyMergeTombstoneOnShard's own fallthrough is itself
   // reached by TWO different upstream sources, and its OTHER one (HandleTombstones' own install
   // lambda, rdb_load.cc) passes the tombstone opcode's own wire meta straight through:
   // kTombMetaNone for a 225 record (which carries none), or a V2 record's own trailing word.

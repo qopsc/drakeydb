@@ -145,9 +145,12 @@ static_assert(alignof(MvccStamp) == 8,
 // live key and explicit tombstone extra bytes for a word only some tombstones ever carry).
 // 0 means no meta: an explicit or legacy tombstone GCs on its own stamp alone, exactly as before
 // this word existed. Non-zero with bit 63 clear is a whole-key deadline D (ms) for a value that was
-// an OBJ_STRING -- every one of that type's replayed removals installs an explicit tombstone,
-// including one that finds the key already absent here (RecordAbsentKeyRemoval, generic_family.cc,
-// the D-20 fix), making D a sound veto premise for a later re-create. Bit 63 set marks an ANCHOR: a
+// an OBJ_STRING -- most of that type's replayed removals install an explicit tombstone, including
+// one that finds the key already absent here (RecordAbsentKeyRemoval, generic_family.cc, the D-20
+// fix), making D a sound veto premise for a later re-create. Named exceptions: MOVE and a
+// same-shard SORT ... STORE never call that install at all (D-18, ISSUE-REGISTER.md) -- the
+// receiver cannot prove the author's own outcome for either, so both can leave a stale D sitting
+// on a lagging receiver's own pre-existing tombstone. Bit 63 set marks an ANCHOR: a
 // member-TTL reap time R for the member-expiry reaper and the container-emptying helpers, but also
 // a whole-key deadline D for every non-string type's whole-key expiry and elapsed-on-arrival
 // install -- a container can also vanish through an ordinary delta well before D, so its own D is

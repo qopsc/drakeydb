@@ -574,13 +574,14 @@ class RdbLoader : protected RdbLoaderBase {
   //
   // drakeydb: P4-5 -- `meta`, mandatory: CreateObjectOnShard's own already-expired-incoming caller
   // passes `item->expire_ms` (the peer's whole-key deadline D, tagged as an anchor unless the
-  // loaded value's own type is OBJ_STRING -- every replayed removal of a string leaves an explicit
-  // tombstone, including one that finds the receiver had already lost the key itself
-  // (RecordAbsentKeyRemoval, generic_family.cc, the D-20 fix), so only a string's D is a sound veto
-  // premise); HandleTombstones' own caller passes kTombMetaNone for a 225 record, or the record's
-  // own trailing wire word for a V2 one. Clamped, at each install point below, against `now_ms` --
-  // the CALLER's own
-  // already-known clock reading for CreateObjectOnShard's merge-load caller (its own
+  // loaded value's own type is OBJ_STRING -- most replayed removals of a string install an
+  // explicit tombstone, including one that finds the receiver had already lost the key itself
+  // (RecordAbsentKeyRemoval, generic_family.cc, the D-20 fix) -- MOVE and a same-shard
+  // SORT ... STORE are named exceptions that never call it, D-18, ISSUE-REGISTER.md -- so only a
+  // string's D is a sound veto premise); HandleTombstones' own caller passes kTombMetaNone for a
+  // 225 record, or the record's own trailing wire word for a V2 one. Clamped, at each install
+  // point below, against `now_ms` -- the CALLER's own already-known clock reading for
+  // CreateObjectOnShard's merge-load caller (its own
   // db_cntx.time_now_ms, threaded from LoadItemsBuffer's own single per-batch read);
   // HandleTombstones' own `install` lambda instead reads a fresh GetCurrentTimeMs() here, having
   // no pre-existing per-key clock of its own to reuse. D <= the reading passed by construction for

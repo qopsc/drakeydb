@@ -269,10 +269,11 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
 
 // drakeydb: P4-5 -- meta for a peer-sourced RESTORE/rename write whose own deadline has already
 // elapsed: `deadline_ms` tagged with kTombMetaAnchorOnly unless the payload's own value is a
-// string, a bare deadline for a string. Every replayed removal of a string leaves an explicit
+// string, a bare deadline for a string. Most replayed removals of a string install an explicit
 // tombstone, including one that finds the receiver had already lost the key itself
-// (RecordAbsentKeyRemoval, below, the D-20 fix), so only a string's own whole-key D is a sound
-// veto premise for a later re-create; every other type can also be emptied by an ordinary delta
+// (RecordAbsentKeyRemoval, below, the D-20 fix) -- MOVE and a same-shard SORT ... STORE are named
+// exceptions, D-18, ISSUE-REGISTER.md -- so only a string's own whole-key D is a sound veto
+// premise for a later re-create; every other type can also be emptied by an ordinary delta
 // well before D. The type is the payload's own first byte -- DumpValue (rdb_save.cc) writes
 // `WriteOpcode(type)` before anything else, so byte 0 of any DUMP-format payload (RESTORE's own
 // wire format) is always the RDB type byte, with no need to deserialize the rest to read it.
@@ -417,20 +418,31 @@ OpStatus OpPersist(const OpArgs& op_args, string_view key);
 // returning/continuing without touching its own reply counter or RecordJournal.
 //
 // CALLER CONTRACT: only call this when the replayed command's own success at the author
-// PROVES a removal happened -- not merely that this receiver doesn't have `key`. A command that
-// the author journals regardless of outcome (MOVE, D-18) or that can succeed as a genuine no-op
-// against a key it never touches (RENAME/COPY onto/from the same key) fails that proof: the
-// author's own FindMutable still arms and restamps a LIVE key to the wire mvcc through the
-// AutoUpdater even when nothing was actually removed, so a receiver that installs a tombstone for
-// that same stamp ends up tombstoned while the author (and every other receiver still holding the
-// key live) converges on a live value at the identical stamp -- order-equal once the tombstone bit
-// is masked, so a later full sync's own tie permanently favors the WRONG (tombstoned) side. Callers
-// that satisfy the contract: OpDelV2 below (DEL/UNLINK, and GETDEL rewritten pre-dispatch to DEL --
-// multimaster_lww.h) for both an absent key and one FindMutable just reaped; OpRen's same-shard
-// RENAME/RENAMENX source, gated on `from_key != to_key` (a self-rename is always a live no-op);
-// Renamer::SerializeSrc's cross-shard twin, gated on `!do_copy_` (COPY never removes its source);
-// and OpStore's SORT ... STORE empty-result destination. OpMove does NOT call this (see its own
-// comment) -- MOVE is a D-18 recipe precisely because it fails this contract on every outcome.
+// PROVES a removal happened -- not merely that this receiver doesn't have `key`. Two distinct
+// ways a caller can fail that proof:
+//   1. The command can succeed as a genuine no-op against a key it never actually removed. MOVE
+//      (journals on every non-error outcome, including KEY_EXISTS/KEY_NOTFOUND) and a same-key
+//      RENAME (a real, successful, auto-journaled no-op) both restamp this way: the author's own
+//      FindMutable still arms and restamps a LIVE key to the wire mvcc through the AutoUpdater
+//      even when nothing was actually removed, so a receiver that installs a tombstone for that
+//      same stamp ends up tombstoned while the author (and every other receiver still holding the
+//      key live) converges on a live value at the identical stamp -- order-equal once the
+//      tombstone bit is masked, so a later full sync's own tie permanently favors the WRONG
+//      (tombstoned) side.
+//   2. The command's own effect on `key` at THIS receiver was never derived from the author's own
+//      outcome at all, because this receiver recomputed it independently. A same-shard
+//      SORT ... STORE reaches its own destination by re-running the sort against this receiver's
+//      OWN copy of the source -- an empty result here proves nothing about whether the author's
+//      own result (against ITS OWN copy) was also empty.
+// COPY is excluded for a simpler, unrelated reason: it never removes its source, full stop --
+// `COPY k k` is rejected outright by GenericFamily::Copy (so a self-copy can't even reach this
+// code), and Renamer::SerializeSrc's own source read is FindReadOnly, never FindMutable, so no
+// restamp of case 1 above happens for it either way.
+// Callers that satisfy the contract: OpDelV2 below (DEL/UNLINK, and GETDEL rewritten pre-dispatch
+// to DEL -- multimaster_lww.h) for both an absent key and one FindMutable just reaped; OpRen's
+// same-shard RENAME/RENAMENX source, gated on `from_key != to_key`; Renamer::SerializeSrc's
+// cross-shard twin, gated on `!do_copy_`. OpMove and OpStore do NOT call this (see their own
+// comments) -- both are D-18 recipes precisely because they fail this contract.
 void RecordAbsentKeyRemoval(const OpArgs& op_args, DbIndex db_ind, string_view key) {
   const DbContext& db_cntx = op_args.db_cntx;
   if (!LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc))
@@ -444,15 +456,20 @@ void RecordAbsentKeyRemoval(const OpArgs& op_args, DbIndex db_ind, string_view k
   if (!MergeAccepts(stored, *incoming))
     return;
   const MvccStamp new_tomb = incoming->AsTombstone();
-  // drakeydb: P4-5 -- a refused (born-expired) install still proves the author's own removal
-  // happened strictly after whatever deadline the EXISTING tombstone's own meta describes (the
-  // MergeAccepts check above already established stored < X): clear that stale D so a later
-  // expired-delta veto can never act on it, even though the tombstone's own stamp keeps its old,
-  // now meta-less value (the install itself is refused, so the stamp cannot advance to X here).
-  // Recomputes the SAME born-expired decision InstallAbsentKeyTombstone makes below (its own
-  // `meta` clamps to itself at kTombMetaNone regardless, so there is nothing to duplicate wrongly)
-  // rather than threading a return value through it.
-  if (stored.has_value() && stored->IsTombstone() &&
+  // drakeydb: P4-5 -- a refused (born-expired) install still disproves the EXISTING tombstone's
+  // own deadline meta, even though the install itself never happens: that meta claims "the value
+  // vanished at D", a premise an EXPLICIT removal at X -- MergeAccepts(stored, X) above already
+  // ordered X strictly above `stored`, regardless of where X's own timestamp falls relative to D
+  // -- disproves outright, so the deadline no longer describes this key and must be cleared, or a
+  // later expired-delta veto could wrongly act on it. `stored->Mvcc() != 0` excludes
+  // PerformDeletionAtomic's own zero-authority placeholder ({kTombstoneBit, 0}, installed
+  // synchronously before its own journal commit lands): reachable mid-callback when the SAME key
+  // appears twice in one guarded command (e.g. `DEL k k`) and the first occurrence already armed
+  // it -- SetTombMeta's own DCHECK requires a genuinely committed tombstone, and this placeholder
+  // is not one yet. Recomputes the SAME born-expired decision InstallAbsentKeyTombstone makes
+  // below (its own `meta` clamps to itself at kTombMetaNone regardless, so there is nothing to
+  // duplicate wrongly) rather than threading a return value through it.
+  if (stored.has_value() && stored->IsTombstone() && stored->Mvcc() != 0 &&
       DbSlice::TombstoneBornExpired(new_tomb, kTombMetaNone, db_cntx.time_now_ms)) {
     db_slice.SetTombMeta(db_ind, key, kTombMetaNone);
   }
@@ -1424,9 +1441,10 @@ OpStatus OpMove(const OpArgs& op_args, string_view key, DbIndex target_db) {
   auto from_res = db_slice.FindMutable(op_args.db_cntx, key);
   if (!IsValid(from_res.it)) {
     // drakeydb: P4-5 -- deliberately NO RecordAbsentKeyRemoval call here: MOVE's own hand-journal
-    // (below in this file) fires on every outcome, including KEY_EXISTS/KEY_NOTFOUND, so a
-    // receiver can never tell from this entry alone whether the author's MOVE actually removed
-    // anything -- D-18, ISSUE-REGISTER.md (RecordAbsentKeyRemoval's own comment, above Renamer).
+    // (below in this file, gated on `res != OpStatus::IO_ERROR`) fires on every NON-ERROR
+    // outcome, including KEY_EXISTS/KEY_NOTFOUND, so a receiver can never tell from this entry
+    // alone whether the author's MOVE actually removed anything -- D-18, ISSUE-REGISTER.md
+    // (RecordAbsentKeyRemoval's own comment, above Renamer).
     return OpStatus::KEY_NOTFOUND;
   }
 
@@ -2529,14 +2547,13 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
         RecordJournal(op_args, "DEL"sv, ArgSlice{key});
       }
     } else {
-      // drakeydb: P4-5 -- D-20 fix: `key` (the STORE destination) is already absent here. A
-      // same-shard SORT ... STORE reaches this replayed via the runtime-revived, verbatim
-      // auto-journaled SORT command (RenameGeneric's own kUnguarded pattern, above, applies here
-      // too -- see RecordAbsentKeyRemoval's own comment). A hand-journaled (cross-shard) author
-      // never reaches this branch with anything to journal: it only ever emits "DEL key" when
-      // `it_res.it` WAS valid, above -- and that DEL is a plain guarded entry, so a downstream
-      // receiver that later finds `key` absent handles it via OpDelV2 (site 1), not here.
-      RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, key);
+      // drakeydb: P4-5 -- deliberately NO RecordAbsentKeyRemoval call here: `key` (the STORE
+      // destination) is already absent, but this receiver's own empty result comes from
+      // RECOMPUTING the sort against its OWN copy of the source -- a member-TTL expiry during
+      // lag, or a third peer's write to the source combined with a LIMIT, can make the author's
+      // own result non-empty (dst LIVE at X there) while this receiver's own recompute is empty,
+      // so an empty result here proves nothing about the author's own result. SORT ... STORE is a
+      // D-18 recipe, like MOVE (see its own comment).
     }
     return 0;
   }

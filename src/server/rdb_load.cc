@@ -3866,10 +3866,12 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
           table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
       // drakeydb: P4-5 -- meta = item->expire_ms, the peer's own whole-key deadline D (D-16,
       // ISSUE-REGISTER.md), tagged as an anchor unless the loaded value `pv` is itself a string:
-      // every replayed removal of a string leaves an explicit tombstone, including one that finds
-      // the receiver had already lost the key itself (RecordAbsentKeyRemoval, generic_family.cc,
-      // the D-20 fix), so only a string's own whole-key D is a sound veto premise for a later
-      // re-create -- every other type can also be emptied by an ordinary delta well before D.
+      // most replayed removals of a string install an explicit tombstone, including one that
+      // finds the receiver had already lost the key itself (RecordAbsentKeyRemoval,
+      // generic_family.cc, the D-20 fix) -- MOVE and a same-shard SORT ... STORE are named
+      // exceptions that never call it, D-18, ISSUE-REGISTER.md -- so only a string's own whole-key
+      // D is a sound veto premise for a later re-create -- every other type can also be emptied by
+      // an ordinary delta well before D.
       // `pv` is already fully materialized above (FromOpaque), so ObjType() is available with no
       // extra parse, unlike OpRestore/
       // Renamer::DeserializeDest's own elapsed branches (generic_family.cc), which never otherwise
