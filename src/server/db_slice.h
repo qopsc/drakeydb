@@ -488,15 +488,16 @@ class DbSlice {
   // Set, OpRestore, Renamer::DeserializeDest, and RdbLoader::ApplyMergeTombstoneOnShard's own
   // no-live-key fallthrough -- and every one of them must consciously decide what to supply, not
   // fall back to a meta-less install by omission). Most callers supply a real incoming deadline D
-  // (tagged as an anchor when the value could only have been emptied by member expiry --
-  // container_utils::MemberTtlOnlyContainer); ApplyMergeTombstoneOnShard's own fallthrough is
-  // itself reached by TWO different upstream sources, and its OTHER one (an RDB_OPCODE_DF_
-  // TOMBSTONES record, whose wire format carries no meta at all yet) passes kTombMetaNone through
-  // explicitly. Clamped via mvcc.h's ClampPeerTombMetaDeadline (which preserves an anchor's own
-  // bit 63 -- see its own comment) before being forwarded to SetTombstone: every caller reaches
-  // this method because the incoming deadline has ALREADY elapsed (D <= now by construction), so
-  // a genuine D never clamps -- only a corrupt or hostile peer value claiming a future deadline
-  // does. kTombMetaNone clamps to itself regardless -- a harmless no-op.
+  // (tagged as an anchor unless the value's own type is OBJ_STRING -- only a string can vanish
+  // solely through an explicit, guarded, full-state delete, so only a string's own D is a sound
+  // veto premise for a later re-create); ApplyMergeTombstoneOnShard's own fallthrough is itself
+  // reached by TWO different upstream sources, and its OTHER one (an RDB_OPCODE_DF_TOMBSTONES
+  // record, whose wire format carries no meta at all yet) passes kTombMetaNone through explicitly.
+  // Clamped via mvcc.h's ClampPeerTombMetaDeadline (which preserves an anchor's own bit 63 -- see
+  // its own comment) before being forwarded to SetTombstone: every caller reaches this method
+  // because the incoming deadline has ALREADY elapsed (D <= now by construction), so a genuine D
+  // never clamps -- only a corrupt or hostile peer value claiming a future deadline does.
+  // kTombMetaNone clamps to itself regardless -- a harmless no-op.
   //
   // drakeydb: P4-5 -- `now_ms`, the CALLER's own already-known clock reading (the transaction's
   // db_cntx.time_now_ms, or the loader's own db_cntx.time_now_ms), not a second, independently-read

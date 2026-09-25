@@ -44,7 +44,6 @@ extern "C" {
 #include "core/string_set.h"
 #include "core/topk.h"
 #include "server/cluster/cluster_config.h"
-#include "server/container_utils.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/family_utils.h"
@@ -3488,14 +3487,18 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // to race this Disarm.
       MvccStamper::tlocal()->Disarm(db_index, key);
       // drakeydb: P4-5 -- clamp here, at install (mvcc.h's own ClampPeerTombMetaDeadline comment):
-      // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally. Clamps
-      // against db_cntx.time_now_ms, which is `now_ms` verbatim -- this method's own
-      // caller-supplied parameter, above (LoadItemsBuffer's own single per-batch clock reading,
-      // threaded through CreateObjectOnShard's own db_cntx), never a fresh, independently-read
-      // GetCurrentTimeMs(): using the SAME clock reading the caller's own elapsed decision was
-      // already made against makes the clamp provably inert for a genuine D (D <= that reading by
-      // construction), rather than racing a fresh read taken after this function's own yield
-      // (FindMutable's PreUpdateBlocking, above) against the same deadline.
+      // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally. This
+      // branch serves BOTH of this method's callers (see this function's own header comment above),
+      // and clamps against db_cntx.time_now_ms, which is `now_ms` verbatim -- this method's own
+      // caller-supplied parameter, above. For CreateObjectOnShard's merge-load caller that is
+      // LoadItemsBuffer's own single per-batch clock reading, threaded through its own db_cntx; for
+      // HandleTombstones' RDB_OPCODE_DF_TOMBSTONES `install` lambda it is a fresh
+      // GetCurrentTimeMs() read there (that caller always passes kTombMetaNone, so the clamp is a
+      // no-op for it regardless). Never a fresh, independently-read GetCurrentTimeMs() taken HERE:
+      // using the SAME clock reading the caller's own elapsed decision was already made against
+      // makes the clamp provably inert for a genuine D (D <= that reading by construction), rather
+      // than racing a fresh read taken after this function's own yield (FindMutable's
+      // PreUpdateBlocking, above) against the same deadline.
       db_slice->SetTombstone(db_index, key, stamp,
                              ClampPeerTombMetaDeadline(meta, db_cntx.time_now_ms));
     }
@@ -3840,15 +3843,16 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
       const bool resident_live =
           table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
       // drakeydb: P4-5 -- meta = item->expire_ms, the peer's own whole-key deadline D (D-16,
-      // ISSUE-REGISTER.md), tagged as an anchor when the loaded value `pv` could only have been
-      // emptied by member expiry (container_utils::MemberTtlOnlyContainer) -- `pv` is already
-      // fully materialized above (FromOpaque), so no extra parse is needed here, unlike
-      // OpRestore/Renamer::DeserializeDest's own elapsed branches (generic_family.cc), which never
-      // otherwise materialize the payload on this path. ApplyMergeTombstoneOnShard clamps the
-      // result to its own caller-supplied now_ms before either install point.
-      const uint64_t merge_tomb_meta = container_utils::MemberTtlOnlyContainer(pv)
-                                           ? (kTombMetaAnchorOnly | item->expire_ms)
-                                           : item->expire_ms;
+      // ISSUE-REGISTER.md), tagged as an anchor unless the loaded value `pv` is itself a string:
+      // only a string can vanish solely through an explicit, guarded, full-state delete, so only a
+      // string's own whole-key D is a sound veto premise for a later re-create -- every other type
+      // can also be emptied by an ordinary delta well before D. `pv` is already fully materialized
+      // above (FromOpaque), so ObjType() is available with no extra parse, unlike OpRestore/
+      // Renamer::DeserializeDest's own elapsed branches (generic_family.cc), which never otherwise
+      // materialize the payload on this path. ApplyMergeTombstoneOnShard clamps the result to its
+      // own caller-supplied now_ms before either install point.
+      const uint64_t merge_tomb_meta =
+          pv.ObjType() == OBJ_STRING ? item->expire_ms : (kTombMetaAnchorOnly | item->expire_ms);
       ApplyMergeTombstoneOnShard(db_slice, db_cntx.db_index, item->key,
                                  ExpiryTombstoneFor(incoming), resident_live, merge_tomb_meta,
                                  db_cntx.time_now_ms);

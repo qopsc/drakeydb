@@ -568,16 +568,18 @@ class RdbLoader : protected RdbLoaderBase {
   // `prime` holds a live entry for `key`.  No-op when the resident side wins the compare.
   //
   // drakeydb: P4-5 -- `meta`, mandatory: CreateObjectOnShard's own already-expired-incoming caller
-  // passes `item->expire_ms` (the peer's whole-key deadline D, tagged as an anchor when the
-  // loaded value could only have been emptied by member expiry -- container_utils::
-  // MemberTtlOnlyContainer); HandleTombstones' own RDB_OPCODE_DF_TOMBSTONES caller passes
-  // kTombMetaNone explicitly -- the V2 tombstone opcode is what will carry meta on the wire for
-  // that record kind. Clamped, at each install point below, against `now_ms` -- the CALLER's own
-  // already-known clock reading (CreateObjectOnShard's own db_cntx.time_now_ms, threaded from
-  // LoadItemsBuffer's own single per-batch read; HandleTombstones' own per-key
-  // db_cntx.time_now_ms), not a fresh, independently-read one taken inside this function: D <= that
-  // reading by construction for the expired-incoming caller, so only a corrupt/hostile value ever
-  // actually clamps (mvcc.h's own ClampPeerTombMetaDeadline comment).
+  // passes `item->expire_ms` (the peer's whole-key deadline D, tagged as an anchor unless the
+  // loaded value's own type is OBJ_STRING -- only a string can vanish solely through an explicit,
+  // guarded, full-state delete, so only a string's D is a sound veto premise); HandleTombstones'
+  // own RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- the V2 tombstone opcode
+  // is what will carry meta on the wire for that record kind. Clamped, at each install point below,
+  // against `now_ms` -- the CALLER's own already-known clock reading for CreateObjectOnShard's
+  // merge-load caller (its own db_cntx.time_now_ms, threaded from LoadItemsBuffer's own single
+  // per-batch read); HandleTombstones' own RDB_OPCODE_DF_TOMBSTONES `install` lambda instead reads
+  // a fresh GetCurrentTimeMs() here, having no pre-existing per-key clock of its own to reuse -- a
+  // meta-less clamp is a no-op regardless of which clock feeds it, so this does not matter for that
+  // caller. D <= the reading passed by construction for the expired-incoming caller, so only a
+  // corrupt/hostile value ever actually clamps (mvcc.h's own ClampPeerTombMetaDeadline comment).
   static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
                                          const MvccStamp& stamp, bool resident_live, uint64_t meta,
                                          uint64_t now_ms);

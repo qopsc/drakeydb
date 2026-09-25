@@ -2245,14 +2245,15 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
     return it;
   }
 
-  // drakeydb: P4-5 -- captured before Del() below erases the value: whether this container could
-  // only ever have been emptied by member expiry (container_utils::MemberTtlOnlyContainer). See
-  // this function's own RecordExpiryBlocking call, below, for why. Deliberately AFTER the early
-  // return above, not before it: every whole-key-TTL'd set/hash lookup reaches this point, on
-  // every node including a non-active one, so walking its members here unconditionally would pay
-  // that cost on every such lookup regardless of whether this call actually goes on to expire
-  // anything.
-  const bool member_ttl_only = container_utils::MemberTtlOnlyContainer(it->second);
+  // drakeydb: P4-5 -- captured before Del() below erases the value: whether this key's own value is
+  // a string. See this function's own RecordExpiryBlocking call, below, for why the type (not the
+  // member-TTL bookkeeping this used to read) decides the tombstone's meta class: a string can only
+  // ever vanish through an explicit, guarded, full-state delete, so its own whole-key D is a sound
+  // veto premise. Every other type can also be emptied by an ordinary delta (SREM, LPOP, HDEL,
+  // ZREM, member expiry...) well before D, then genuinely re-created before D -- a receiver that
+  // never saw that delta, only the later whole-key expiry, must not let its own bare D veto that
+  // re-create.
+  const bool is_string = it->second.ObjType() == OBJ_STRING;
 
   string scratch;
   // drakeydb: P4-3 Task 11 -- own a copy, not just a view into `it`. Del() below erases this entry
@@ -2315,20 +2316,16 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
     // born, since GC's own eligibility check only ever saw the tombstone's OWN stamp (T.ms), never
     // the value's much-later deadline.
     //
-    // drakeydb: P4-5 -- `member_ttl_only` (computed above, before Del()) tags the deadline as an
-    // anchor (kTombMetaAnchorOnly | D) instead of a bare whole-key D. GC eligibility is
-    // unaffected -- TombMetaMs strips the anchor bit back off, so this still reaps at D + ttl
-    // exactly as a bare D would -- but the meta CLASS a container's tombstone gets must be a
-    // function of the value's own replicated content alone (container_utils::
-    // MemberTtlOnlyContainer's own comment, container_utils.h), never of which reap path happens
-    // to win the race on a given node: two nodes that reap the SAME container's expiry through
-    // different paths (one whole-key, after D; the other via member-emptiness, before D) must
-    // agree that the resulting tombstone is an anchor on both sides, or the D-27 delta veto would
-    // drop a genuine re-create on the side that saw a bare D but not on the side that saw an
-    // anchor.
-    const uint64_t tomb_meta = member_ttl_only
-                                   ? (kTombMetaAnchorOnly | static_cast<uint64_t>(expire_time))
-                                   : static_cast<uint64_t>(expire_time);
+    // drakeydb: P4-5 -- non-string types (computed above, before Del(), as `is_string`) tag the
+    // deadline as an anchor (kTombMetaAnchorOnly | D) instead of a bare whole-key D. GC eligibility
+    // is unaffected -- TombMetaMs strips the anchor bit back off, so this still reaps at D + ttl
+    // exactly as a bare D would -- but only a string's own tombstone may veto a later re-create: a
+    // container's value can vanish through an ordinary delta well before D and be genuinely
+    // re-created before D too, which a receiver that only ever observes the later whole-key expiry
+    // (never the delta) cannot distinguish from the author's own original value surviving to D.
+    const uint64_t tomb_meta = is_string
+                                   ? static_cast<uint64_t>(expire_time)
+                                   : (kTombMetaAnchorOnly | static_cast<uint64_t>(expire_time));
     RecordExpiryBlocking(cntx, key, tomb_meta);
   }
 

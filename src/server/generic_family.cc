@@ -196,10 +196,10 @@ class RdbRestoreValue : protected RdbLoaderBase {
                                       const RestoreArgs& args, DbSlice* db_slice);
 
   // drakeydb: P4-5 -- parses `payload` into a materialized PrimeValue without installing it
-  // anywhere, so a caller that has already decided this write's own deadline has elapsed can
-  // still inspect the value's own content (its type, and for a set/hash its member-TTL layout --
-  // container_utils::MemberTtlOnlyContainer) before discarding it. Add() below calls this too,
-  // then installs the result; the two never parse the same payload independently.
+  // anywhere. Add() below is the sole caller: it parses via this, then installs the result. Kept
+  // as its own method (rather than inlined into Add()) so the parse and the install stay two
+  // separately-named steps; ElapsedRestoreTombMeta (below in this file) does NOT call this -- the
+  // meta-class decision there only needs the payload's own type byte, never a full deserialize.
   OpResult<PrimeValue> ParseOnly(string_view payload);
 
  private:
@@ -284,28 +284,23 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
 }
 
 // drakeydb: P4-5 -- meta for a peer-sourced RESTORE/rename write whose own deadline has already
-// elapsed: `deadline_ms` tagged with kTombMetaAnchorOnly when the payload's own value is a
-// container that could only ever have been emptied by member expiry
-// (container_utils::MemberTtlOnlyContainer), a bare deadline otherwise. The payload is not
-// materialized elsewhere on this path (OpRestore/Renamer::DeserializeDest both skip
-// RdbRestoreValue::Add entirely once Expired() is already known), so this parses it via
-// ParseOnly, inspects the result, then lets it go -- never installed, since the key stays
-// absent/deleted either way. A missing version or a parse failure falls back to a bare deadline,
-// the same meta a plain string (which never carries member TTLs) always gets.
+// elapsed: `deadline_ms` tagged with kTombMetaAnchorOnly unless the payload's own value is a
+// string, a bare deadline for a string. Only a string can vanish solely through an explicit,
+// guarded, full-state delete, so only a string's own whole-key D is a sound veto premise for a
+// later re-create; every other type can also be emptied by an ordinary delta well before D. The
+// type is the payload's own first byte -- DumpValue (rdb_save.cc) writes `WriteOpcode(type)`
+// before anything else, so byte 0 of any DUMP-format payload (RESTORE's own wire format) is always
+// the RDB type byte, with no need to deserialize the rest to read it. `version` being present (a
+// GetRdbVersion success, at either producer of this payload -- SerializeSrc for rename/copy, or the
+// client's own RESTORE argument) already guarantees `payload.size() > DUMP_FOOTER_SIZE`, so
+// `payload[0]` is always safe to read here; a missing version falls back to a bare deadline, the
+// same meta a plain string always gets anyway.
 uint64_t ElapsedRestoreTombMeta(string_view payload, optional<RdbVersion> version,
                                 uint64_t deadline_ms) {
-  if (!version)
+  if (!version || payload.empty())
     return deadline_ms;
-  RdbRestoreValue loader(*version);
-  auto pv_res = loader.ParseOnly(payload);
-  if (!pv_res) {
-    // SKIPPED means every member's own per-field TTL had also already elapsed by parse time
-    // (RdbLoaderBase::FromOpaque's rdb::errc::value_expired) -- the container was logically
-    // already empty, which the member-emptiness rule anchors unconditionally.
-    return pv_res.status() == OpStatus::SKIPPED ? (kTombMetaAnchorOnly | deadline_ms) : deadline_ms;
-  }
-  return container_utils::MemberTtlOnlyContainer(*pv_res) ? (kTombMetaAnchorOnly | deadline_ms)
-                                                          : deadline_ms;
+  return static_cast<uint8_t>(payload[0]) == RDB_TYPE_STRING ? deadline_ms
+                                                             : (kTombMetaAnchorOnly | deadline_ms);
 }
 
 [[nodiscard]] bool RestoreArgs::UpdateExpiration(int64_t now_msec) {
@@ -697,10 +692,9 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
         if (auto incoming = IncomingStamp(dctx.repl_mvcc, dctx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(dctx.db_index, dest_key_), *incoming)) {
           // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), tagged as an anchor
-          // when the payload's own value could only have been emptied by member expiry
-          // (ElapsedRestoreTombMeta, above in this file), clamped to this transaction's own
-          // dctx.time_now_ms at install (InstallAbsentKeyTombstone, db_slice.cc): D-16,
-          // ISSUE-REGISTER.md.
+          // unless the payload's own value is a string (ElapsedRestoreTombMeta, above in this
+          // file), clamped to this transaction's own dctx.time_now_ms at install
+          // (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
           const uint64_t tagged_meta =
               ElapsedRestoreTombMeta(serialized_value_->value, serialized_value_->version,
                                      restore_args.ElapsedDeadlineMs());
@@ -852,10 +846,9 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
           // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), tagged as an anchor
-          // when the payload's own value could only have been emptied by member expiry
-          // (ElapsedRestoreTombMeta, above in this file), clamped to this transaction's own
-          // db_cntx.time_now_ms at install (InstallAbsentKeyTombstone, db_slice.cc): D-16,
-          // ISSUE-REGISTER.md.
+          // unless the payload's own value is a string (ElapsedRestoreTombMeta, above in this
+          // file), clamped to this transaction's own db_cntx.time_now_ms at install
+          // (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
           const uint64_t tagged_meta =
               ElapsedRestoreTombMeta(payload, rdb_version, restore_args.ElapsedDeadlineMs());
           db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
