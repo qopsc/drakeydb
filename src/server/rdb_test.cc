@@ -4188,10 +4188,12 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
   EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the expired entry must still parse";
 
   std::optional<MvccStamp> got;
+  uint64_t got_meta = 0;
   size_t mismatches = 0;
   shard_set->Await(0, [&] {
     auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     got = db_slice.GetMvcc(0, std::string_view{"k"});
+    got_meta = db_slice.GetTombMeta(0, std::string_view{"k"});
     mismatches = db_slice.TEST_VerifyMvccTable(0);
   });
   ASSERT_TRUE(got.has_value()) << "the synthetic tombstone must be installed";
@@ -4199,7 +4201,59 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
   // peer's own incoming stamp (mvcc.h).
   EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
   EXPECT_TRUE(got->IsTombstone());
+  // drakeydb: P4-5 -- meta must be the peer's own whole-key deadline D (BuildExpiredStringEntry's
+  // own default expire_ms, 1000), never kTombMetaNone: D-16, ISSUE-REGISTER.md, applies to a
+  // merge-load's synthetic tombstone exactly as it does to a local expiry's own.
+  //
+  // Falsifying: passing kTombMetaNone instead of item->expire_ms at CreateObjectOnShard's own
+  // ApplyMergeTombstoneOnShard call site (rdb_load.cc) makes this observe kTombMetaNone instead.
+  EXPECT_EQ(got_meta, 1000u);
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold after the delete";
+}
+
+// drakeydb: P4-5 -- the ABSENT-key sibling of the test directly above: an already-expired
+// incoming key this node has NEVER held (no resident value at all) reaches
+// ApplyMergeTombstoneOnShard's OTHER install point, InstallAbsentKeyTombstone (rdb_load.cc/
+// db_slice.cc), not SetTombstone. Meta must be attached there too.
+//
+// Falsifying: passing kTombMetaNone instead of item->expire_ms at CreateObjectOnShard's own
+// ApplyMergeTombstoneOnShard call site (rdb_load.cc) makes the EXPECT_EQ below observe
+// kTombMetaNone instead.
+TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp, /*expire_ms=*/2000);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil) << "an already-expired incoming key creates nothing";
+
+  std::optional<MvccStamp> got;
+  uint64_t got_meta = 0;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    got_meta = db_slice.GetTombMeta(0, std::string_view{"k"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value())
+      << "the synthetic tombstone must be installed against the absent key";
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(got_meta, 2000u);
+  EXPECT_EQ(mismatches, 0u);
 }
 
 // The guard, so the fix above is a DECISION and not a new unconditional delete: the same expired

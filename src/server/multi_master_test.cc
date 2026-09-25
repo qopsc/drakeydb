@@ -1695,7 +1695,7 @@ TEST_F(MvccStoreTest, NonDefaultNamespaceWriteLeavesNoStampAnywhere) {
     DbContext ns_cntx{&ns1, 0, GetCurrentTimeMs()};
     RecordDelete(ns_cntx, helper_key);
     RecordDerivedDelete(ns_cntx, helper_key);
-    RecordExpiryBlocking(ns_cntx, helper_key);
+    RecordExpiryBlocking(ns_cntx, helper_key, kTombMetaNone);
   });
 
   std::move(unregister_consumer).Invoke();
@@ -3281,8 +3281,19 @@ TEST_F(MvccStoreTest, GuardedApplyAfterThisNodeAlreadyReapedTheKeyStillApplies) 
 // unconditionally makes both EXPECT_EQ below fail (tomb comes back self-originated, not one tick
 // above `before`), and DEBUG MVCC's own `mvcc:<N>` substring no longer matches either `before`
 // stamp's Mvcc().
+//
+// drakeydb: P4-5 -- re-pinned to also assert meta == D (this key's own now-stale expire time,
+// captured just below each SET as `*_deadline_ms`): RecordExpiryBlocking (tx_base.cc) now attaches
+// it via DbSlice::CommitExpiryTombstone, for both the lazy and the active half. See
+// GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs (below) for the D+ttl GC-survival timeline
+// this test does not itself cover.
+//
+// Falsifying (meta halves only): passing kTombMetaNone instead of `expire_time` at
+// RecordExpiryBlocking's own call site (db_slice.cc) makes both `EXPECT_EQ(TombMetaOf(...), ...)`
+// below observe kTombMetaNone instead of the real deadline.
 TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp) {
   // Lazy (read-triggered) half.
+  const uint64_t lazy_deadline_ms = TEST_current_time_ms + 10;
   ASSERT_EQ(Run({"set", "lazykey", "v", "px", "10"}), "OK");
   auto lazy_before = StampOf("lazykey");
   ASSERT_TRUE(lazy_before.has_value());
@@ -3295,6 +3306,8 @@ TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp
   // Independently constructed, not by calling ExpiryTombstoneFor.
   EXPECT_EQ(*lazy_tomb, (MvccStamp{lazy_before->packed | MvccClock::kTombstoneBit,
                                    lazy_before->origin_hash + 1}));
+  EXPECT_EQ(TombMetaOf("lazykey"), lazy_deadline_ms)
+      << "meta must be the expired key's own deadline D, not kTombMetaNone";
 
   {
     const std::string body = Run({"debug", "mvcc", "lazykey"}).GetString();
@@ -3302,9 +3315,11 @@ TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp
     EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("mvcc:", lazy_tomb->Mvcc())));
     EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
                           "origin:", absl::Hex(lazy_tomb->origin_hash, absl::kZeroPad16))));
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("meta:", lazy_deadline_ms)));
   }
 
   // Active (heartbeat) half: DbSlice::DeleteExpiredStep, not a client read.
+  const uint64_t active_deadline_ms = TEST_current_time_ms + 10;
   ASSERT_EQ(Run({"set", "activekey", "v", "px", "10"}), "OK");
   auto active_before = StampOf("activekey");
   ASSERT_TRUE(active_before.has_value());
@@ -3323,6 +3338,9 @@ TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp
   EXPECT_TRUE(active_tomb->IsTombstone());
   EXPECT_EQ(*active_tomb, (MvccStamp{active_before->packed | MvccClock::kTombstoneBit,
                                      active_before->origin_hash + 1}));
+  EXPECT_EQ(TombMetaOf("activekey"), active_deadline_ms)
+      << "the ACTIVE (heartbeat) half must carry meta = D too -- same RecordExpiryBlocking call "
+         "site as the lazy half above";
 
   {
     const std::string body = Run({"debug", "mvcc", "activekey"}).GetString();
@@ -3331,6 +3349,105 @@ TEST_F(MvccStoreTest, LazyAndActiveExpiryTombstonesCarryTheExpiredValuesOwnStamp
     EXPECT_THAT(body, testing::HasSubstr(absl::StrCat(
                           "origin:", absl::Hex(active_tomb->origin_hash, absl::kZeroPad16))));
   }
+}
+
+// drakeydb: P4-5 -- the D-16 closure itself (ISSUE-REGISTER.md): a key whose TTL exceeds
+// --multi_master_tombstone_ttl must no longer expire into a tombstone that is GC-eligible the
+// moment it is born. Before this task, GC's eligibility check only ever floored on the
+// tombstone's OWN stamp (T.ms == the reap time, always <= now by definition), so a tombstone for
+// a long-TTL key was reapable at the very next TombstoneGcStep -- exactly the failure this test
+// pins the ABSENCE of. PX is set to ttl_ms + 2000 specifically so T.ms + ttl is already in the
+// past by the time this test reaches its first TombstoneGcStep call (proving the OLD behavior
+// really would have reaped it), while D + ttl is still in the future.
+//
+// Falsifying: passing kTombMetaNone instead of `expire_time` at RecordExpiryBlocking's own call
+// site (db_slice.cc) reproduces D-16 exactly -- captured verbatim in the task report, not
+// asserted here (a lasting test must never encode "and if I break this on purpose..." branches).
+TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint64_t kTtlMs = 1000;
+  constexpr uint64_t kPxMs = kTtlMs + 2000;  // D is 2s past T.ms + ttl
+  const std::string key = "long-ttl-key";
+  const ShardId sid = Shard(key, shard_set->size());
+
+  const uint64_t deadline_ms = TEST_current_time_ms + kPxMs;
+  ASSERT_EQ(Run({"set", key, "v", "px", absl::StrCat(kPxMs)}), "OK");
+  auto before = StampOf(key);
+  ASSERT_TRUE(before.has_value());
+
+  const uint64_t before_born_expired = [&] {
+    uint64_t total = 0;
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      total += namespaces->GetDefaultNamespace()
+                   .GetDbSlice(shard->shard_id())
+                   .GetStats()
+                   .db_stats[0]
+                   .mvcc_tombstones_born_expired;
+    });
+    return total;
+  }();
+
+  AdvanceTime(kPxMs + 50);  // past T.ms + ttl (kPxMs - kTtlMs) but well before D + ttl
+  Run({"get", key});        // triggers lazy expiry
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_EQ(TombMetaOf(key), deadline_ms) << "meta must be D exactly";
+  // TombstoneGcAtMs's own sum: max(stamp.MsPart(), meta_ms) + ttl_ms; D dominates here since
+  // D > T.ms (D is T.ms + kPxMs, and kPxMs > 0).
+  const uint64_t expect_gc_at_ms = deadline_ms + kTtlMs;
+  {
+    const std::string body = Run({"debug", "mvcc", key}).GetString();
+    EXPECT_THAT(body, testing::HasSubstr(absl::StrCat("gc_at_ms:", expect_gc_at_ms))) << body;
+  }
+
+  // T.ms + ttl has already elapsed (AdvanceTime above jumped past it), so a GC step that floors
+  // only on the stamp's own ms component would reap this right now. It must not.
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.TombstoneGcStep();
+  });
+  EXPECT_TRUE(StampOf(key).has_value())
+      << "a tombstone whose TTL (via meta) exceeds --multi_master_tombstone_ttl must survive GC "
+         "at a clock between T.ms + ttl and D + ttl -- this is D-16 itself";
+
+  // Past D + ttl, it must finally be reaped.
+  AdvanceTime(2100);  // now is D + ttl + ~50ms
+  std::vector<uint8_t> pending(shard_set->size(), 1);
+  auto any_pending = [&pending] {
+    for (uint8_t v : pending) {
+      if (v)
+        return true;
+    }
+    return false;
+  };
+  int guard = 0;
+  while (any_pending()) {
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
+      pending[shard->shard_id()] = db_slice.TombstoneGcStep() ? 1 : 0;
+    });
+    ASSERT_LT(++guard, 100000) << "TombstoneGcStep never converged";
+  }
+  EXPECT_FALSE(StampOf(key).has_value()) << "once past D + ttl, the tombstone must be reaped";
+
+  const uint64_t after_born_expired = [&] {
+    uint64_t total = 0;
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      total += namespaces->GetDefaultNamespace()
+                   .GetDbSlice(shard->shard_id())
+                   .GetStats()
+                   .db_stats[0]
+                   .mvcc_tombstones_born_expired;
+    });
+    return total;
+  }();
+  EXPECT_EQ(after_born_expired, before_born_expired)
+      << "a LOCAL expiry's own tombstone must never be counted as born-expired -- that counter is "
+         "reserved for a peer-sourced install of an already-dead key (a later task)";
 }
 
 // drakeydb: P4-4 -- a genuinely UNSTAMPED value (Mvcc() == 0: this node's own mvcc
@@ -3446,6 +3563,7 @@ TEST_F(MvccStoreTest, SpopAllMembersExpiredEarnsExpiryTombstoneAndStaysStamped) 
   auto s_stamp = StampOf("key");  // S: the set's own pre-expiry stamp
   ASSERT_TRUE(s_stamp.has_value());
   AdvanceTime(2000);
+  const uint64_t reap_ms = TEST_current_time_ms;  // R: the reap time, captured before SPOP
 
   const uint64_t before_unstamped = TotalUnstampedWrites();
   auto resp = Run({"spop", "key"});
@@ -3463,6 +3581,11 @@ TEST_F(MvccStoreTest, SpopAllMembersExpiredEarnsExpiryTombstoneAndStaysStamped) 
       << "must derive from the set's own pre-expiry stamp, never a freshly minted self stamp";
   EXPECT_EQ(TotalUnstampedWrites(), before_unstamped)
       << "the tombstone arm must be committed, not left to roll back uncommitted at epoch end";
+  // drakeydb: P4-5 -- meta must be an anchor (kTombMetaAnchorOnly | reap-time R), the same anchor
+  // every other member-expiry emptiness earns (SetFamily::DeleteSetIfEmpty/HSetFamily::
+  // DeleteIfEmpty's own sibling tests, DbSlice::DeleteReapedContainer's own reaper test, above/
+  // below in this file).
+  EXPECT_EQ(TombMetaOf("key"), kTombMetaAnchorOnly | reap_ms);
 }
 
 // drakeydb: Phase 4 Task 9, fix round (F1v2) -- proves ExecuteTx applies an author's mvcc AND
@@ -3705,7 +3828,8 @@ TEST_F(MvccStoreTest, MemberTtlEmptiedSetByCommandEarnsExpiryTombstoneAndApplies
   Run({"fieldexpire", "mset", "1", "m"});
   auto s_stamp = StampOf("mset");  // S: the set's own stamp after arming the member TTL
   ASSERT_TRUE(s_stamp.has_value());
-  AdvanceTime(1100);  // past the 1s member TTL
+  AdvanceTime(1100);                              // past the 1s member TTL
+  const uint64_t reap_ms = TEST_current_time_ms;  // R: the reap time, captured before SISMEMBER
 
   const uint64_t before_unstamped = TotalUnstampedWrites();
   // SISMEMBER queries the expired member specifically: IsInSet's own time-aware lookup
@@ -3722,6 +3846,10 @@ TEST_F(MvccStoreTest, MemberTtlEmptiedSetByCommandEarnsExpiryTombstoneAndApplies
             (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
       << "must be one origin_hash tick above S, never a freshly minted self stamp";
   EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  // drakeydb: P4-5 -- meta must be an ANCHOR (kTombMetaAnchorOnly | reap-time R), never a
+  // whole-key deadline: this emptiness is member-TTL-caused, not a whole-key TTL, so D-27 (a
+  // later task) must never veto an applied delta against it.
+  EXPECT_EQ(TombMetaOf("mset"), kTombMetaAnchorOnly | reap_ms);
 
   // A guarded peer write stamped strictly between S and this node's own (much later, after
   // AdvanceTime) wall clock must still apply -- it would be wrongly dropped against a reap-time
@@ -3759,6 +3887,7 @@ TEST_F(MvccStoreTest, MemberTtlEmptiedHashByCommandEarnsExpiryTombstoneAndApplie
   auto s_stamp = StampOf("mhash");
   ASSERT_TRUE(s_stamp.has_value());
   AdvanceTime(1100);
+  const uint64_t reap_ms = TEST_current_time_ms;  // R: the reap time, captured before HTTL
 
   const uint64_t before_unstamped = TotalUnstampedWrites();
   // HTTL triggers HSetFamily::FieldExpireTime's own lazy field-expiry check, then
@@ -3773,6 +3902,9 @@ TEST_F(MvccStoreTest, MemberTtlEmptiedHashByCommandEarnsExpiryTombstoneAndApplie
             (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
       << "must be one origin_hash tick above S, never a freshly minted self stamp";
   EXPECT_EQ(TotalUnstampedWrites(), before_unstamped);
+  // drakeydb: P4-5 -- meta must be an anchor (kTombMetaAnchorOnly | reap-time R), mirroring
+  // SetFamily::DeleteSetIfEmpty's own sibling test above.
+  EXPECT_EQ(TombMetaOf("mhash"), kTombMetaAnchorOnly | reap_ms);
 
   const uint64_t stamp_i = (s_stamp->MsPart() + 500) << MvccClock::kCounterBits;
   ASSERT_GT(stamp_i, s_stamp->Mvcc()) << "sanity: I is strictly after S";
@@ -5733,6 +5865,11 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredReplaceJournalsDelAndCommitsTheArm
     EXPECT_EQ(args[1], "restore_exp_k");
   }
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  // drakeydb: P4-5 -- this RESTORE is a plain LOCAL command (Run(), not ApplyReplicatedCommand):
+  // repl_lww_guard/repl_mvcc default to false/0, so LwwGuardActive is false and OpRestore's
+  // found_prev branch must attach NO meta -- an ordinary local RESTORE has no peer authority to
+  // protect with a deadline-bearing tombstone.
+  EXPECT_EQ(TombMetaOf("restore_exp_k"), kTombMetaNone);
 }
 
 // drakeydb: P4-4 -- SetCmd::Set's own absent-key sibling of the RESTORE fix above: a guarded
@@ -5774,6 +5911,9 @@ TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOld
               (MvccStamp{x_stamp.packed | MvccClock::kTombstoneBit, x_stamp.origin_hash + 1}))
         << "must derive from X's own stamp (ExpiryTombstoneFor), never a freshly minted one";
   }
+  // drakeydb: P4-5 -- meta must be D (the guarded write's own already-elapsed absolute PXAT, 1ms
+  // since the epoch) exactly, unclamped here (1 is nowhere near "now"): D-16, ISSUE-REGISTER.md.
+  EXPECT_EQ(TombMetaOf("k"), 1u);
 
   // W: an OLDER write (mvcc strictly below X) for the same key, reaching this node afterwards
   // from a third peer. It must be dropped -- the tombstone this node just installed for X is
@@ -5837,6 +5977,9 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyInstallsTombstoneRejectin
               (MvccStamp{x_stamp.packed | MvccClock::kTombstoneBit, x_stamp.origin_hash + 1}))
         << "must derive from X's own stamp (ExpiryTombstoneFor), never a freshly minted one";
   }
+  // drakeydb: P4-5 -- meta must be D (the guarded RESTORE's own already-elapsed ABSTTL, 1ms since
+  // the epoch) exactly, unclamped here: D-16, ISSUE-REGISTER.md.
+  EXPECT_EQ(TombMetaOf("k"), 1u);
 
   // W: an OLDER write (mvcc strictly below X) for the same key, reaching this node afterwards
   // from a third peer. It must be dropped -- the tombstone this node just installed for X is
@@ -5855,6 +5998,107 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyInstallsTombstoneRejectin
       << "W must be dropped -- it is older than the tombstone X installed";
   EXPECT_EQ(TotalLwwDropped(), before_dropped + 1);
   EXPECT_EQ(StampOf("k"), after_x) << "the tombstone must survive W's drop untouched";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-5 -- the install-time clamp itself (mvcc.h's ClampPeerTombMetaDeadline,
+// InstallAbsentKeyTombstone's own comment, db_slice.h). Every PRODUCTION call site reaching
+// InstallAbsentKeyTombstone today already verifies D <= now using its OWN local clock before ever
+// calling it (SetCmd::Set's own expire_in_past gate, OpRestore's own Expired() gate, RdbLoader::
+// ApplyMergeTombstoneOnShard's own expire_ms >= now_ms gate), so a hostile far-future meta can
+// never actually reach it through any of THIS task's producers -- this calls the real method
+// directly instead, the shape a not-yet-existing producer (a later task's V2 opcode, trusting a
+// peer's meta verbatim off the wire with no local elapsed-check of its own) could actually reach.
+//
+// Falsifying: removing the clamp in InstallAbsentKeyTombstone (db_slice.cc) makes the EXPECT_EQ
+// below observe the hostile far-future value verbatim instead of "now".
+TEST_F(MvccStoreTest, InstallAbsentKeyTombstoneClampsHostileFarFutureDeadlineToNow) {
+  const std::string key = "clamp-absent-key";
+  const ShardId sid = Shard(key, shard_set->size());
+  const MvccStamp stamp{MvccClock::kTombstoneBit | (1ULL << 20), 7};
+  constexpr uint64_t kFarFutureMs = UINT64_MAX / 2;  // absurdly far in the future
+
+  uint64_t now_ms = 0;
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    now_ms = GetCurrentTimeMs();
+    db_slice.InstallAbsentKeyTombstone(0, key, stamp, kFarFutureMs);
+  });
+
+  EXPECT_EQ(TombMetaOf(key), now_ms)
+      << "a hostile far-future deadline must clamp to now, never survive verbatim";
+}
+
+// drakeydb: P4-5 -- SetCmd::DeleteExpiredKey's own guarded, PRESENT-key sibling of
+// SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOlderWrite above: a guarded SET whose
+// absolute TTL has already elapsed, against a key this node DOES hold, must attach meta = D to
+// the tombstone its own ordinary delete already commits (D-16, ISSUE-REGISTER.md) -- unlike
+// RestoreActiveNodeExpiredReplaceJournalsDelAndCommitsTheArm above, which pins the SAME shape but
+// UNGUARDED (meta stays kTombMetaNone there).
+//
+// Falsifying: removing the LwwGuardActive-gated SetTombMeta call in SetCmd::DeleteExpiredKey
+// (string_family.cc) makes the EXPECT_EQ below observe kTombMetaNone instead of D.
+TEST_F(MvccStoreTest, SetCmdDeleteExpiredKeyGuardedPresentKeyAttachesDeadlineMeta) {
+  constexpr uint32_t kPeerIdx = 91;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000091");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "present_k", "old"}), "OK");
+  auto s_stamp = StampOf("present_k");
+  ASSERT_TRUE(s_stamp.has_value());
+
+  // X: a guarded SET, strictly newer than S, carrying an ABSOLUTE deadline already in the past
+  // (PXAT 1) -- reaches SetCmd::Set's own unconditional expire_in_past branch against a PRESENT
+  // key (DeleteExpiredKey), not the absent-key branch the sibling test above covers. S's own Mvcc()
+  // is a real wall-clock-derived mint (MvccClock::Next), so X must be built relative to it, not a
+  // small literal.
+  const uint64_t kXMvcc = s_stamp->Mvcc() + 0x1000000ULL;
+  ASSERT_GT(kXMvcc, s_stamp->Mvcc()) << "sanity: X is strictly after S so the guard admits it";
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "present_k", "new_val", "PXAT", "1"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "present_k"}).GetInt(), 0)
+      << "the already-expired write must delete the present key, not store it";
+
+  auto tomb = StampOf("present_k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf("present_k"), 1u)
+      << "meta must be D -- this delete IS a guarded, peer-sourced apply";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
+// drakeydb: P4-5 -- OpRestore's own guarded, found_prev sibling of the SET test directly above:
+// a guarded RESTORE ... REPLACE whose absolute TTL has already elapsed, against a key this node
+// DOES hold, must attach meta = D too.
+//
+// Falsifying: removing the LwwGuardActive-gated SetTombMeta call in OpRestore's found_prev branch
+// (generic_family.cc) makes the EXPECT_EQ below observe kTombMetaNone instead of D.
+TEST_F(MvccStoreTest, OpRestoreFoundPrevGuardedAttachesDeadlineMeta) {
+  constexpr uint32_t kPeerIdx = 92;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000092");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"set", "restore_present_donor", "donorval"}), "OK");
+  std::string dump = Run({"dump", "restore_present_donor"}).GetString();
+  ASSERT_EQ(Run({"set", "restore_present_k", "old"}), "OK");
+  auto s_stamp = StampOf("restore_present_k");
+  ASSERT_TRUE(s_stamp.has_value());
+
+  // S's own Mvcc() is a real wall-clock-derived mint (MvccClock::Next); build X relative to it.
+  const uint64_t kXMvcc = s_stamp->Mvcc() + 0x1000000ULL;
+  ASSERT_GT(kXMvcc, s_stamp->Mvcc()) << "sanity: X is strictly after S so the guard admits it";
+  ASSERT_EQ(ApplyReplicatedCommand({"restore", "restore_present_k", "1", dump, "REPLACE", "ABSTTL"},
+                                   kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "restore_present_k"}).GetInt(), 0);
+
+  auto tomb = StampOf("restore_present_k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf("restore_present_k"), 1u)
+      << "meta must be D -- this delete IS a guarded, peer-sourced apply";
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
@@ -10316,13 +10560,16 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
   ASSERT_FALSE(s_stamp->IsTombstone());
 
   AdvanceTime(1100);
+  const uint64_t reap_ms = TEST_current_time_ms;  // R: the reap time, captured before the sweep
 
   std::optional<MvccStamp> tomb;
+  uint64_t tomb_meta = kTombMetaNone;
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
     DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100);
     tomb = db_slice.GetMvcc(0, "rs-tomb");
+    tomb_meta = db_slice.GetTombMeta(0, "rs-tomb");
   });
 
   // Guard against a vacuous pass: the container must have actually been reaped.
@@ -10336,6 +10583,10 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperDeleteEarnsATombstone) {
             (MvccStamp{s_stamp->packed | MvccClock::kTombstoneBit, s_stamp->origin_hash + 1}))
       << "must derive from the set's own prior stamp S -- one origin_hash tick above S's own mvcc "
          "AND origin_hash -- never a freshly minted self stamp, and never S reused verbatim";
+  // drakeydb: P4-5 -- meta must be an anchor (kTombMetaAnchorOnly | reap-time R), the member-TTL
+  // shape D-16 (ISSUE-REGISTER.md) also closes: gc_at now floors on R, never on this container's
+  // own (unrelated) whole-key TTL, if it even had one.
+  EXPECT_EQ(tomb_meta, kTombMetaAnchorOnly | reap_ms);
 }
 
 TEST_F(ReaperJournalFamilyTest, LocalOnlyReaperDoesNotJournalNamespaceBlindDelete) {
