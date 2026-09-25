@@ -3866,10 +3866,12 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
           table != nullptr && !table->prime.Find(string_view{item->key}).is_done();
       // drakeydb: P4-5 -- meta = item->expire_ms, the peer's own whole-key deadline D (D-16,
       // ISSUE-REGISTER.md), tagged as an anchor unless the loaded value `pv` is itself a string:
-      // only a string can vanish solely through an explicit, guarded, full-state delete, so only a
-      // string's own whole-key D is a sound veto premise for a later re-create -- every other type
-      // can also be emptied by an ordinary delta well before D. `pv` is already fully materialized
-      // above (FromOpaque), so ObjType() is available with no extra parse, unlike OpRestore/
+      // every replayed removal of a string leaves an explicit tombstone, including one that finds
+      // the receiver had already lost the key itself (RecordAbsentKeyRemoval, generic_family.cc,
+      // the D-20 fix), so only a string's own whole-key D is a sound veto premise for a later
+      // re-create -- every other type can also be emptied by an ordinary delta well before D.
+      // `pv` is already fully materialized above (FromOpaque), so ObjType() is available with no
+      // extra parse, unlike OpRestore/
       // Renamer::DeserializeDest's own elapsed branches (generic_family.cc), which never otherwise
       // materialize the payload on this path. ApplyMergeTombstoneOnShard clamps the result to its
       // own caller-supplied now_ms before either install point.

@@ -2292,12 +2292,13 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   // drakeydb: P4-5 -- captured before Del() below erases the value: whether this key's own value is
   // a string. See this function's own RecordExpiryBlocking call, below, for why the type (not the
-  // member-TTL bookkeeping this used to read) decides the tombstone's meta class: a string can only
-  // ever vanish through an explicit, guarded, full-state delete, so its own whole-key D is a sound
-  // veto premise. Every other type can also be emptied by an ordinary delta (SREM, LPOP, HDEL,
-  // ZREM, member expiry...) well before D, then genuinely re-created before D -- a receiver that
-  // never saw that delta, only the later whole-key expiry, must not let its own bare D veto that
-  // re-create.
+  // member-TTL bookkeeping this used to read) decides the tombstone's meta class: every replayed
+  // removal of a string leaves an explicit tombstone -- including one whose replay finds the
+  // receiver had already lost the key itself (RecordAbsentKeyRemoval, generic_family.cc, the D-20
+  // fix) -- so its own whole-key D is a sound veto premise. Every other type can also be emptied by
+  // an ordinary delta (SREM, LPOP, HDEL, ZREM, member expiry...) well before D, then genuinely
+  // re-created before D -- a receiver that never saw that delta, only the later whole-key expiry,
+  // must not let its own bare D veto that re-create.
   const bool is_string = it->second.ObjType() == OBJ_STRING;
 
   string scratch;

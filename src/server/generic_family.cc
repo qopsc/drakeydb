@@ -269,12 +269,14 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
 
 // drakeydb: P4-5 -- meta for a peer-sourced RESTORE/rename write whose own deadline has already
 // elapsed: `deadline_ms` tagged with kTombMetaAnchorOnly unless the payload's own value is a
-// string, a bare deadline for a string. Only a string can vanish solely through an explicit,
-// guarded, full-state delete, so only a string's own whole-key D is a sound veto premise for a
-// later re-create; every other type can also be emptied by an ordinary delta well before D. The
-// type is the payload's own first byte -- DumpValue (rdb_save.cc) writes `WriteOpcode(type)`
-// before anything else, so byte 0 of any DUMP-format payload (RESTORE's own wire format) is always
-// the RDB type byte, with no need to deserialize the rest to read it. `version` being present (a
+// string, a bare deadline for a string. Every replayed removal of a string leaves an explicit
+// tombstone, including one that finds the receiver had already lost the key itself
+// (RecordAbsentKeyRemoval, below, the D-20 fix), so only a string's own whole-key D is a sound
+// veto premise for a later re-create; every other type can also be emptied by an ordinary delta
+// well before D. The type is the payload's own first byte -- DumpValue (rdb_save.cc) writes
+// `WriteOpcode(type)` before anything else, so byte 0 of any DUMP-format payload (RESTORE's own
+// wire format) is always the RDB type byte, with no need to deserialize the rest to read it.
+// `version` being present (a
 // GetRdbVersion success, at either producer of this payload -- SerializeSrc for rename/copy, or the
 // client's own RESTORE argument) already guarantees `payload.size() > DUMP_FOOTER_SIZE`, so
 // `payload[0]` is always safe to read here; a missing version or an empty payload (both
@@ -396,6 +398,40 @@ void RecordFullStateJournal(const OpArgs& op_args, string_view key, const PrimeK
 }
 
 OpStatus OpPersist(const OpArgs& op_args, string_view key);
+
+// drakeydb: P4-5 -- D-20 fix, generalized to every server-side removal (controller ruling R40, D-20
+// ISSUE-REGISTER.md). On a guarded applied entry (LwwGuardActive), a removal of `key` that finds it
+// already absent -- never resident here, or just reaped a moment ago by the caller's own
+// FindMutable -- left the older stored state untouched, so a later write timestamped between an
+// existing tombstone and this delete's own stamp applied here while every peer that actually held
+// the key already dropped it. Installs the author's own stamp, tombstone bit set, as this key's new
+// tombstone whenever it still beats whatever is stored: `stamp.AsTombstone()` (mvcc.h), never
+// ExpiryTombstoneFor -- this is an EXPLICIT delete the author itself issued against a key it held
+// live, not a value expiring on its own -- and `kTombMetaNone`, since an explicit delete carries no
+// deadline for a later D-27 veto to act on. Re-reads the CURRENT stamp via GetMvcc rather than
+// trusting any pre-FindMutable snapshot a caller took: a lazy reap inside that FindMutable call can
+// have just installed a fresh ExpiryTombstoneFor(S) for this very key, and this call must still
+// beat that (via MergeAccepts) before overwriting it. Journals nothing and never counts as a
+// command-level delete -- every caller reaches this only on its own "nothing here to remove"
+// branch, already returning/continuing without touching its own reply counter or RecordJournal.
+// Callers: OpDelV2 below (DEL/UNLINK, and GETDEL rewritten pre-dispatch to DEL --
+// multimaster_lww.h) for both an absent key and one FindMutable just reaped;
+// Renamer::SerializeSrc's cross-shard RENAME/RENAMENX source and OpRen's same-shard twin; OpMove's
+// source db; and OpStore's SORT ... STORE empty-result destination.
+void RecordAbsentKeyRemoval(const OpArgs& op_args, DbIndex db_ind, string_view key) {
+  const DbContext& db_cntx = op_args.db_cntx;
+  if (!LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc))
+    return;
+  const std::optional<MvccStamp> incoming =
+      IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
+  if (!incoming)
+    return;
+  auto& db_slice = op_args.GetDbSlice();
+  if (!MergeAccepts(db_slice.GetMvcc(db_ind, key), *incoming))
+    return;
+  db_slice.InstallAbsentKeyTombstone(db_ind, key, incoming->AsTombstone(), kTombMetaNone,
+                                     db_cntx.time_now_ms);
+}
 
 class Renamer {
  public:
@@ -550,6 +586,10 @@ void Renamer::SerializeSrc(Transaction* t, EngineShard* shard) {
 
   src_found_ = IsValid(it);
   if (!src_found_) {
+    // drakeydb: P4-5 -- D-20 fix: reached whenever this receiver's own shard count hashes
+    // src/dest onto different shards for a RENAME/RENAMENX the author committed same-shard (see
+    // RecordAbsentKeyRemoval's own comment, above). OpRen covers the same-shard twin below.
+    RecordAbsentKeyRemoval(t->GetOpArgs(shard), t->GetDbIndex(), src_key_);
     return;
   }
 
@@ -1352,8 +1392,12 @@ OpStatus OpMove(const OpArgs& op_args, string_view key, DbIndex target_db) {
 
   // Fetch value at key in current db.
   auto from_res = db_slice.FindMutable(op_args.db_cntx, key);
-  if (!IsValid(from_res.it))
+  if (!IsValid(from_res.it)) {
+    // drakeydb: P4-5 -- D-20 fix: install the tombstone in the SOURCE db, where the key is
+    // actually absent (see RecordAbsentKeyRemoval's own comment, above Renamer).
+    RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, key);
     return OpStatus::KEY_NOTFOUND;
+  }
 
   // We must prepare tiered values for transfer to break any back references from disk to this key
   if (auto* ts = op_args.shard->tiered_storage(); ts && from_res.it->second.IsExternal()) {
@@ -1415,8 +1459,13 @@ OpResult<void> OpRen(const OpArgs& op_args, string_view from_key, string_view to
   auto* es = op_args.shard;
   auto& db_slice = op_args.GetDbSlice();
   auto from_res = db_slice.FindMutable(op_args.db_cntx, from_key);
-  if (!IsValid(from_res.it))
+  if (!IsValid(from_res.it)) {
+    // drakeydb: P4-5 -- D-20 fix, the same-shard RENAME/RENAMENX source (see
+    // RecordAbsentKeyRemoval's own comment, above Renamer; Renamer::SerializeSrc covers the
+    // cross-shard twin).
+    RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, from_key);
     return OpStatus::KEY_NOTFOUND;
+  }
 
   if (from_key == to_key)
     return destination_should_not_exist ? OpStatus::KEY_EXISTS : OpStatus::OK;
@@ -1642,8 +1691,15 @@ OpResult<uint32_t> OpDelV2(const OpArgs& op_args, const ShardArgs& keys, bool as
     auto it = db_slice.FindMutable(op_args.db_cntx, key);
     it.post_updater.Run();  // Run before Del
 
-    if (!IsValid(it.it))
+    if (!IsValid(it.it)) {
+      // drakeydb: P4-5 -- D-20 fix: `key` is absent here either because it never existed (the
+      // split check above only drops a STALE incoming stamp; an absent key has no stored stamp to
+      // be stale against) or because FindMutable just lazily reaped it a line above. Either way,
+      // preserved below: `deleted_cnt` and `journal_args` stay untouched, so an all-absent DEL
+      // still keeps deleted_cnt == 0 and never calls ClearBuffer.
+      RecordAbsentKeyRemoval(op_args, db_cntx.db_index, key);
       continue;
+    }
 
     db_slice.Del(op_args.db_cntx, it.it, nullptr, async);
     ++deleted_cnt;
@@ -2435,6 +2491,15 @@ OpResult<uint32_t> OpStore(const OpArgs& op_args, std::string_view key, Iterator
       if (hand_journal) {
         RecordJournal(op_args, "DEL"sv, ArgSlice{key});
       }
+    } else {
+      // drakeydb: P4-5 -- D-20 fix: `key` (the STORE destination) is already absent here. A
+      // same-shard SORT ... STORE reaches this replayed via the runtime-revived, verbatim
+      // auto-journaled SORT command (RenameGeneric's own kUnguarded pattern, above, applies here
+      // too -- see RecordAbsentKeyRemoval's own comment). A hand-journaled (cross-shard) author
+      // never reaches this branch with anything to journal: it only ever emits "DEL key" when
+      // `it_res.it` WAS valid, above -- and that DEL is a plain guarded entry, so a downstream
+      // receiver that later finds `key` absent handles it via OpDelV2 (site 1), not here.
+      RecordAbsentKeyRemoval(op_args, op_args.db_cntx.db_index, key);
     }
     return 0;
   }

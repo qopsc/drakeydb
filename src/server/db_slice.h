@@ -480,9 +480,11 @@ class DbSlice {
   // same would_grow/cap accounting PerformDeletionAtomic's own earns_tombstone branch
   // (db_slice.cc) applies to a live delete's tombstone. Shared by RdbLoader::
   // ApplyMergeTombstoneOnShard (rdb_load.cc), whose own no-resident-key install reaches the
-  // identical shape via a full sync, rather than copied a third time there; and by SetCmd::Set's
+  // identical shape via a full sync, rather than copied a third time there; by SetCmd::Set's
   // already-expired absent-key branch, OpRestore, and Renamer::DeserializeDest (string_family.cc
-  // / generic_family.cc).
+  // / generic_family.cc); and by generic_family.cc's RecordAbsentKeyRemoval (the D-20 fix), whose
+  // own five call sites cover DEL/UNLINK/GETDEL, the RENAME/RENAMENX source, the MOVE source, and
+  // a same-shard SORT ... STORE empty-result destination replaying against an already-absent key.
   //
   // NOTE: the same write landing on a PRESENT live key (stored S < incoming X) never reaches this
   // call -- SetCmd::DeleteExpiredKey / OpRestore's found_prev branch deletes it through the
@@ -491,13 +493,16 @@ class DbSlice {
   // a divergence -- no real stamp falls between the two (floored stamps never go on the wire), and
   // a merge-load raises the lower one. This present-key path predates this call.
   //
-  // drakeydb: P4-5 -- `meta`, mandatory (no default: this method has four call sites -- SetCmd::
-  // Set, OpRestore, Renamer::DeserializeDest, and RdbLoader::ApplyMergeTombstoneOnShard's own
-  // no-live-key fallthrough -- and every one of them must consciously decide what to supply, not
-  // fall back to a meta-less install by omission). Most callers supply a real incoming deadline D
-  // (tagged as an anchor unless the value's own type is OBJ_STRING -- only a string can vanish
-  // solely through an explicit, guarded, full-state delete, so only a string's own D is a sound
-  // veto premise for a later re-create); ApplyMergeTombstoneOnShard's own fallthrough is itself
+  // drakeydb: P4-5 -- `meta`, mandatory (no default: this method's callers -- SetCmd::Set,
+  // OpRestore, Renamer::DeserializeDest, RdbLoader::ApplyMergeTombstoneOnShard's own no-live-key
+  // fallthrough, and RecordAbsentKeyRemoval (generic_family.cc) -- must each consciously decide
+  // what to supply, not fall back to a meta-less install by omission). Most callers supply a real
+  // incoming deadline D (tagged as an anchor unless the value's own type is OBJ_STRING -- every
+  // replayed removal of a string leaves an explicit tombstone, including one that finds the
+  // receiver had already lost the key itself (RecordAbsentKeyRemoval, the D-20 fix), so only a
+  // string's own D is a sound veto premise for a later re-create); RecordAbsentKeyRemoval's own
+  // calls pass kTombMetaNone instead -- an explicit delete carries no deadline for that veto to
+  // act on. ApplyMergeTombstoneOnShard's own fallthrough is itself
   // reached by TWO different upstream sources, and its OTHER one (HandleTombstones' own install
   // lambda, rdb_load.cc) passes the tombstone opcode's own wire meta straight through:
   // kTombMetaNone for a 225 record (which carries none), or a V2 record's own trailing word.
