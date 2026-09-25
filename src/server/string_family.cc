@@ -1017,10 +1017,11 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
       if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
-          // drakeydb: P4-5 -- meta = D (params.expire_deadline_ms), clamped to now at install
-          // (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
+          // drakeydb: P4-5 -- meta = D (params.expire_deadline_ms), clamped to this transaction's
+          // own db_cntx.time_now_ms at install (InstallAbsentKeyTombstone, db_slice.cc):
+          // D-16, ISSUE-REGISTER.md.
           db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
-                                             params.expire_deadline_ms);
+                                             params.expire_deadline_ms, db_cntx.time_now_ms);
         }
       }
       return OpStatus::OK;

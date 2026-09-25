@@ -1733,8 +1733,9 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
     ++db.stats.mvcc_tombstones;
   // drakeydb: P4-5 -- sets (a fresh insert never carries one) or overwrites this slot's meta to
   // match `meta`, whatever it held before -- a full tombstone overwrite specifies the complete
-  // new state, meta included. No production caller passes a non-zero meta yet (kTombMetaNone is
-  // this parameter's default), so this is a no-op for every caller today.
+  // new state, meta included. kTombMetaNone is this parameter's default, so a caller that omits
+  // it still gets the original meta-less behavior; InstallAbsentKeyTombstone and
+  // RdbLoader::ApplyMergeTombstoneOnShard both pass a real, non-default meta today.
   SetTombMetaOnSlot(db, it, meta);
 }
 
@@ -1746,11 +1747,12 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
 // other DashTable traversal in this file are unaffected by whatever this call does to the key's TTL
 // word.
 void DbSlice::SetTombMetaOnSlot(DbTable& db, DbTable::MvccTable::iterator it, uint64_t meta) {
-  // drakeydb: P4-5 -- clearing an already meta-less slot is a no-op: every SetTombstone call
-  // reaches here with meta defaulted to kTombMetaNone (no production caller passes a real one
-  // yet), so without this fast path every one of those -- including PerformDeletionAtomic's own
-  // synchronous placeholder write, the hottest caller of SetTombstone there is -- would pay two
-  // MallocUsed() calls for a mutation that never happens.
+  // drakeydb: P4-5 -- clearing an already meta-less slot is a no-op: PerformDeletionAtomic's own
+  // synchronous placeholder write -- the hottest caller of SetTombstone there is, still always
+  // meta-less -- would otherwise pay two MallocUsed() calls for a mutation that never happens.
+  // Every OTHER SetTombstone/CommitExpiryTombstone caller may pass a real meta; this fast path is
+  // still correct for them too, since `it->first.HasExpire()` reads the CURRENT slot state, not
+  // an assumption about which caller reached here.
   if (meta == kTombMetaNone && !it->first.HasExpire())
     return;
   const size_t old_bytes = it->first.MallocUsed();
@@ -1819,7 +1821,7 @@ void DbSlice::TEST_ForceTombMeta(DbIndex db_ind, string_view key, uint64_t meta)
 // load-bearing for RdbLoader::ApplyMergeTombstoneOnShard's own merge-load caller, which can name a
 // db index this node has never activated for a key arriving from an unfamiliar source.
 void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp,
-                                        uint64_t meta) {
+                                        uint64_t meta, uint64_t now_ms) {
   if (!TombstonesEnabled() || !IsDbValid(db_ind))
     return;
   auto& db = *db_arr_[db_ind];
@@ -1827,8 +1829,8 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
   // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
   // corrupt or hostile peer meta must never make this tombstone immortal by claiming a deadline
-  // far in the future.
-  const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, GetCurrentTimeMs());
+  // far in the future. Against the CALLER's own now_ms (fix round 1), not a fresh read here.
+  const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, now_ms);
   if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
     SetTombstone(db_ind, key, stamp, clamped_meta);
   } else {
@@ -2233,6 +2235,11 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   int64_t expire_time = it->first.GetExpireTime();
 
+  // drakeydb: P4-5 fix round 1 -- captured before Del() below erases the value: whether this
+  // container also carried member-level TTL bookkeeping (SADDEX/HSETEX/FIELDEXPIRE) at the moment
+  // its WHOLE key expired. See this function's own RecordExpiryBlocking call, below, for why.
+  const bool had_member_expiration = it->second.HasMemberExpiration();
+
   // Never do expiration if expiration is disabled, or on replicas unless replica_delete_expired
   // is enabled (which allows replicas to proactively delete expired keys on the read path).
   if (int64_t(cntx.time_now_ms) < expire_time || !expire_allowed_ ||
@@ -2300,7 +2307,21 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
     // --multi_master_tombstone_ttl expired into a tombstone that was GC-eligible the moment it was
     // born, since GC's own eligibility check only ever saw the tombstone's OWN stamp (T.ms), never
     // the value's much-later deadline.
-    RecordExpiryBlocking(cntx, key, static_cast<uint64_t>(expire_time));
+    //
+    // drakeydb: P4-5 fix round 1 -- when this container ALSO carried member-level TTL bookkeeping
+    // (`had_member_expiration`, captured above before Del()), tag the deadline as an anchor
+    // (kTombMetaAnchorOnly | D) instead of a bare whole-key D. GC eligibility is unaffected --
+    // TombMetaMs strips the anchor bit back off, so this still reaps at D + ttl exactly as a bare
+    // D would -- but the meta CLASS a container's tombstone gets must not depend on which reap
+    // path (whole-key vs member-emptiness) happens to win the race on a given node: two nodes
+    // that reap the SAME container's expiry through different paths (one whole-key, after D; the
+    // other via member-emptiness, before D) must agree that the resulting tombstone is an anchor
+    // on both sides, or the D-27 delta veto would drop a genuine re-create on the side that saw a
+    // bare D but not on the side that saw an anchor.
+    const uint64_t tomb_meta = had_member_expiration
+                                   ? (kTombMetaAnchorOnly | static_cast<uint64_t>(expire_time))
+                                   : static_cast<uint64_t>(expire_time);
+    RecordExpiryBlocking(cntx, key, tomb_meta);
   }
 
   ++events_.expired_keys;
@@ -2784,8 +2805,8 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
     // `cntx.repl_mvcc`/`repl_origin_idx` are forwarded unpatched, exactly as before this change.
     // drakeydb: P4-5 -- meta = kTombMetaAnchorOnly | reap-time R: the member-TTL reaper has no
     // whole-key deadline to attach (this container's own TTL, if it even has one, is unrelated to
-    // why it just got deleted), so this earns an anchor, never a whole-key D -- D-27 (a later task)
-    // must never veto an applied delta against it.
+    // why it just got deleted), so this earns an anchor, never a whole-key D -- the D-27 delta veto
+    // must never fire against it.
     const uint64_t tomb_meta = kTombMetaAnchorOnly | cntx.time_now_ms;
     MvccStamp committed;
     const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(

@@ -597,6 +597,17 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
 
     if (dest_found_ && shard->journal()) {  // We need to delete old dest_key_ from replica
       RecordJournal(op_args, "DEL"sv, ArgSlice{dest_key_}, 2);
+
+      // drakeydb: P4-5 fix round 1 -- the identical elapsed-on-arrival present-key shape
+      // SetCmd::DeleteExpiredKey and OpRestore's found_prev branch attach meta for (string_family.
+      // cc / generic_family.cc, above in this file): attach meta = D only AFTER the DEL's own
+      // journal call above has fully returned, and only when this delete is itself a guarded,
+      // peer-sourced apply. This key's own prior stamp already committed above regardless.
+      if (LwwGuardActive(op_args.db_cntx.repl_lww_guard, op_args.db_cntx.repl_mvcc)) {
+        db_slice.SetTombMeta(op_args.db_cntx.db_index, dest_key_,
+                             ClampPeerTombMetaDeadline(restore_args.ElapsedDeadlineMs(),
+                                                       op_args.db_cntx.time_now_ms));
+      }
     }
 
     // drakeydb: P4-4 -- same fix as OpRestore/SetCmd::Set (this file / string_family.cc), for the
@@ -625,11 +636,12 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
       if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(dctx.repl_mvcc, dctx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(dctx.db_index, dest_key_), *incoming)) {
-          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to now at
-          // install (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to this
+          // transaction's own dctx.time_now_ms at install (InstallAbsentKeyTombstone,
+          // db_slice.cc): D-16, ISSUE-REGISTER.md.
           db_slice.InstallAbsentKeyTombstone(dctx.db_index, dest_key_,
                                              ExpiryTombstoneFor(*incoming),
-                                             restore_args.ElapsedDeadlineMs());
+                                             restore_args.ElapsedDeadlineMs(), dctx.time_now_ms);
         }
       }
     }
@@ -774,10 +786,11 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
-          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to now at
-          // install (InstallAbsentKeyTombstone, db_slice.cc): D-16, ISSUE-REGISTER.md.
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to this
+          // transaction's own db_cntx.time_now_ms at install (InstallAbsentKeyTombstone,
+          // db_slice.cc): D-16, ISSUE-REGISTER.md.
           db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
-                                             restore_args.ElapsedDeadlineMs());
+                                             restore_args.ElapsedDeadlineMs(), db_cntx.time_now_ms);
         }
       }
     } else if (op_args.shard->journal() && IsActiveReplica()) {

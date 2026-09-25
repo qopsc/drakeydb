@@ -487,16 +487,22 @@ class DbSlice {
   // drakeydb: P4-5 -- `meta`, mandatory (no default: every one of this method's four call sites --
   // SetCmd::Set, OpRestore, Renamer::DeserializeDest, RdbLoader::ApplyMergeTombstoneOnShard's own
   // no-live-key fallthrough -- now has a real incoming deadline D to supply, never a meta-less
-  // install left over by omission). Clamped to `min(meta, GetCurrentTimeMs())` here, at install,
-  // before being forwarded to SetTombstone: every caller reaches this method because the incoming
-  // deadline has ALREADY elapsed (D <= now by construction), so a genuine D never clamps -- only a
-  // corrupt or hostile peer value claiming a future deadline does, which is exactly the hazard this
-  // guards against (mvcc.h's own ClampPeerTombMetaDeadline comment). A caller with no real deadline
-  // to give (there are none left today) would pass kTombMetaNone explicitly -- clamping 0 against
-  // any now_ms is still 0, a harmless no-op -- never an anchor: no caller of this method installs
-  // one.
+  // install left over by omission). Clamped via mvcc.h's ClampPeerTombMetaDeadline (which
+  // preserves an anchor's own bit 63 -- see its own comment) before being forwarded to
+  // SetTombstone: every caller reaches this method because the incoming deadline has ALREADY
+  // elapsed (D <= now by construction), so a genuine D never clamps -- only a corrupt or hostile
+  // peer value claiming a future deadline does. A caller with no real deadline to give (there are
+  // none left today) would pass kTombMetaNone explicitly -- clamping 0 against any now_ms is
+  // still 0, a harmless no-op.
+  //
+  // drakeydb: P4-5 fix round 1 -- `now_ms`, the CALLER's own already-known clock reading (the
+  // transaction's db_cntx.time_now_ms, or the loader's own db_cntx.time_now_ms), not a second,
+  // independently-read GetCurrentTimeMs() here: reusing the SAME reading the caller already used
+  // to decide this write had elapsed makes the clamp provably inert for a genuine D, rather than
+  // racing a fresh read taken microseconds later (across any yield the caller took) against the
+  // same deadline.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
-                                 uint64_t meta);
+                                 uint64_t meta, uint64_t now_ms);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
   // drakeydb: P4-5 -- reads the tombstone meta word (mvcc.h's kTombMetaNone/kTombMetaAnchorOnly
   // encoding), stored in the mvcc slot's own CompactKey TTL word rather than a third MvccStamp

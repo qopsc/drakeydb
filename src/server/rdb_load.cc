@@ -3487,9 +3487,15 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // to race this Disarm.
       MvccStamper::tlocal()->Disarm(db_index, key);
       // drakeydb: P4-5 -- clamp here, at install (mvcc.h's own ClampPeerTombMetaDeadline comment):
-      // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally.
+      // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally. Clamps
+      // against db_cntx.time_now_ms (captured once, above, for this whole function) -- fix round
+      // 1 -- not a second, independently-read GetCurrentTimeMs(): using the SAME clock reading
+      // this function's own MergeAccepts/FindMutable decisions already ran against makes the
+      // clamp provably inert for a genuine D (D <= that reading by construction), rather than
+      // racing a fresh read taken after this function's own yield (FindMutable's
+      // PreUpdateBlocking, above) against the same deadline.
       db_slice->SetTombstone(db_index, key, stamp,
-                             ClampPeerTombMetaDeadline(meta, GetCurrentTimeMs()));
+                             ClampPeerTombMetaDeadline(meta, db_cntx.time_now_ms));
     }
     // else: PerformDeletionAtomic itself decided this delete does not earn a tombstone (ttl=0, or
     // the per-(db, shard) cap was already hit -- mvcc_tombstones_dropped already incremented in
@@ -3576,8 +3582,9 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // above for exactly the same reason (a stale table pointer captured before a yield).
   // drakeydb: P4-5 -- `meta` unclamped here: InstallAbsentKeyTombstone clamps internally (its own
   // comment, db_slice.h), the same install-time clamp SetCmd::Set's own InstallAbsentKeyTombstone
-  // caller relies on.
-  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta);
+  // caller relies on. db_cntx.time_now_ms (fix round 1): this function's own already-captured
+  // clock reading, above, not a second, independently-read GetCurrentTimeMs().
+  db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta, db_cntx.time_now_ms);
 }
 
 void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, DbSlice* db_slice) {
@@ -4453,7 +4460,7 @@ error_code RdbLoader::HandleTombstones() {
       // which is already safe for it.
       if (merge_lww && mvcc_ready) {
         // drakeydb: P4-5 -- kTombMetaNone: an RDB_OPCODE_DF_TOMBSTONES (225) record carries no
-        // meta on the wire at all yet (a later task's V2 opcode does) -- matches this
+        // meta on the wire at all yet (the V2 tombstone opcode carries it) -- matches this
         // function's OTHER, non-merge install of the identical record just below, which also
         // passes kTombMetaNone explicitly.
         ApplyMergeTombstoneOnShard(&db_slice, db_index, key, stamp, resident_live, kTombMetaNone);
@@ -4540,7 +4547,7 @@ error_code RdbLoader::HandleTombstones() {
       if (!would_grow ||
           cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
         // drakeydb: P4-5 -- kTombMetaNone, explicit: this RDB_OPCODE_DF_TOMBSTONES (225)
-        // record carries no meta on the wire at all yet (a later task's V2 opcode does).
+        // record carries no meta on the wire at all yet (the V2 tombstone opcode carries it).
         db_slice.SetTombstone(db_index, key, stamp, kTombMetaNone);
       } else {
         ++cur_table->stats.mvcc_tombstones_dropped;  // at the cap: degrade, visibly

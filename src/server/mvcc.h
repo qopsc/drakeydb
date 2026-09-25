@@ -152,7 +152,7 @@ inline uint64_t TombMetaMs(uint64_t meta) {
   return meta & ~kTombMetaAnchorOnly;
 }
 
-// drakeydb: P4-5 -- the install-time clamp TombstoneGcAtMs's own comment above forward-references:
+// drakeydb: P4-5 -- the install-time clamp TombstoneGcAtMs's own comment below forward-references:
 // every PEER-SOURCED whole-key deadline (an incoming already-elapsed PXAT/ABSTTL, or a merge-load's
 // synthetic tombstone) is capped to `now_ms` before it is stored, so a corrupt or hostile peer can
 // never mint a tombstone that outlives its own ttl by claiming a deadline far in the future --
@@ -160,18 +160,25 @@ inline uint64_t TombMetaMs(uint64_t meta) {
 // elapsed), so this only ever bites a value this node cannot trust. Never applied to a LOCAL
 // expiry's own D (RecordExpiryBlocking, tx_base.cc): that one is already <= now at reap time by
 // construction (ExpireIfNeeded's own pre-check), so that caller DCHECKs the invariant instead of
-// clamping it. Callers pass a bare deadline, never kTombMetaAnchorOnly|R -- no producer this phase
-// clamps an anchor.
-inline uint64_t ClampPeerTombMetaDeadline(uint64_t deadline_ms, uint64_t now_ms) {
-  return std::min(deadline_ms, now_ms);
+// clamping it.
+//
+// drakeydb: P4-5 fix round 1 -- preserves the anchor bit: the naive `min(meta, now_ms)` strips it,
+// since an anchor's own bit 63 makes the raw word compare far ABOVE any real `now_ms`, so a plain
+// min() always picks `now_ms` and silently turns an anchor into a bare whole-key deadline. Masking
+// the clamp to the ms payload (TombMetaMs) and re-OR-ing the anchor bit back in afterward keeps
+// the CLASS of `meta` (None, D, or anchor) intact through the clamp -- only the magnitude, for the
+// D and anchor cases, is ever capped. kTombMetaNone (0) needs no special case: TombMetaMs(0) is 0,
+// 0 & kTombMetaAnchorOnly is 0, and min(0, now_ms) is 0 for any real now_ms, so the result is 0
+// either way.
+inline uint64_t ClampPeerTombMetaDeadline(uint64_t meta, uint64_t now_ms) {
+  return (meta & kTombMetaAnchorOnly) | std::min(TombMetaMs(meta), now_ms);
 }
 
 // The GC deadline for a tombstone that may also carry a meta word, atop MvccStamp::DeadlineMs
 // above: eligibility floors on whichever of the stamp's own ms component or the meta deadline is
 // later, so a tombstone installed for an already-late whole-key TTL never GCs before that TTL
 // itself would have. meta=kTombMetaNone makes this identical to stamp.DeadlineMs(ttl_ms) for a
-// VALIDATED ttl (see below); every install/apply site still passes kTombMetaNone today, with no
-// producer yet minting a real D or an anchor-only R.
+// VALIDATED ttl (see below).
 //
 // Saturates rather than overflows, but only as a backstop, not a load-bearing guarantee.
 // DeadlineMs's own plain add is safe not because MsPart() alone is bounded (its 43-bit layout

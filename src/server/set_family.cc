@@ -1753,8 +1753,8 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
       if (derived) {
         // drakeydb: P4-5 -- meta = kTombMetaAnchorOnly | reap-time R, mirroring
         // DbSlice::DeleteReapedContainer (db_slice.cc): this emptiness is member-TTL-caused, not a
-        // whole-key deadline, so it earns an anchor, never a D that D-27 (a later task) could veto
-        // an applied delta against.
+        // whole-key deadline, so it earns an anchor, never a D the D-27 delta veto could fire
+        // against.
         const uint64_t tomb_meta = kTombMetaAnchorOnly | db_cntx.time_now_ms;
         MvccStamp committed;
         const bool found_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(

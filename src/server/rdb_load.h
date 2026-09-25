@@ -569,10 +569,11 @@ class RdbLoader : protected RdbLoaderBase {
   //
   // drakeydb: P4-5 -- `meta`, mandatory: CreateObjectOnShard's own already-expired-incoming caller
   // passes `item->expire_ms` (the peer's whole-key deadline D); HandleTombstones' own
-  // RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- that wire format carries no
-  // meta at all yet (a later task's V2 opcode does). Clamped to `min(meta, this call's own "now")`
-  // before either install point below: D <= now by construction for the expired-incoming caller,
-  // so only a corrupt/hostile value ever actually clamps (mvcc.h's own
+  // RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- the V2 tombstone opcode is
+  // what will carry meta on the wire for that record kind. Clamped, at each install point below,
+  // against this function's own already-captured clock reading (its own `db_cntx.time_now_ms`),
+  // never a second, independently-read clock: D <= that reading by construction for the
+  // expired-incoming caller, so only a corrupt/hostile value ever actually clamps (mvcc.h's own
   // ClampPeerTombMetaDeadline comment).
   static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
                                          const MvccStamp& stamp, bool resident_live, uint64_t meta);
