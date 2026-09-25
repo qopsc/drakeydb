@@ -568,15 +568,19 @@ class RdbLoader : protected RdbLoaderBase {
   // `prime` holds a live entry for `key`.  No-op when the resident side wins the compare.
   //
   // drakeydb: P4-5 -- `meta`, mandatory: CreateObjectOnShard's own already-expired-incoming caller
-  // passes `item->expire_ms` (the peer's whole-key deadline D); HandleTombstones' own
-  // RDB_OPCODE_DF_TOMBSTONES caller passes kTombMetaNone explicitly -- the V2 tombstone opcode is
-  // what will carry meta on the wire for that record kind. Clamped, at each install point below,
-  // against this function's own already-captured clock reading (its own `db_cntx.time_now_ms`),
-  // never a second, independently-read clock: D <= that reading by construction for the
-  // expired-incoming caller, so only a corrupt/hostile value ever actually clamps (mvcc.h's own
-  // ClampPeerTombMetaDeadline comment).
+  // passes `item->expire_ms` (the peer's whole-key deadline D, tagged as an anchor when the
+  // loaded value could only have been emptied by member expiry -- container_utils::
+  // MemberTtlOnlyContainer); HandleTombstones' own RDB_OPCODE_DF_TOMBSTONES caller passes
+  // kTombMetaNone explicitly -- the V2 tombstone opcode is what will carry meta on the wire for
+  // that record kind. Clamped, at each install point below, against `now_ms` -- the CALLER's own
+  // already-known clock reading (CreateObjectOnShard's own db_cntx.time_now_ms, threaded from
+  // LoadItemsBuffer's own single per-batch read; HandleTombstones' own per-key
+  // db_cntx.time_now_ms), not a fresh, independently-read one taken inside this function: D <= that
+  // reading by construction for the expired-incoming caller, so only a corrupt/hostile value ever
+  // actually clamps (mvcc.h's own ClampPeerTombMetaDeadline comment).
   static void ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, std::string_view key,
-                                         const MvccStamp& stamp, bool resident_live, uint64_t meta);
+                                         const MvccStamp& stamp, bool resident_live, uint64_t meta,
+                                         uint64_t now_ms);
 
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.

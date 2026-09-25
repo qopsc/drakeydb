@@ -484,23 +484,25 @@ class DbSlice {
   // a divergence -- no real stamp falls between the two (floored stamps never go on the wire), and
   // a merge-load raises the lower one. This present-key path predates this call.
   //
-  // drakeydb: P4-5 -- `meta`, mandatory (no default: every one of this method's four call sites --
-  // SetCmd::Set, OpRestore, Renamer::DeserializeDest, RdbLoader::ApplyMergeTombstoneOnShard's own
-  // no-live-key fallthrough -- now has a real incoming deadline D to supply, never a meta-less
-  // install left over by omission). Clamped via mvcc.h's ClampPeerTombMetaDeadline (which
-  // preserves an anchor's own bit 63 -- see its own comment) before being forwarded to
-  // SetTombstone: every caller reaches this method because the incoming deadline has ALREADY
-  // elapsed (D <= now by construction), so a genuine D never clamps -- only a corrupt or hostile
-  // peer value claiming a future deadline does. A caller with no real deadline to give (there are
-  // none left today) would pass kTombMetaNone explicitly -- clamping 0 against any now_ms is
-  // still 0, a harmless no-op.
+  // drakeydb: P4-5 -- `meta`, mandatory (no default: this method has four call sites -- SetCmd::
+  // Set, OpRestore, Renamer::DeserializeDest, and RdbLoader::ApplyMergeTombstoneOnShard's own
+  // no-live-key fallthrough -- and every one of them must consciously decide what to supply, not
+  // fall back to a meta-less install by omission). Most callers supply a real incoming deadline D
+  // (tagged as an anchor when the value could only have been emptied by member expiry --
+  // container_utils::MemberTtlOnlyContainer); ApplyMergeTombstoneOnShard's own fallthrough is
+  // itself reached by TWO different upstream sources, and its OTHER one (an RDB_OPCODE_DF_
+  // TOMBSTONES record, whose wire format carries no meta at all yet) passes kTombMetaNone through
+  // explicitly. Clamped via mvcc.h's ClampPeerTombMetaDeadline (which preserves an anchor's own
+  // bit 63 -- see its own comment) before being forwarded to SetTombstone: every caller reaches
+  // this method because the incoming deadline has ALREADY elapsed (D <= now by construction), so
+  // a genuine D never clamps -- only a corrupt or hostile peer value claiming a future deadline
+  // does. kTombMetaNone clamps to itself regardless -- a harmless no-op.
   //
-  // drakeydb: P4-5 fix round 1 -- `now_ms`, the CALLER's own already-known clock reading (the
-  // transaction's db_cntx.time_now_ms, or the loader's own db_cntx.time_now_ms), not a second,
-  // independently-read GetCurrentTimeMs() here: reusing the SAME reading the caller already used
-  // to decide this write had elapsed makes the clamp provably inert for a genuine D, rather than
-  // racing a fresh read taken microseconds later (across any yield the caller took) against the
-  // same deadline.
+  // drakeydb: P4-5 -- `now_ms`, the CALLER's own already-known clock reading (the transaction's
+  // db_cntx.time_now_ms, or the loader's own db_cntx.time_now_ms), not a second, independently-read
+  // GetCurrentTimeMs() here: reusing the SAME reading the caller already used to decide this write
+  // had elapsed makes the clamp provably inert for a genuine D, rather than racing a fresh read
+  // taken microseconds later (across any yield the caller took) against the same deadline.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;

@@ -162,7 +162,7 @@ inline uint64_t TombMetaMs(uint64_t meta) {
 // construction (ExpireIfNeeded's own pre-check), so that caller DCHECKs the invariant instead of
 // clamping it.
 //
-// drakeydb: P4-5 fix round 1 -- preserves the anchor bit: the naive `min(meta, now_ms)` strips it,
+// drakeydb: P4-5 -- preserves the anchor bit: the naive `min(meta, now_ms)` strips it,
 // since an anchor's own bit 63 makes the raw word compare far ABOVE any real `now_ms`, so a plain
 // min() always picks `now_ms` and silently turns an anchor into a bare whole-key deadline. Masking
 // the clamp to the ms payload (TombMetaMs) and re-OR-ing the anchor bit back in afterward keeps

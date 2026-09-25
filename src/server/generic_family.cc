@@ -195,6 +195,13 @@ class RdbRestoreValue : protected RdbLoaderBase {
   OpResult<DbSlice::ItAndUpdater> Add(string_view key, string_view payload, const DbContext& cntx,
                                       const RestoreArgs& args, DbSlice* db_slice);
 
+  // drakeydb: P4-5 -- parses `payload` into a materialized PrimeValue without installing it
+  // anywhere, so a caller that has already decided this write's own deadline has elapsed can
+  // still inspect the value's own content (its type, and for a set/hash its member-TTL layout --
+  // container_utils::MemberTtlOnlyContainer) before discarding it. Add() below calls this too,
+  // then installs the result; the two never parse the same payload independently.
+  OpResult<PrimeValue> ParseOnly(string_view payload);
+
  private:
   std::optional<OpaqueObj> Parse(io::Source* source);
   int rdb_type_ = -1;
@@ -224,10 +231,8 @@ std::optional<RdbLoaderBase::OpaqueObj> RdbRestoreValue::Parse(io::Source* sourc
   return std::optional<OpaqueObj>(std::move(obj));
 }
 
-OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_view data,
-                                                     const DbContext& cntx, const RestoreArgs& args,
-                                                     DbSlice* db_slice) {
-  InMemSource data_src(data);
+OpResult<PrimeValue> RdbRestoreValue::ParseOnly(string_view payload) {
+  InMemSource data_src(payload);
   PrimeValue pv;
   bool first_parse = true;
   do {
@@ -259,12 +264,48 @@ OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_vie
     }
   } while (pending_read_.remaining > 0);
 
-  auto res = db_slice->AddOrUpdate(cntx, key, std::move(pv), args.ExpirationTime());
+  return pv;
+}
+
+OpResult<DbSlice::ItAndUpdater> RdbRestoreValue::Add(string_view key, string_view data,
+                                                     const DbContext& cntx, const RestoreArgs& args,
+                                                     DbSlice* db_slice) {
+  auto pv_res = ParseOnly(data);
+  if (!pv_res) {
+    return pv_res.status();
+  }
+
+  auto res = db_slice->AddOrUpdate(cntx, key, std::move(*pv_res), args.ExpirationTime());
   if (res) {
     res->it->first.SetSticky(args.Sticky());
     AddKeyToIndexesIfNeeded(key, cntx, res->it->second, db_slice->shard_owner());
   }
   return res;
+}
+
+// drakeydb: P4-5 -- meta for a peer-sourced RESTORE/rename write whose own deadline has already
+// elapsed: `deadline_ms` tagged with kTombMetaAnchorOnly when the payload's own value is a
+// container that could only ever have been emptied by member expiry
+// (container_utils::MemberTtlOnlyContainer), a bare deadline otherwise. The payload is not
+// materialized elsewhere on this path (OpRestore/Renamer::DeserializeDest both skip
+// RdbRestoreValue::Add entirely once Expired() is already known), so this parses it via
+// ParseOnly, inspects the result, then lets it go -- never installed, since the key stays
+// absent/deleted either way. A missing version or a parse failure falls back to a bare deadline,
+// the same meta a plain string (which never carries member TTLs) always gets.
+uint64_t ElapsedRestoreTombMeta(string_view payload, optional<RdbVersion> version,
+                                uint64_t deadline_ms) {
+  if (!version)
+    return deadline_ms;
+  RdbRestoreValue loader(*version);
+  auto pv_res = loader.ParseOnly(payload);
+  if (!pv_res) {
+    // SKIPPED means every member's own per-field TTL had also already elapsed by parse time
+    // (RdbLoaderBase::FromOpaque's rdb::errc::value_expired) -- the container was logically
+    // already empty, which the member-emptiness rule anchors unconditionally.
+    return pv_res.status() == OpStatus::SKIPPED ? (kTombMetaAnchorOnly | deadline_ms) : deadline_ms;
+  }
+  return container_utils::MemberTtlOnlyContainer(*pv_res) ? (kTombMetaAnchorOnly | deadline_ms)
+                                                          : deadline_ms;
 }
 
 [[nodiscard]] bool RestoreArgs::UpdateExpiration(int64_t now_msec) {
@@ -585,6 +626,15 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
   }
 
   auto& db_slice = t->GetDbSlice(shard->shard_id());
+  // drakeydb: P4-5 -- captured BEFORE DelMutable below overwrites it: RENAME is kUnguarded
+  // (ClassifyJournaledCommand), so unlike a guarded SET/RESTORE this callback runs regardless of
+  // any LWW comparison against the destination's own prior stamp -- the delete below can be
+  // FLOORED (the incoming write's own stamp X is actually OLDER than dest_prior, applied anyway
+  // because nothing upstream of this callback ever compared them). A meta-bearing tombstone must
+  // only ever represent a genuine deadline, so the Expired()-branch below attaches one only when
+  // MergeAccepts(dest_prior, incoming) actually holds -- mirroring the !dest_found_ branch's own,
+  // pre-existing gate a few lines down.
+  const optional<MvccStamp> dest_prior = db_slice.GetMvcc(op_args.db_cntx.db_index, dest_key_);
   auto dest_res = db_slice.FindMutable(op_args.db_cntx, dest_key_);
 
   if (dest_found_) {
@@ -598,15 +648,25 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
     if (dest_found_ && shard->journal()) {  // We need to delete old dest_key_ from replica
       RecordJournal(op_args, "DEL"sv, ArgSlice{dest_key_}, 2);
 
-      // drakeydb: P4-5 fix round 1 -- the identical elapsed-on-arrival present-key shape
-      // SetCmd::DeleteExpiredKey and OpRestore's found_prev branch attach meta for (string_family.
-      // cc / generic_family.cc, above in this file): attach meta = D only AFTER the DEL's own
-      // journal call above has fully returned, and only when this delete is itself a guarded,
-      // peer-sourced apply. This key's own prior stamp already committed above regardless.
+      // drakeydb: P4-5 -- the identical elapsed-on-arrival present-key shape SetCmd::
+      // DeleteExpiredKey and OpRestore's found_prev branch attach meta for (string_family.cc /
+      // generic_family.cc, above in this file): attach meta only AFTER the DEL's own journal call
+      // above has fully returned, and only when this delete is itself a guarded, peer-sourced
+      // apply. Unlike those two guarded (kSingleKey) commands, this one is NOT protected by
+      // Transaction::ShouldDropForLww's generic pre-callback veto (RENAME is kUnguarded), so it
+      // additionally gates on MergeAccepts(dest_prior, incoming) -- see dest_prior's own comment,
+      // above -- before attaching anything: a floored delete's own tombstone must never carry a
+      // deadline that implies it genuinely won.
       if (LwwGuardActive(op_args.db_cntx.repl_lww_guard, op_args.db_cntx.repl_mvcc)) {
-        db_slice.SetTombMeta(op_args.db_cntx.db_index, dest_key_,
-                             ClampPeerTombMetaDeadline(restore_args.ElapsedDeadlineMs(),
-                                                       op_args.db_cntx.time_now_ms));
+        if (auto incoming =
+                IncomingStamp(op_args.db_cntx.repl_mvcc, op_args.db_cntx.repl_origin_idx);
+            incoming && MergeAccepts(dest_prior, *incoming)) {
+          const uint64_t tagged_meta =
+              ElapsedRestoreTombMeta(serialized_value_->value, serialized_value_->version,
+                                     restore_args.ElapsedDeadlineMs());
+          db_slice.SetTombMeta(op_args.db_cntx.db_index, dest_key_,
+                               ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms));
+        }
       }
     }
 
@@ -636,12 +696,17 @@ OpStatus Renamer::DeserializeDest(Transaction* t, EngineShard* shard) {
       if (LwwGuardActive(dctx.repl_lww_guard, dctx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(dctx.repl_mvcc, dctx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(dctx.db_index, dest_key_), *incoming)) {
-          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to this
-          // transaction's own dctx.time_now_ms at install (InstallAbsentKeyTombstone,
-          // db_slice.cc): D-16, ISSUE-REGISTER.md.
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), tagged as an anchor
+          // when the payload's own value could only have been emptied by member expiry
+          // (ElapsedRestoreTombMeta, above in this file), clamped to this transaction's own
+          // dctx.time_now_ms at install (InstallAbsentKeyTombstone, db_slice.cc): D-16,
+          // ISSUE-REGISTER.md.
+          const uint64_t tagged_meta =
+              ElapsedRestoreTombMeta(serialized_value_->value, serialized_value_->version,
+                                     restore_args.ElapsedDeadlineMs());
           db_slice.InstallAbsentKeyTombstone(dctx.db_index, dest_key_,
-                                             ExpiryTombstoneFor(*incoming),
-                                             restore_args.ElapsedDeadlineMs(), dctx.time_now_ms);
+                                             ExpiryTombstoneFor(*incoming), tagged_meta,
+                                             dctx.time_now_ms);
         }
       }
     }
@@ -786,11 +851,15 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       if (LwwGuardActive(db_cntx.repl_lww_guard, db_cntx.repl_mvcc)) {
         if (auto incoming = IncomingStamp(db_cntx.repl_mvcc, db_cntx.repl_origin_idx);
             incoming && MergeAccepts(db_slice.GetMvcc(db_cntx.db_index, key), *incoming)) {
-          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), clamped to this
-          // transaction's own db_cntx.time_now_ms at install (InstallAbsentKeyTombstone,
-          // db_slice.cc): D-16, ISSUE-REGISTER.md.
+          // drakeydb: P4-5 -- meta = D (restore_args.ElapsedDeadlineMs()), tagged as an anchor
+          // when the payload's own value could only have been emptied by member expiry
+          // (ElapsedRestoreTombMeta, above in this file), clamped to this transaction's own
+          // db_cntx.time_now_ms at install (InstallAbsentKeyTombstone, db_slice.cc): D-16,
+          // ISSUE-REGISTER.md.
+          const uint64_t tagged_meta =
+              ElapsedRestoreTombMeta(payload, rdb_version, restore_args.ElapsedDeadlineMs());
           db_slice.InstallAbsentKeyTombstone(db_cntx.db_index, key, ExpiryTombstoneFor(*incoming),
-                                             restore_args.ElapsedDeadlineMs(), db_cntx.time_now_ms);
+                                             tagged_meta, db_cntx.time_now_ms);
         }
       }
     } else if (op_args.shard->journal() && IsActiveReplica()) {
@@ -804,16 +873,21 @@ OpStatus OpRestore(const OpArgs& op_args, std::string_view key, std::string_view
       // dest key deleted, new value never created" DEL journal, above in this file.
       RecordJournal(op_args, "DEL"sv, ArgSlice{key});
 
-      // drakeydb: P4-5 -- attach meta = D only AFTER the DEL's own journal call above has fully
+      // drakeydb: P4-5 -- attach meta only AFTER the DEL's own journal call above has fully
       // returned (journal.cc's post-AddLogRecord commit callback must never allocate; SetTombMeta
       // can). Gated on LwwGuardActive, mirroring SetCmd::DeleteExpiredKey's identical present-key
       // shape (string_family.cc): this key's own prior stamp already committed above regardless,
       // and a deadline-bearing tombstone is only worth installing when this delete is itself a
-      // guarded, PEER-sourced apply. D-16, ISSUE-REGISTER.md.
+      // guarded, PEER-sourced apply. RESTORE is guarded (kSingleKey, ClassifyJournaledCommand),
+      // so Transaction::ShouldDropForLww's generic pre-callback veto already guarantees this
+      // delete is not floored -- no additional MergeAccepts gate is needed here, unlike Renamer::
+      // DeserializeDest's own present-destination branch (RENAME is kUnguarded, above in this
+      // file). D-16, ISSUE-REGISTER.md.
       if (LwwGuardActive(op_args.db_cntx.repl_lww_guard, op_args.db_cntx.repl_mvcc)) {
+        const uint64_t tagged_meta =
+            ElapsedRestoreTombMeta(payload, rdb_version, restore_args.ElapsedDeadlineMs());
         db_slice.SetTombMeta(op_args.db_cntx.db_index, key,
-                             ClampPeerTombMetaDeadline(restore_args.ElapsedDeadlineMs(),
-                                                       op_args.db_cntx.time_now_ms));
+                             ClampPeerTombMetaDeadline(tagged_meta, op_args.db_cntx.time_now_ms));
       }
     }
     return OpStatus::OK;

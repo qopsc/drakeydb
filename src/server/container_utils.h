@@ -57,6 +57,15 @@ bool IterateMap(const PrimeValue& pv, const IterateKVFunc& func, bool allow_yiel
 // Get StringMap pointer from primetable value. Sets expire time from db_context
 StringMap* GetStringMap(const PrimeValue& pv, const DbContext& db_context);
 
+// drakeydb: P4-5 -- true iff `pv` is a container whose emptiness could ONLY ever have been
+// reached through member expiry: it carries member-level TTL bookkeeping
+// (PrimeValue::HasMemberExpiration()) AND every member it currently holds has a TTL of its own.
+// A plain string/list/zset/stream/json can never carry member TTLs and always returns false. Pure
+// function of `pv`'s own encoded content -- never of local reaper state -- so every node computes
+// the identical answer for the identical replicated value, regardless of which reap path (if any)
+// has run on this node, or how far it got. See mvcc.h's kTombMetaAnchorOnly for what this decides.
+bool MemberTtlOnlyContainer(const PrimeValue& pv);
+
 using BlockingResultCb =
     std::function<void(Transaction*, EngineShard*, std::string_view /* key */)>;
 

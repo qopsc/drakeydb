@@ -1735,7 +1735,9 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
   // match `meta`, whatever it held before -- a full tombstone overwrite specifies the complete
   // new state, meta included. kTombMetaNone is this parameter's default, so a caller that omits
   // it still gets the original meta-less behavior; InstallAbsentKeyTombstone and
-  // RdbLoader::ApplyMergeTombstoneOnShard both pass a real, non-default meta today.
+  // RdbLoader::ApplyMergeTombstoneOnShard may each pass a real, non-default meta (or, for an
+  // opcode-225 record, kTombMetaNone explicitly -- see InstallAbsentKeyTombstone's own comment,
+  // db_slice.h).
   SetTombMetaOnSlot(db, it, meta);
 }
 
@@ -1829,7 +1831,8 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
   // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
   // corrupt or hostile peer meta must never make this tombstone immortal by claiming a deadline
-  // far in the future. Against the CALLER's own now_ms (fix round 1), not a fresh read here.
+  // far in the future. Against `now_ms`, the CALLER's own already-known clock reading, never a
+  // fresh read taken here.
   const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, now_ms);
   if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
     SetTombstone(db_ind, key, stamp, clamped_meta);
@@ -2235,17 +2238,21 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
 
   int64_t expire_time = it->first.GetExpireTime();
 
-  // drakeydb: P4-5 fix round 1 -- captured before Del() below erases the value: whether this
-  // container also carried member-level TTL bookkeeping (SADDEX/HSETEX/FIELDEXPIRE) at the moment
-  // its WHOLE key expired. See this function's own RecordExpiryBlocking call, below, for why.
-  const bool had_member_expiration = it->second.HasMemberExpiration();
-
   // Never do expiration if expiration is disabled, or on replicas unless replica_delete_expired
   // is enabled (which allows replicas to proactively delete expired keys on the read path).
   if (int64_t(cntx.time_now_ms) < expire_time || !expire_allowed_ ||
       (owner_->IsReplica() && !absl::GetFlag(FLAGS_replica_delete_expired))) {
     return it;
   }
+
+  // drakeydb: P4-5 -- captured before Del() below erases the value: whether this container could
+  // only ever have been emptied by member expiry (container_utils::MemberTtlOnlyContainer). See
+  // this function's own RecordExpiryBlocking call, below, for why. Deliberately AFTER the early
+  // return above, not before it: every whole-key-TTL'd set/hash lookup reaches this point, on
+  // every node including a non-active one, so walking its members here unconditionally would pay
+  // that cost on every such lookup regardless of whether this call actually goes on to expire
+  // anything.
+  const bool member_ttl_only = container_utils::MemberTtlOnlyContainer(it->second);
 
   string scratch;
   // drakeydb: P4-3 Task 11 -- own a copy, not just a view into `it`. Del() below erases this entry
@@ -2308,17 +2315,18 @@ PrimeIterator DbSlice::ExpireIfNeeded(const Context& cntx, PrimeIterator it, vec
     // born, since GC's own eligibility check only ever saw the tombstone's OWN stamp (T.ms), never
     // the value's much-later deadline.
     //
-    // drakeydb: P4-5 fix round 1 -- when this container ALSO carried member-level TTL bookkeeping
-    // (`had_member_expiration`, captured above before Del()), tag the deadline as an anchor
-    // (kTombMetaAnchorOnly | D) instead of a bare whole-key D. GC eligibility is unaffected --
-    // TombMetaMs strips the anchor bit back off, so this still reaps at D + ttl exactly as a bare
-    // D would -- but the meta CLASS a container's tombstone gets must not depend on which reap
-    // path (whole-key vs member-emptiness) happens to win the race on a given node: two nodes
-    // that reap the SAME container's expiry through different paths (one whole-key, after D; the
-    // other via member-emptiness, before D) must agree that the resulting tombstone is an anchor
-    // on both sides, or the D-27 delta veto would drop a genuine re-create on the side that saw a
-    // bare D but not on the side that saw an anchor.
-    const uint64_t tomb_meta = had_member_expiration
+    // drakeydb: P4-5 -- `member_ttl_only` (computed above, before Del()) tags the deadline as an
+    // anchor (kTombMetaAnchorOnly | D) instead of a bare whole-key D. GC eligibility is
+    // unaffected -- TombMetaMs strips the anchor bit back off, so this still reaps at D + ttl
+    // exactly as a bare D would -- but the meta CLASS a container's tombstone gets must be a
+    // function of the value's own replicated content alone (container_utils::
+    // MemberTtlOnlyContainer's own comment, container_utils.h), never of which reap path happens
+    // to win the race on a given node: two nodes that reap the SAME container's expiry through
+    // different paths (one whole-key, after D; the other via member-emptiness, before D) must
+    // agree that the resulting tombstone is an anchor on both sides, or the D-27 delta veto would
+    // drop a genuine re-create on the side that saw a bare D but not on the side that saw an
+    // anchor.
+    const uint64_t tomb_meta = member_ttl_only
                                    ? (kTombMetaAnchorOnly | static_cast<uint64_t>(expire_time))
                                    : static_cast<uint64_t>(expire_time);
     RecordExpiryBlocking(cntx, key, tomb_meta);

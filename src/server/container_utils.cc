@@ -3,6 +3,8 @@
 //
 #include "server/container_utils.h"
 
+#include <absl/cleanup/cleanup.h>
+
 #include "base/flags.h"
 #include "base/logging.h"
 #include "core/detail/listpack_wrap.h"
@@ -333,6 +335,42 @@ StringMap* GetStringMap(const PrimeValue& pv, const DbContext& db_context) {
   DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
   pv.SetMemberTime(MemberTimeSeconds(db_context.time_now_ms));
   return static_cast<StringMap*>(pv.RObjPtr());
+}
+
+bool MemberTtlOnlyContainer(const PrimeValue& pv) {
+  if (!pv.HasMemberExpiration())
+    return false;
+
+  // HasMemberExpiration() is only ever true for the dense (kEncodingStrMap2) encoding --
+  // DispatchSetOrMap's own guard (compact_object.cc) -- so ObjType() is OBJ_SET or OBJ_HASH here.
+  // 0 disables lazy member expiry for this read-only walk, the same pattern RdbSerializer::
+  // SaveSetObject/SaveHSetObject (rdb_save.cc) use: a real clock reading here could itself expire
+  // (and so silently drop) a member mid-walk, making the answer depend on the exact instant this
+  // ran rather than on the value's own content.
+  pv.SetMemberTime(0);
+  absl::Cleanup restore_time = [&pv] { pv.SetMemberTime(MemberTimeSeconds(GetCurrentTimeMs())); };
+
+  bool all_have_ttl = true;
+  if (pv.ObjType() == OBJ_SET) {
+    VisitSet(pv.RObjPtr(), [&](auto* set) {
+      for (auto it = set->begin(); it != set->end(); ++it) {
+        if (!it.HasExpiry()) {
+          all_have_ttl = false;
+          break;
+        }
+      }
+    });
+  } else {
+    DCHECK_EQ(OBJ_HASH, pv.ObjType());
+    auto* sm = static_cast<StringMap*>(pv.RObjPtr());
+    for (auto it = sm->begin(); it != sm->end(); ++it) {
+      if (!it.HasExpiry()) {
+        all_have_ttl = false;
+        break;
+      }
+    }
+  }
+  return all_have_ttl;
 }
 
 OpResult<string> RunCbOnFirstNonEmptyBlocking(Transaction* trans, int req_obj_type,
