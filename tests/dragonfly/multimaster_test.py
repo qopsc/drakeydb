@@ -2798,11 +2798,13 @@ async def test_stream_lww_dropped_counter_renders_as_prometheus_metric(
         samples[0].value == info_dropped
     ), f"/metrics ({samples[0].value}) must agree with INFO replication ({info_dropped})"
 
-    # drakeydb: P4-5 -- multimaster_expired_delta_dropped_total has no producer yet (the D-27 veto
-    # that increments it lands separately), so this only pins the same presence/gate shape its
-    # sibling above gets: present and 0 on an active node, entirely absent on a non-active one.
+    # drakeydb: P4-5 -- this test's own scenario (a stale SET dropped by the streaming LWW guard)
+    # never touches a whole-key deadline tombstone, so the D-27 veto has nothing to drop here; this
+    # only pins the same presence/gate shape its sibling above gets: present and 0 on an active
+    # node, entirely absent on a non-active one. See test_expired_delta_rate_limiter_across_paused_
+    # link below for a scenario that actually drives this counter off 0.
     info_expired_dropped = int((await c_b.info("replication"))["multimaster_expired_delta_dropped"])
-    assert info_expired_dropped == 0, "sanity: nothing here increments this counter yet"
+    assert info_expired_dropped == 0, "sanity: this scenario never touches a deadline tombstone"
     assert (
         "dragonfly_multimaster_expired_delta_dropped" in metrics_b
     ), "dragonfly_multimaster_expired_delta_dropped_total must render on /metrics on an active node"
@@ -3003,3 +3005,293 @@ async def test_stream_lww_restore_without_replace_pinned_by_flag(
         # ANY active-replica node -- confirmed by hand with a single node, zero peers, issuing the
         # same RESTORE directly, no guard or replication involved at all. Pre-existing (OpRestore's
         # BUSYKEY early-return does not roll back PostUpdate's arm), independent of the guard.
+
+
+# ---- Phase 4: the D-27 expired-delta veto (P4-5) ----
+#
+# Transaction::ShouldDropExpiredDelta (transaction.cc): an unguarded delta (INCR/APPEND/...)
+# authored strictly before a STRING's own whole-key deadline D is dropped outright once the
+# receiver already holds (or comes to hold) a tombstone carrying that D, instead of re-creating
+# the key with no TTL. See docs/ISSUE-REGISTER.md D-27 for the failure this closes, and
+# multi_master_test.cc's own MvccStoreTest.ExpiredDeltaVeto* suite for the unit-level coverage of
+# every branch; the two tests below are the socket-level, real-clock proof that the same mechanism
+# holds end to end.
+
+
+@pytest.mark.parametrize("stream_lww", [True, False], ids=["guarded", "unguarded"])
+async def test_expired_delta_rate_limiter_across_paused_link(
+    df_factory: DflyInstanceFactory, proxy_factory, stream_lww
+):
+    """The classic rate-limiter pattern (`INCR k`; `EXPIRE k ttl` when it returns 1) across a
+    paused peer link, parametrized on A's own `--multi_master_stream_lww` -- A is what applies
+    B's INCR here, and the guard bit is read once at flow setup from the CONSUMING side's own
+    flag (replica.cc), so A's flag (not B's) is what this parametrization must flip. The
+    parametrization IS the falsification, the same shape as
+    test_stream_lww_newer_local_write_survives_stale_peer_write above: `ids=["guarded",
+    "unguarded"]` runs the identical body with only the flag flipped, so a body that only ever
+    exercised one branch would fail the other parametrization outright.
+
+    Setup: A and B are active peers (B's own consuming link to A goes through a proxy, so A's own
+    writes to B can be paused without touching the reverse direction). A runs `INCR k` (k=1) then
+    `PEXPIRE k <px_ms>`, both converging to B over the direct (unproxied) B<-A flow.
+
+    With the B<-A flow then paused, B runs its OWN local `INCR k` (k=2 on B) strictly before the
+    converged deadline D -- the rate limiter's own "only EXPIRE when INCR returns 1" branch never
+    re-arms the TTL on this second INCR (Redis semantics: INCR never touches an existing TTL), so
+    B's copy keeps counting down toward the SAME D as A's. A's own copy is left to expire and get
+    lazily reaped on its own (forced via a plain read, deterministic, unrelated to replication) --
+    this reproduces "A has expired k and reaped it" before B's INCR is ever let through.
+
+    Resuming then delivers B's stale (pre-D) INCR to A's now-tombstoned slot:
+    - guarded: the veto drops it outright -- A stays a tombstone, and once D also elapses locally
+      on B (the SAME real deadline, unaffected by B's own INCR), B expires its own copy too:
+      DEBUG MVCC agrees (`state:tombstone`) on both, and the drop counter has advanced.
+    - unguarded: the delta re-creates k=1 on A with NO TTL (ISSUE-REGISTER.md's own D-27 example,
+      verbatim -- an unguarded INCR replays against A's OWN current state, which was absent, so it
+      counts up from 0, not from B's own value): A's copy never expires again, permanently
+      diverging from B's, which still expires on schedule. This IS D-27, not a fixed variant of it.
+    """
+    # Margin over the ~0.5s of setup overhead below (a 0.2s propagation sleep plus one
+    # _pause_and_settle call's own fixed 0.3s settle delay) that must elapse strictly BEFORE B's
+    # own INCR runs, or it would land on the wrong side of D itself. See the 3-node reorder test's
+    # own comment (below) for the tighter budget that actually caught this the hard way.
+    px_ms = 2000
+
+    # drakeydb: P4-5 -- the guard bit is read once at flow setup from the CONSUMING side's own
+    # --multi_master_stream_lww (replica.cc); A is what applies B's INCR here, so A's own flag --
+    # not B's -- is what this parametrization must flip.
+    a = df_factory.create(**active_args(multi_master_stream_lww=str(stream_lww).lower()))
+    b = df_factory.create(**active_args())
+    df_factory.start_all([a, b])
+    c_a, c_b = a.client(), b.client()
+
+    proxy = await proxy_factory(b.port)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, proxy)
+    await wait_for_peers(c_a, 1)
+
+    assert await c_a.incr("k") == 1
+    await wait_for_value(c_b, "k", "1")
+    assert await c_a.execute_command("pexpire", "k", str(px_ms)) == 1
+    await asyncio.sleep(0.2)  # let the PEXPIRE's own full-state SET reach B over the direct flow.
+    assert int(await c_b.execute_command("pttl", "k")) > 0, "sanity: B must have the same deadline"
+
+    baseline_dropped = int((await c_a.info("replication"))["multimaster_expired_delta_dropped"])
+
+    await _pause_and_settle(proxy, c_b, "settle-rate-limiter")
+    assert await c_b.incr("k") == 2  # B's own local write, strictly before D; TTL untouched.
+
+    await asyncio.sleep(px_ms / 1000 + 0.5)  # comfortably past D on the shared wall clock.
+    assert await _exists(c_a, "k") is False, "A must have lazily expired its own copy by now"
+
+    proxy.resume()
+    await c_b.set("drain-rate-limiter", "x")
+    await wait_for_value(c_a, "drain-rate-limiter", "x")
+
+    # B's own copy carries the SAME deadline D, untouched by its own later INCR -- it expires on
+    # its own schedule regardless of which branch A took above.
+    assert await _exists(c_b, "k") is False, "B must have independently expired its own copy too"
+
+    if stream_lww:
+        assert await _exists(c_a, "k") is False, "the veto must drop the delta, not re-create it"
+        state_a = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))["state"]
+        state_b = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))["state"]
+        assert state_a == state_b == "tombstone", (state_a, state_b)
+        dropped = int((await c_a.info("replication"))["multimaster_expired_delta_dropped"])
+        assert dropped >= baseline_dropped + 1, f"drop counter did not advance: {dropped}"
+    else:
+        assert await c_a.get("k") == "1", (
+            "unguarded: replays as a plain INCR against A's own (absent) state, counting up "
+            "from 0, not from B's value"
+        )
+        assert int(await c_a.execute_command("pttl", "k")) == -1, "re-created with NO TTL -- D-27"
+        # The divergence itself: A now holds a live, TTL-less key while B holds none at all.
+        assert not await _exists(c_b, "k")
+
+    unstamped = int((await c_a.info("replication"))["mvcc_unstamped_writes"])
+    assert unstamped == 0, f"unstamped writes leaked on A: {unstamped}"
+
+
+async def _detach_all_local(clients):
+    """3-node REPLICAOF NO ONE, confirmed on every node -- the same shape multimaster_merge_test.
+    py's own `_detach_all` uses for its D-15 tests, kept local here rather than imported: that
+    module already imports from this one (attach_full_mesh), and importing back would be
+    circular.
+    """
+    for c in clients:
+        await c.execute_command("REPLICAOF NO ONE")
+    for c in clients:
+        info = await c.info("replication")
+        assert info["connected_masters"] == 0, f"still attached after REPLICAOF NO ONE: {info}"
+
+
+async def _wait_converged_3(c_a, c_b, c_c, key, label, timeout=30):
+    """3-node stamp/value agreement on one key, via DEBUG MVCC on each node -- the local
+    equivalent of multimaster_merge_test.py's own `_wait_converged_n`, kept local for the same
+    reason as `_detach_all_local` above."""
+
+    @assert_eventually(timeout=timeout)
+    async def converged():
+        snaps = [
+            _parse_mvcc(await c.execute_command("debug", "mvcc", key)) for c in (c_a, c_b, c_c)
+        ]
+        for i, snap in enumerate(snaps[1:], start=1):
+            assert snap.get("state") == snaps[0].get(
+                "state"
+            ), f"{label}: node0={snaps[0]} node{i}={snap}"
+            assert snap.get("mvcc") == snaps[0].get(
+                "mvcc"
+            ), f"{label}: node0={snaps[0]} node{i}={snap}"
+            assert snap.get("origin") == snaps[0].get(
+                "origin"
+            ), f"{label}: node0={snaps[0]} node{i}={snap}"
+        return snaps
+
+    return await converged()
+
+
+async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
+    df_factory: DflyInstanceFactory, proxy_factory
+):
+    """The drop-only design's own reason for existing (owner decision, 2026-09-25): with 3+ nodes,
+    a peer stream carries no cross-link causality, so ADVANCING the tombstone the D-27 veto drops
+    against can permanently delete a genuine re-create authored by a third node the receiver has
+    not yet heard from. This is the data-loss scenario the "advance" design (reverted before this
+    veto shipped) would have reintroduced.
+
+    Topology: A, B, C in a full mesh, with A's own two consuming links (to B and to C) each routed
+    through their own proxy, so either can be paused independently while the other, and every
+    other leg of the mesh, keeps flowing.
+
+      1. `k` is SET on A with a short PX, converged (identical stamp AND deadline D) to B and C.
+      2. Both of A's own consuming proxies are paused.
+      3. C runs `DEL k` -- reaches B directly (unproxied C<->B), converging there to an explicit,
+         meta-less tombstone; queued behind the paused proxy toward A.
+      4. B, now itself absent, runs its OWN local `INCR k` -- a fresh, ordinary write (never
+         subject to any veto -- it is not a replicated apply), minted strictly before D. Reaches C
+         directly (converges there too); queued behind ITS OWN paused proxy toward A.
+      5. The wall clock is advanced past D (a real sleep). B's INCR's own stamp still predates D --
+         only "now", as read on whichever node processes it, has moved.
+      6. A's B-facing proxy alone is resumed: B's already-stamped, pre-D INCR is delivered to A's
+         still-live (now provably past-D, unreaped) slot. The veto's own lazy reap installs A's
+         local whole-key tombstone (this node's own {S, o+1}+D, unrelated to either B's or C's own
+         stamps), then drops the delta outright: A ends this step lacking the key.
+      7. A's C-facing proxy is deliberately left paused through all of this -- C's own DEL, stamped
+         BELOW B's later INCR, never reaches A by streaming at all in this test.
+      8. A full sync heals A back into the mesh (detach-all, then a fresh REPLICAOF on every leg,
+         no proxies): the merge-on-load LWW compare (MergeAccepts, mvcc.h -- the SAME rule the
+         streaming veto itself defers to) now decides, not arrival order. A's own local tombstone
+         is OLDER than B's live key (it derives from A's ORIGINAL pre-detach stamp, which predates
+         every event in this scenario), so B's live value wins the merge on A.
+      9. Every node ends holding B's re-created key, at B's own stamp -- verified via DEBUG MVCC.
+
+    Falsifying: adding the advance the design considered and rejected -- committing
+    `max(T, ExpiryTombstoneFor(I))` in place of leaving `T` untouched at step 6 -- makes A's own
+    tombstone stamp jump to one tick above B's OWN live stamp I. That advanced stamp is NEWER than
+    B's live key, so at step 8's merge it wins instead: the delete propagates to B and C too, and
+    the key this test expects to survive is gone everywhere. This is the "advance" design's own
+    data-loss case, not merely a slower convergence.
+    """
+    # drakeydb: P4-5 -- margin, not a tight bound: TWO sequential _pause_and_settle calls below
+    # (each with its own fixed 0.3s settle sleep) plus the post-PEXPIRE propagation sleep already
+    # cost ~0.8s before B's own INCR ever runs -- discovered the hard way (a 900ms budget here
+    # made B's INCR land AFTER D on a loaded run, landing in the "genuine re-create" branch
+    # instead of being dropped, and the test failed reproducibly until this was widened).
+    px_ms = 3000
+
+    a = df_factory.create(**active_args())
+    b = df_factory.create(**active_args())
+    c = df_factory.create(**active_args())
+    df_factory.start_all([a, b, c])
+    c_a, c_b, c_c = a.client(), b.client(), c.client()
+
+    proxy_ab = await proxy_factory(b.port)  # A's consuming link to B, pausable independently.
+    proxy_ac = await proxy_factory(c.port)  # A's consuming link to C, pausable independently.
+
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, proxy_ab)
+    await wait_for_peers(c_a, 1)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
+    await attach(c_a, proxy_ac)
+    await wait_for_peers(c_a, 2)
+    await attach(c_b, c)
+    await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
+
+    assert await c_a.set("k", "v0")
+    await wait_for_value(c_b, "k", "v0")
+    await wait_for_value(c_c, "k", "v0")
+    assert await c_a.execute_command("pexpire", "k", str(px_ms)) == 1
+    await asyncio.sleep(0.2)
+    assert int(await c_b.execute_command("pttl", "k")) > 0
+    assert int(await c_c.execute_command("pttl", "k")) > 0
+
+    await _pause_and_settle(proxy_ab, c_b, "settle-reorder-b")
+    await _pause_and_settle(proxy_ac, c_c, "settle-reorder-c")
+
+    assert await c_c.delete("k") == 1
+
+    @assert_eventually(timeout=10)
+    async def _b_sees_del():
+        assert await _exists(c_b, "k") is False
+
+    await _b_sees_del()
+
+    assert await c_b.incr("k") == 1  # B's own local write: fresh, absent key, own stamp I < D.
+    b_stamp = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
+    assert b_stamp["state"] == "value", b_stamp
+
+    @assert_eventually(timeout=10)
+    async def _c_sees_incr():
+        assert await c_c.get("k") == "1"
+
+    await _c_sees_incr()
+
+    baseline_dropped = int((await c_a.info("replication"))["multimaster_expired_delta_dropped"])
+
+    await asyncio.sleep(px_ms / 1000 + 0.5)  # past D on the shared wall clock.
+    assert await _exists(c_a, "k") is False, "A must lazily expire its own still-live copy first"
+
+    proxy_ab.resume()  # only B's own flow -- C's DEL (queued on proxy_ac) stays held back.
+    await c_b.set("drain-reorder", "x")
+    await wait_for_value(c_a, "drain-reorder", "x")
+
+    assert await _exists(c_a, "k") is False, "the veto must drop B's stale delta, not re-create it"
+    dropped = int((await c_a.info("replication"))["multimaster_expired_delta_dropped"])
+    assert dropped >= baseline_dropped + 1, f"drop counter did not advance: {dropped}"
+
+    # C's own DEL never reached A by streaming at all -- proxy_ac was never resumed.
+    await _detach_all_local([c_a, c_b, c_c])
+    await attach(c_a, b)
+    await wait_for_peers(c_a, 1)
+    await attach(c_b, a)
+    await wait_for_peers(c_b, 1)
+    await attach(c_a, c)
+    await wait_for_peers(c_a, 2)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
+    await attach(c_b, c)
+    await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
+
+    snaps = await _wait_converged_3(c_a, c_b, c_c, "k", "post-full-sync-reorder")
+    for label, snap in zip(("a", "b", "c"), snaps):
+        assert snap["state"] == "value", (label, snap)
+        assert snap["mvcc"] == b_stamp["mvcc"], (label, snap, b_stamp)
+        assert snap["origin"] == b_stamp["origin"], (label, snap, b_stamp)
+
+    assert await c_a.get("k") == "1"
+    assert await c_b.get("k") == "1"
+    assert await c_c.get("k") == "1"
+
+    for label, client in (("a", c_a), ("b", c_b), ("c", c_c)):
+        reply = await client.execute_command("debug", "mvcc", "verify")
+        text = reply.decode() if isinstance(reply, bytes) else reply
+        assert text == "mismatches:0", (label, text)
+        unstamped = int((await client.info("replication"))["mvcc_unstamped_writes"])
+        assert unstamped == 0, (label, unstamped)
