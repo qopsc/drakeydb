@@ -1570,6 +1570,72 @@ void AppendBinaryDouble(std::string* out, double val) {
   out->append(reinterpret_cast<const char*>(buf), sizeof(buf));
 }
 
+// drakeydb: P4-5 fix round 1 -- hand-encodes an RDB_ENC_INT32 value byte-for-byte the way
+// EncodeInteger (rdb_save.cc, anonymous namespace there, not reachable from this file) does, so a
+// test can construct an aux value identical in shape to what SaveAuxFieldStrInt/TryIntegerEncoding
+// actually write for ctime/used-mem/etc. -- including one deliberately chosen so a payload byte
+// equals 0xDD, to reproduce the byte-scan hazard deterministically (see
+// ByteScanMustStartAfterAuxSectionNotOffsetZero below).
+void AppendEncodedInt32(std::string* out, int32_t val) {
+  uint8_t buf[5] = {static_cast<uint8_t>((RDB_ENCVAL << 6) | RDB_ENC_INT32)};
+  absl::little_endian::Store32(buf + 1, static_cast<uint32_t>(val));
+  out->append(reinterpret_cast<const char*>(buf), sizeof(buf));
+}
+
+// drakeydb: P4-5 fix round 1 -- returns the offset of the first opcode at or after `pos` that is
+// NOT RDB_OPCODE_AUX, skipping each aux field's key/value pair along the way. `pos` must already
+// sit on an opcode byte (callers pass the offset right after the 9-byte magic header, where
+// RdbSaver::SaveHeader's own SaveAux writes every aux field, rdb_save.cc). A raw 0xDD byte-scan
+// must never start at offset 0: SaveAux writes `ctime`/`used-mem` (live process state --
+// time(NULL)/used_mem_current) through SaveString, which integer-encodes a short numeric value as
+// RDB_ENC_INT8/16/32 raw binary rather than decimal text, and any byte of that binary value can
+// coincidentally equal whatever opcode byte a scan is looking for. Every aux value SaveAux
+// actually writes is either a plain length-prefixed string or one of those three integer shapes --
+// never RDB_ENC_LZF (SaveString's compression path only fires above 20 bytes, far longer than any
+// value SaveAux writes) -- so an LZF marker here is rejected loudly (npos) rather than
+// mis-skipped.
+size_t SkipAuxSection(std::string_view bytes, size_t pos) {
+  auto skip_string = [&](size_t p) -> size_t {
+    if (p >= bytes.size())
+      return std::string::npos;
+    const uint8_t first = static_cast<uint8_t>(bytes[p]);
+    const PackedUIntMeta meta{first};
+    if (meta.Type() == RDB_ENCVAL) {
+      switch (first & 0x3F) {
+        case RDB_ENC_INT8:
+          return p + 1 + 1;
+        case RDB_ENC_INT16:
+          return p + 1 + 2;
+        case RDB_ENC_INT32:
+          return p + 1 + 4;
+        default:
+          return std::string::npos;  // RDB_ENC_LZF: unreachable for SaveAux's own values.
+      }
+    }
+    const unsigned len_bytes = meta.ByteSize();
+    if (p + 1 + len_bytes > bytes.size())
+      return std::string::npos;
+    auto len = ReadPackedUInt(
+        meta, io::Bytes{reinterpret_cast<const uint8_t*>(bytes.data() + p + 1), len_bytes});
+    if (!len)
+      return std::string::npos;
+    const size_t start = p + 1 + len_bytes;
+    if (start + *len > bytes.size())
+      return std::string::npos;
+    return start + *len;
+  };
+
+  while (pos < bytes.size() && static_cast<uint8_t>(bytes[pos]) == RDB_OPCODE_AUX) {
+    pos = skip_string(pos + 1);  // aux key
+    if (pos == std::string::npos)
+      return std::string::npos;
+    pos = skip_string(pos);  // aux value
+    if (pos == std::string::npos)
+      return std::string::npos;
+  }
+  return pos;
+}
+
 // drakeydb: P4-3 Task 5 -- hand-builds an RDB_OPCODE_DF_TOMBSTONES section byte-for-byte per
 // rdb_extensions.h's format: [db_index][count][count x {key, packed, origin_hash}], with
 // {packed, origin_hash} as 16 raw LE bytes, exactly like EmitsOpcodeOnlyForTheStampedKey (above)
@@ -2506,6 +2572,45 @@ TEST_F(RdbTest, EofWithRemoteShardChunksPending) {
   EXPECT_EQ(Run({"EXISTS", key}), 0);
 }
 
+// drakeydb: P4-5 fix round 1 -- deterministic proof of the byte-scan hazard SkipAuxSection exists
+// to close, and of the fix itself, without depending on wall-clock timing or any production hook:
+// hand-builds a minimal RDB-shaped buffer (magic header, one aux field whose value is a
+// hand-encoded RDB_ENC_INT32 -- SaveAuxFieldStrInt's own real shape for ctime/used-mem,
+// rdb_save.cc -- deliberately chosen so one payload byte is 0xDD, then a SELECTDB opcode, then a
+// real 17-byte RDB_OPCODE_DF_MVCC block, mirroring EmitsOpcodeOnlyForTheStampedKey's own shape
+// below) and shows the naive offset-0 scan lands on the aux value's own byte while
+// SkipAuxSection-anchored scan lands on the real opcode.
+TEST_F(RdbTest, ByteScanMustStartAfterAuxSectionNotOffsetZero) {
+  std::string bytes = absl::StrFormat("REDIS%04d", RDB_SER_VERSION);  // same shape WrapInRdb uses
+  ASSERT_EQ(bytes.size(), 9u);
+  bytes.push_back(static_cast<char>(RDB_OPCODE_AUX));
+  AppendString(&bytes, "ctime");
+  // 0x12DD3456 little-endian is 56 34 dd 12 -- byte 2 of the 4-byte payload is 0xDD, the same
+  // shape a real ctime/used-mem value takes during the window this fix guards against.
+  AppendEncodedInt32(&bytes, 0x12DD3456);
+  const size_t selectdb_pos = bytes.size();
+  bytes.push_back(static_cast<char>(RDB_OPCODE_SELECTDB));
+  AppendLen(&bytes, 0);
+  const size_t mvcc_pos = bytes.size();
+  bytes.push_back(static_cast<char>(0xDD));
+  uint8_t stamp_buf[16] = {};
+  bytes.append(reinterpret_cast<const char*>(stamp_buf), sizeof(stamp_buf));
+
+  // OLD behavior: a scan from offset 0 is fooled by the aux value's own 0xDD byte.
+  const size_t naive_pos = bytes.find(static_cast<char>(0xDD));
+  ASSERT_NE(naive_pos, std::string::npos);
+  EXPECT_LT(naive_pos, selectdb_pos)
+      << "the coincidental byte must sit inside the aux section for this to be a real repro";
+  EXPECT_NE(naive_pos, mvcc_pos) << "the naive scan must NOT land on the real mvcc opcode";
+
+  // NEW behavior: anchored after the aux section, the scan is not fooled by it.
+  const size_t after_aux = SkipAuxSection(bytes, 9);
+  EXPECT_EQ(after_aux, selectdb_pos)
+      << "SkipAuxSection must land exactly on the first opcode after the aux section";
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), after_aux), mvcc_pos)
+      << "scanning from after the aux section must find only the real mvcc opcode block";
+}
+
 // drakeydb: P4-2 Task 1 -- pins num_shards=1 (RdbTest's default num_threads_ == 3 gives 2 shards)
 // so a single-shard capture is guaranteed to see every key in this fixture's tests, regardless of
 // hash placement. FlagSaver restores active_replica/num_shards for every later RdbTest case in
@@ -2528,9 +2633,13 @@ class RdbMvccTest : public RdbTest {
 // PeerFullSyncFiltersConcurrentJournalPlainReplicaUnaffected above uses for its full-sync capture,
 // minus journal streaming (this is a plain point-in-time snapshot, not a stable-sync stream) --
 // so the opcode's SaveEntry/SerializeEntry/GetMvcc plumbing is exercised end to end, not
-// hand-simulated. Byte-scanned rather than round-tripped through a loader: Task 2 (the read side)
-// is a separate, not-yet-landed task, and an unrecognized opcode 221 would fail a loader round
-// trip for the wrong reason.
+// hand-simulated. Byte-scanned rather than round-tripped through a loader: this asserts the SAVE
+// side's exact wire placement (immediately before k1's type byte, exactly once, nowhere else)
+// directly; a loader round trip would not directly verify that -- it could tolerate a shifted or
+// malformed encoding as long as it still parsed to the right value. Every 0xDD scan below starts
+// at SkipAuxSection(bytes, 9) rather than offset 0 -- see that helper's own comment for why a scan
+// from offset 0 is unsound (SaveAux's ctime/used-mem aux values are live process state, encoded
+// as raw binary, and can coincidentally contain the byte 0xDD).
 TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
   ASSERT_TRUE(IsActiveReplica());
   ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
@@ -2591,11 +2700,16 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
   EXPECT_EQ(bytes.substr(after_block + 1, key1_encoded.size()), key1_encoded)
       << "0xDD opcode block must be positioned before k1's type byte";
 
-  // 0xDD's first (and only legitimate) occurrence in the whole buffer is k1's block above -- so no
-  // 0xDD opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not
-  // appear a second time anywhere else either.
-  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), pos)
-      << "0xDD must not appear anywhere before k1's opcode block (e.g., preceding k0)";
+  // 0xDD's first (and only legitimate) occurrence AFTER the aux section is k1's block above -- so
+  // no 0xDD opcode precedes k0 (its stamp is zero == unstamped == absent), and the block does not
+  // appear a second time anywhere else either. Scanning from offset 0 instead would also have to
+  // contend with SaveAux's own ctime/used-mem aux values, which are live process state encoded as
+  // raw binary (SkipAuxSection's own comment, above) -- either can coincidentally contain 0xDD.
+  const size_t scan_start = SkipAuxSection(bytes, 9);
+  ASSERT_NE(scan_start, std::string::npos) << "could not locate the end of the aux section";
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), scan_start), pos)
+      << "0xDD must not appear anywhere between the aux section and k1's opcode block (e.g., "
+         "preceding k0)";
   EXPECT_EQ(bytes.find(static_cast<char>(0xDD), pos + 1), std::string::npos)
       << "0xDD must not appear a second time anywhere in the buffer";
 }
@@ -2604,7 +2718,8 @@ TEST_F(RdbMvccTest, EmitsOpcodeOnlyForTheStampedKey) {
 // compatibility rule in the phase"): with --active_replica off, neither the RDB_OPCODE_DF_MVCC
 // byte nor its "drakeydb-mvcc" breadcrumb aux field may appear, even though both keys below get a
 // real (non-mvcc-table-backed) write. Uses plain RdbTest -- inactive is upstream's default, so no
-// extra fixture scaffolding is needed.
+// extra fixture scaffolding is needed. The 0xDD scan starts at SkipAuxSection(bytes, 9), not
+// offset 0 -- see that helper's own comment (above) for why a scan from offset 0 is unsound.
 TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
   ASSERT_FALSE(IsActiveReplica());
   ASSERT_EQ(Run({"set", "k0", "v0"}), "OK");
@@ -2626,7 +2741,9 @@ TEST_F(RdbTest, NoMvccOpcodeOrAuxWhenInactive) {
   });
 
   EXPECT_EQ(bytes.find("drakeydb-mvcc"), std::string::npos);
-  EXPECT_EQ(bytes.find(static_cast<char>(0xDD)), std::string::npos);
+  const size_t scan_start = SkipAuxSection(bytes, 9);
+  ASSERT_NE(scan_start, std::string::npos) << "could not locate the end of the aux section";
+  EXPECT_EQ(bytes.find(static_cast<char>(0xDD), scan_start), std::string::npos);
 }
 
 // drakeydb: P4-2 Task 2 -- the read-side counterpart to EmitsOpcodeOnlyForTheStampedKey above:
