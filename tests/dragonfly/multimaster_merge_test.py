@@ -292,8 +292,8 @@ async def _wait_converged_n(clients, keys, label, timeout=30, stamp_free_keys=fr
 
 async def _verify_mismatches(c) -> int:
     """DEBUG MVCC VERIFY's from-scratch dense-invariant check, parsed to an int -- every new
-    test in this module asserts this is 0 on every node at the end (task rule: a passing merge
-    that silently corrupted the dense mvcc<->prime invariant along the way is not a pass)."""
+    test in this module asserts this is 0 on every node at the end: a passing merge that
+    silently corrupted the dense mvcc<->prime invariant along the way is not a pass."""
     reply = await c.execute_command("debug", "mvcc", "verify")
     text = reply.decode() if isinstance(reply, bytes) else reply
     return int(text.split(":", 1)[1])
@@ -302,8 +302,8 @@ async def _verify_mismatches(c) -> int:
 async def _unstamped_writes(c) -> int:
     """Sum of shard*_unstamped_writes from DEBUG MVCC's per-shard aggregate -- the
     MvccStamper::Stats canary for an arm that got discarded with no journal entry ever committing
-    it. Tests that drop writes (a stale merge loser, a capped tombstone install) assert this stays
-    0, per the task rule: a dropped write must be dropped cleanly, never silently orphaned."""
+    it. Tests that drop writes (a stale merge loser, a capped tombstone install) assert this
+    stays 0: a dropped write must be dropped cleanly, never silently orphaned."""
     reply = await c.execute_command("debug", "mvcc")
     text = reply.decode() if isinstance(reply, bytes) else reply
     fields = dict(part.split(":", 1) for part in text.split())
@@ -568,27 +568,28 @@ async def test_merge_fuzzer_random_two_node(df_factory: DflyInstanceFactory):
     await _run_fuzzer(df_factory, seed, rounds, ops_per_round)
 
 
-# ---- B5 (P4-5): three-node model-based fuzzer -- D-15's composition risk, at fuzzer scale ------
+# ---- Three-node model-based fuzzer -- D-15's composition risk, at fuzzer scale ----------------
 #
 # Same shape as `_run_fuzzer` above (full-state SET/DEL/EXPIRE only -- D-23 means a delta RMW like
 # INCR/APPEND cannot converge by design, so this must not assert what the merge rule never
 # promises for one), generalized from a hardcoded pair to a list of (name, client) sides, over a
 # full three-node mesh instead of a pair. Keeps the straddling-TTL mode. Adds one thing the
 # two-node fuzzer structurally cannot produce: a genuine THREE-way contest on one key in one
-# round, which is exactly the D-15 composition shape B2-B4 above pin explicitly -- a third
-# side's write landing between two others' stamps. `_run_fuzzer_three_node` counts how many times
-# the generator actually built that shape and asserts it happened often enough to mean something
-# (a fuzzer that never builds it would otherwise pass vacuously, proving nothing about
+# round, which is exactly the D-15 composition shape the explicit topologies above pin by hand --
+# a third side's write landing between two others' stamps. `_run_fuzzer_three_node` counts how
+# many times the generator actually built that shape and asserts it happened often enough to mean
+# something (a fuzzer that never builds it would otherwise pass vacuously, proving nothing about
 # composition).
 THREE_NODE_KEY_SPACE = 30
 THREE_NODE_DEFAULT_ROUNDS = 4
 THREE_NODE_DEFAULT_OPS_PER_ROUND = 60
 # A key is "stale-intermediate" for a round when all three sides touched it: with three
 # sequential, randomly-ordered writes to the same key inside one round, at least one of them is
-# necessarily sandwiched between the other two in real issuance order -- the exact shape B2's
-# topology builds by hand (C's intermediate write meeting A's stale tombstone before B's fresher
-# one arrives). Asserted at a floor across the whole run, not per round (unlike the two-node
-# fuzzer's per-round I-2 contest requirement): three-way contests are rarer than two-way ones by
+# necessarily sandwiched between the other two in real issuance order -- the exact shape the
+# explicit stale-tombstone-advance topology above builds by hand (an intermediate write meeting a
+# stale tombstone before a fresher one arrives). Asserted at a floor across the whole run, not
+# per round (unlike the two-node fuzzer's per-round I-2 contest requirement): three-way contests
+# are rarer than two-way ones by
 # construction (P(all 3 of {a,b,c} chosen) < P(any 2 match) for a uniform per-op side choice), so
 # demanding one in EVERY round would need an unreasonably large ops_per_round for a CI-sized run.
 THREE_NODE_MIN_STALE_INTERMEDIATE = 3
@@ -598,10 +599,17 @@ async def _apply_random_ops_n(rng, sides, key_space, count, round_idx, model):
     """N-sided generalization of `_apply_random_ops` above -- `sides` is a list of (name, client)
     pairs of any length >= 2. Identical op mix/weights and model bookkeeping; only the side is
     drawn from `sides` instead of a hardcoded pair. See `_apply_random_ops`'s own docstring for
-    the DEL-returns-0 / expiring.discard rationale, unchanged here."""
+    the DEL-returns-0 / expiring.discard rationale, unchanged here.
+
+    Also returns `kinds`: key -> the set of op kinds ("set"/"del"/"expire") issued against it
+    this round, across every side -- lets a caller distinguish a three-way contest built purely
+    from SETs (proving only value-vs-value composition) from one that also involved a delete or
+    an expiry (the shape D-15's tombstone-composition risk actually names).
+    """
     expiring = set()
     straddling = set()
     touched = defaultdict(set)
+    kinds = defaultdict(set)
     for i in range(count):
         key = f"k{rng.randrange(key_space)}"
         side, c = rng.choice(sides)
@@ -612,6 +620,7 @@ async def _apply_random_ops_n(rng, sides, key_space, count, round_idx, model):
             stamp, _ = await _read_one(c, key)
             model.record(key, model.next_seq(), "set", side, stamp, value)
             touched[key].add(side)
+            kinds[key].add("set")
             expiring.discard((side, key))
         elif kind == "del":
             deleted = await c.execute_command("del", key)
@@ -621,15 +630,18 @@ async def _apply_random_ops_n(rng, sides, key_space, count, round_idx, model):
             stamp, _ = await _read_one(c, key)
             model.record(key, model.next_seq(), "del", side, stamp, None)
             touched[key].add(side)
+            kinds[key].add("del")
         elif rng.random() < STRADDLE_FRACTION:
             straddling.add((side, key))
             touched[key].add(side)
+            kinds[key].add("expire")
         else:
             await c.execute_command("set", key, f"v-{round_idx}-{i}-ttl")
             await c.execute_command("pexpire", key, rng.randint(*EXPIRE_TTL_MS_RANGE))
             expiring.add((side, key))
             touched[key].add(side)
-    return expiring, touched, straddling
+            kinds[key].add("expire")
+    return expiring, touched, straddling, kinds
 
 
 async def _settle_expiries_n(sides, expiring, model):
@@ -685,11 +697,12 @@ async def _run_fuzzer_three_node(df_factory, seed, rounds, ops_per_round, extra=
     model = _Model()
     any_delete_won_a_contest = False
     stale_intermediate_count = 0
+    stale_intermediate_with_delete_or_expire_count = 0
 
     for round_idx in range(rounds):
         await _detach_all(clients)
         seq_before = model.seq
-        expiring, touched, straddling = await _apply_random_ops_n(
+        expiring, touched, straddling, kinds = await _apply_random_ops_n(
             rng, sides, THREE_NODE_KEY_SPACE, ops_per_round, round_idx, model
         )
         await _settle_expiries_n(sides, expiring, model)
@@ -702,10 +715,16 @@ async def _run_fuzzer_three_node(df_factory, seed, rounds, ops_per_round, extra=
             f"seed={seed} round={round_idx}: no key was written by 2+ sides this round "
             f"(ops_per_round={ops_per_round}, {len(touched)} key(s) touched total)"
         )
-        # The B5-specific coverage oracle: a genuine three-way contest (see the module-level
-        # comment above THREE_NODE_KEY_SPACE for why this is a floor across the run, not per
-        # round).
-        stale_intermediate_count += sum(1 for touching in touched.values() if len(touching) >= 3)
+        # The three-node-specific coverage oracle: a genuine three-way contest (see the
+        # module-level comment above THREE_NODE_KEY_SPACE for why this is a floor across the run,
+        # not per round). Counted two ways: every three-way contest, and the (rarer) subset that
+        # also involved at least one DEL or EXPIRE -- the composition risk against a tombstone
+        # specifically, versus value-vs-value composition alone.
+        three_way_keys_this_round = {key for key, touching in touched.items() if len(touching) >= 3}
+        stale_intermediate_count += len(three_way_keys_this_round)
+        stale_intermediate_with_delete_or_expire_count += sum(
+            1 for key in three_way_keys_this_round if kinds[key] & {"del", "expire"}
+        )
 
         for key in contested:
             winner = model.expected[key]
@@ -775,36 +794,46 @@ async def _run_fuzzer_three_node(df_factory, seed, rounds, ops_per_round, extra=
         assert await _verify_mismatches(client) == 0
         assert await _unstamped_writes(client) == 0
 
-    return stale_intermediate_count
+    return stale_intermediate_count, stale_intermediate_with_delete_or_expire_count
 
 
 @pytest.mark.slow
 async def test_merge_fuzzer_random_three_node(df_factory: DflyInstanceFactory):
-    """T-5 (D-15): the three-node generalization of `test_merge_fuzzer_random_two_node` above --
-    see `_run_fuzzer_three_node`'s own docstring-equivalent module comment for the shape. Seed is
-    random per run unless MULTIMASTER_FUZZ3_SEED is set (embedded in every assertion message for
-    reproduction); round/op counts scale via MULTIMASTER_FUZZ3_ROUNDS / MULTIMASTER_FUZZ3_OPS.
+    """D-15 (docs/ISSUE-REGISTER.md): the three-node generalization of
+    `test_merge_fuzzer_random_two_node` above -- see `_run_fuzzer_three_node`'s own
+    docstring-equivalent module comment for the shape. Seed is random per run unless
+    MULTIMASTER_FUZZ3_SEED is set (embedded in every assertion message for reproduction);
+    round/op counts scale via MULTIMASTER_FUZZ3_ROUNDS / MULTIMASTER_FUZZ3_OPS.
 
-    Falsifying: see the task report for the verbatim failure produced by inverting `MergeAccepts`
-    (mvcc.h) to `incoming < *stored` (the OLDER side wins) -- caught in round 0 as a winner-value
-    mismatch against the model's own oracle.
+    Falsifying: inverting `MergeAccepts` (mvcc.h) to `incoming < *stored` (the OLDER side wins)
+    is caught in round 0 as a winner-value mismatch against the model's own oracle.
 
     A literal tie-acceptance break (`!(incoming < *stored)`, accepting `incoming == stored` too)
-    was tried first, per this task's own suggested example, and is NOT caught by this fuzzer: an
-    exact `{mvcc, origin_hash}` tie needs the SAME node to independently mint the SAME stamp
-    twice, or two DIFFERENT nodes to collide on both fields at once -- neither ever happens from
-    ordinary SET/DEL/EXPIRE traffic across three real, monotonically-advancing per-shard clocks
-    (HopStamp/LocalMintFloor, mvcc.h, never repeat a stamp once minted). Ties matter for
-    idempotent re-application of the exact same wire entry (replay/retry), which this fuzzer
-    never does either. The report records this as a characterization finding, not a gap in this
-    test: the inverted-comparison falsification above is the one that demonstrates the fuzzer
-    actually detects a broken merge rule.
+    was tried first and is NOT caught by this fuzzer -- not because ties cannot occur (they
+    occur constantly: any full sync that re-delivers a key nothing has since touched on either
+    side is exactly `stored == incoming`, the SAME data twice), but because a tie between
+    IDENTICAL data is unobservable either way -- accepting or rejecting the SAME stamp/value
+    changes nothing either side can see. What a tie-acceptance break actually risks is a tie
+    between DIFFERENT states at the same stamp (the shape the C++ test
+    `MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaRecreate`, multi_master_test.cc,
+    demonstrates directly), which needs an unguarded delta's own floor (FloorAppliedStamp,
+    mvcc.h) to land a mutated value at a PRE-EXISTING stamp -- full-state-only traffic (this
+    fuzzer's own SET/DEL/EXPIRE, per D-23) never floors anything, so it has no way to construct
+    that shape either. This is recorded as a characterization finding about what this fuzzer's
+    own traffic shape can and cannot exercise, not a gap in the merge rule itself: the
+    inverted-comparison falsification above is what demonstrates this fuzzer detects a broken
+    merge rule when one IS reachable from its own traffic.
     """
     seed = int(os.environ.get("MULTIMASTER_FUZZ3_SEED", random.randrange(2**31)))
     rounds = int(os.environ.get("MULTIMASTER_FUZZ3_ROUNDS", THREE_NODE_DEFAULT_ROUNDS))
     ops_per_round = int(os.environ.get("MULTIMASTER_FUZZ3_OPS", THREE_NODE_DEFAULT_OPS_PER_ROUND))
-    count = await _run_fuzzer_three_node(df_factory, seed, rounds, ops_per_round)
-    print(f"[multimaster_merge_fuzzer3] seed={seed} stale_intermediate_count={count}")
+    count, count_with_delete_or_expire = await _run_fuzzer_three_node(
+        df_factory, seed, rounds, ops_per_round
+    )
+    print(
+        f"[multimaster_merge_fuzzer3] seed={seed} stale_intermediate_count={count} "
+        f"stale_intermediate_with_delete_or_expire_count={count_with_delete_or_expire}"
+    )
 
 
 # ---- Explicit resurrection pins (Task 9 Step 3) -- fuzzers find these by luck; these pin them. ----
@@ -968,7 +997,7 @@ async def test_resurrection_pin_natural_expiry_deletes_stale_value_on_full_sync(
         assert not await _exists(c_b, key)
 
 
-# ---- B2-B5 (P4-5): three-node merge characterization, plus the three-node fuzzer --------------
+# ---- Three-node merge characterization, plus the three-node fuzzer ----------------------------
 #
 # D-15 (docs/ISSUE-REGISTER.md): every tombstone/merge test above uses exactly two peers. The
 # merge rule itself is pairwise and stateless, so two peers exercise the decision function fully
@@ -981,43 +1010,52 @@ async def test_resurrection_pin_natural_expiry_deletes_stale_value_on_full_sync(
 
 
 async def test_three_node_stale_tombstone_advance_survives_cap(df_factory: DflyInstanceFactory):
-    """T-1 (D-15): a stale tombstone must not let a third peer's intermediate write resurrect a
-    key once a fresher delete elsewhere has superseded it.
+    """A stale tombstone must not let a third peer's intermediate write resurrect a key once a
+    fresher delete elsewhere has superseded it (D-15, docs/ISSUE-REGISTER.md).
 
     Topology (single key `k`, real-time-ordered so no clock-skew trick is needed):
       1. A, B, C all hold k=v1 (converged via a full mesh), then detach (REPLICAOF NO ONE,
          confirmed on all three).
-      2. C SETs k (the "intermediate" write) FIRST, so its stamp is the OLDEST of the three
-         post-partition writes.
-      3. A DELETEs k -> TA (A's own local delete -- a real, comparable tombstone).
-      4. B DELETEs k -> TB, strictly newer than TA (issued after TA in real time too).
-      5. Heal A<->C ONLY first: A's TA (newer than C's write) correctly deletes C's stale value.
-         This is the first tombstone C's (database, shard) pair has ever tried to earn (A's TA
-         already exists, from A's own local delete, before any merge) -- checkpoint-asserted to
-         be exactly TA on both sides, proving C's write really did "meet a stale tombstone" (TB
-         does not exist anywhere in the mesh yet).
-      6. Heal B in: B's TB ADVANCES A's and C's now-resident TA in place. Both (database, shard)
-         pairs are sitting at exactly 1 tombstone -- AT the configured cap -- so this advance is
-         exactly the shape `would_grow` exists to let through even though a GROWING install there
-         would be refused.
+      2. A DELETEs k -> TA (A's own local delete -- a real, comparable tombstone; the first
+         tombstone A's (database, shard) pair has ever earned, so this alone puts that pair AT
+         the configured cap).
+      3. C SETs k -> W, strictly NEWER than TA (issued after TA in real time). W therefore sits
+         strictly BETWEEN TA and the delete B is about to author.
+      4. B DELETEs k -> TB, strictly newer than W (issued after W in real time too). Stamp order
+         TA < W < TB is asserted directly off DEBUG MVCC on each authoring node as it happens.
+      5. Heal A<->B only (C stays detached, still holding W live). A's (database, shard) pair is
+         AT the cap (TA occupies its one slot); B's TB must ADVANCE that resident tombstone in
+         place -- `would_grow` is false for an slot that is ALREADY a tombstone, so the cap check
+         never runs for this specific install, regardless of its value. No stamp-level assertion
+         sits here on purpose (see the comment at that call site below): asserting it now would
+         let a wrongly-refused advance surface as a mere tombstone-vs-tombstone mismatch instead
+         of the sharper signal step 6 gets to show.
+      6. Heal C in. If A correctly holds TB, W (which is strictly OLDER than TB) correctly loses
+         on merge. If the advance in step 5 was wrongly refused and A is still stuck at TA
+         instead, W (which is strictly NEWER than TA) wrongly WINS on merge -- a live-value
+         resurrection on A, the actual property this test is checking for.
+      7. Assert every node ends at TB: absent, with mvcc and origin exactly TB's, everywhere.
 
-    `--multi_master_max_tombstones=1`, not the literal 0 in the register/re-plan prose: cap=0
+    `--multi_master_max_tombstones=1`, not the literal 0 the original plan proposed: cap=0
     refuses every GROWING install unconditionally (an unsigned tombstone count is never `< 0`),
     which would refuse k's own FIRST tombstone (TA) everywhere too, before there is anything to
-    advance -- confirmed by reading `DbSlice::PerformDeletionAtomic`'s and `InstallAbsentKeyTomb
-    stone`'s identical `count < cap` guard, and by `RdbMvccTest.MergeLwwTombstoneUpdateForAbsent
-    KeyIgnoresCapWhenNoGrowth` (rdb_test.cc), which can only build its own "already at the cap"
-    precondition by calling `DbSlice::SetTombstone` directly -- a raw C++-only backdoor this
-    black-box pytest does not have. cap=1 is the smallest value a single, real, locally-authored
-    tombstone can still fill: k's own TA occupies that one slot, putting the (database, shard)
-    pair AT the cap for anything else, while the SAME key's own advance to TB stays exempt
-    (`would_grow` is false for it) -- exercising precisely the property this test is named for.
+    advance -- confirmed by reading `DbSlice::PerformDeletionAtomic`'s `count < cap` guard, and by
+    `RdbMvccTest.MergeLwwTombstoneUpdateForAbsentKeyIgnoresCapWhenNoGrowth` (rdb_test.cc), which
+    can only build its own "already at the cap" precondition by calling `DbSlice::SetTombstone`
+    directly -- a raw C++-only backdoor this black-box pytest does not have. cap=1 is the
+    smallest value a single, real, locally-authored tombstone can still fill: k's own TA occupies
+    that one slot, putting the (database, shard) pair AT the cap for anything else, while the
+    SAME key's own advance to TB stays exempt (`would_grow` is false for it) -- exercising
+    precisely the property this test is named for.
 
     Falsifying: forcing `would_grow` to always be true in `DbSlice::InstallAbsentKeyTombstone`
-    (db_slice.cc) -- the only site that computes it, shared by `RdbLoader::
-    ApplyMergeTombstoneOnShard`'s own absent-key fallthrough -- makes TB's advance look like a
-    GROWING install at a shard already sitting at cap=1, so it is refused: A and C stay stuck at
-    the stale TA forever while B holds TB, a permanent divergence `_wait_converged_n` catches.
+    (db_slice.cc; `RdbLoader::ApplyMergeTombstoneOnShard`'s own absent-key fallthrough shares this
+    same call, though the non-merge install at rdb_load.cc computes an equivalent `would_grow` of
+    its own separately) makes TB's advance in step 5 look like a GROWING install at a shard
+    already sitting at cap=1, so it is refused there: A stays stuck at TA with nothing in this
+    test's own flow ever pointed at it again until step 6, where C's W -- strictly newer than the
+    stale TA -- wins on A instead of losing, a live-value resurrection `_wait_converged_n` reports
+    directly (A shows `state:value, value:'W'`, diverging from B's and C's `state:tombstone`).
     """
     a = df_factory.create(**active_args(proactor_threads=2, multi_master_max_tombstones=1))
     b = df_factory.create(**active_args(proactor_threads=2, multi_master_max_tombstones=1))
@@ -1033,51 +1071,55 @@ async def test_three_node_stale_tombstone_advance_survives_cap(df_factory: DflyI
 
     await _detach_all([c_a, c_b, c_c])
 
-    # Real-time margin (LOCALHOST_SKEW_TOLERANCE_MS-scale, see multimaster_test.py) so each of the
-    # three post-partition writes below gets a strictly later mvcc stamp than the last, with no
-    # reliance on clock skew between processes.
-    await c_c.set("k", "v-c-intermediate")
-    await asyncio.sleep(0.25)
-
     assert await c_a.delete("k") == 1
     ta = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
     assert ta["state"] == "tombstone", ta
+    # Real-time margin (LOCALHOST_SKEW_TOLERANCE_MS-scale, see multimaster_test.py) so each of
+    # the writes below gets a strictly later mvcc stamp than the last, with no reliance on clock
+    # skew between processes.
+    await asyncio.sleep(0.25)
+
+    await c_c.set("k", "W")
+    w = _parse_mvcc(await c_c.execute_command("debug", "mvcc", "k"))
+    assert w["state"] == "value", w
+    assert (int(w["mvcc"]), int(w["origin"], 16)) > (
+        int(ta["mvcc"]),
+        int(ta["origin"], 16),
+    ), f"construction bug: W must be strictly newer than TA -- ta={ta} w={w}"
     await asyncio.sleep(0.25)
 
     assert await c_b.delete("k") == 1
     tb = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
     assert tb["state"] == "tombstone", tb
     assert (int(tb["mvcc"]), int(tb["origin"], 16)) > (
-        int(ta["mvcc"]),
-        int(ta["origin"], 16),
-    ), f"construction bug: TB must be strictly newer than TA -- ta={ta} tb={tb}"
+        int(w["mvcc"]),
+        int(w["origin"], 16),
+    ), f"construction bug: TB must be strictly newer than W -- w={w} tb={tb}"
 
-    # Heal A<->C only -- B stays detached, so TB does not exist anywhere in this mesh yet.
-    await attach(c_a, c)
-    await wait_for_peers(c_a, 1)
-    await attach(c_c, a)
-    await wait_for_peers(c_c, 1)
-    got_a, got_c = await _wait_converged(c_a, c_c, ["k"], "b2-partial-heal-a-c")
-    for label, client, got in (("a", c_a, got_a), ("c", c_c, got_c)):
-        stamp = got["k"]["stamp"]
-        assert stamp["state"] == "tombstone", (label, stamp)
-        assert stamp["mvcc"] == ta["mvcc"], (label, stamp, ta)
-        assert stamp["origin"] == ta["origin"], (label, stamp, ta)
-        assert not await _exists(client, "k")
-
-    # Heal B in -- same sequential, non-loading-node-only dialing discipline as
-    # attach_full_mesh's own tail (multimaster_test.py), applied to adding B to an
-    # already-converged A<->C pair instead of adding C to an already-converged A<->B pair.
+    # Heal A<->B only -- C stays detached, still holding W live. A's (database, shard) pair is
+    # AT the cap (TA occupies its one slot), so B's TB must advance it in place. Deliberately no
+    # stamp-level assertion here: see this function's own docstring, step 5, for why a check
+    # placed HERE would only ever show a weaker tombstone-vs-tombstone mismatch if the advance
+    # were wrongly refused, masking the sharper resurrection signal step 6 (below) is built to
+    # surface instead.
     await attach(c_a, b)
-    await wait_for_peers(c_a, 2)
+    await wait_for_peers(c_a, 1)
     await attach(c_b, a)
     await wait_for_peers(c_b, 1)
-    await attach(c_c, b)
-    await wait_for_peers(c_c, 2)
+
+    # Heal C in -- same sequential, non-loading-node-only dialing discipline as
+    # attach_full_mesh's own tail (multimaster_test.py), applied to adding C to an
+    # already-converged A<->B pair.
+    await attach(c_a, c)
+    await wait_for_peers(c_a, 2)
+    await attach(c_c, a)
+    await wait_for_peers(c_c, 1)
     await attach(c_b, c)
     await wait_for_peers(c_b, 2)
+    await attach(c_c, b)
+    await wait_for_peers(c_c, 2)
 
-    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k"], "b2-full-heal")
+    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k"], "advance-in-place-full-heal")
 
     for label, client, snap in (("a", c_a, snaps[0]), ("b", c_b, snaps[1]), ("c", c_c, snaps[2])):
         stamp = snap["k"]["stamp"]
@@ -1099,10 +1141,10 @@ def _tick_origin(origin_hex: str) -> str:
 async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
     df_factory: DflyInstanceFactory,
 ):
-    """T-2 (D-15): the synthetic expiry tombstone a merge load installs for an already-expired
-    incoming key (rdb_load.cc ~:3820-3829) sits EXACTLY one origin_hash tick above the expired
-    value's own stamp S -- {S.mvcc, S.origin_hash+1} -- never at S itself, never at the wall-clock
-    expiry deadline.
+    """D-15 (docs/ISSUE-REGISTER.md): the synthetic expiry tombstone a merge load installs for an
+    already-expired incoming key (rdb_load.cc ~:3820-3829) sits EXACTLY one origin_hash tick above
+    the expired value's own stamp S -- {S.mvcc, S.origin_hash+1} -- never at S itself, never at
+    the wall-clock expiry deadline.
 
     Topology (two keys sharing one timeline, --hz=0 on A and C -- GetPeriodicCycleMs
     (engine_shard.cc) treats hz<=0 as "no periodic tasks at all", disabling active-expire
@@ -1118,29 +1160,33 @@ async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
       4. Attach a FRESH B to A only: B's only knowledge of k1/k2 is A's full sync, which carries
          both as already-expired -- the exact site under test installs
          ExpiryTombstoneFor(incoming) for each. Pinned directly off B.
-      5. Full-mesh C back in: C's still-live k1=S1 meets B's/A's tombstone and must lose (a real
-         later value can't survive against a strictly-later tombstone); C's k2=W_early, MINTED
-         BEFORE the PX deadline but AFTER S2, must SURVIVE the same tombstone everywhere -- this
-         is the one-tick-above rule's whole point (mint-from-deadline would wrongly delete it).
+      5. Full-mesh C back in: C's k1 -- resident at bare S1 only because --hz=0 has kept it from
+         being locally reaped yet, not because it is immune to expiry -- meets B's/A's tombstone
+         and must lose (a real later value can't survive against a strictly-later tombstone);
+         C's k2=W_early, MINTED BEFORE the PX deadline but AFTER S2, must SURVIVE the same
+         tombstone everywhere -- this is the one-tick-above rule's whole point (mint-from-deadline
+         would wrongly delete it).
       6. A genuinely later write (issued once k1's tombstone has already merged everywhere) must
          beat that tombstone too, everywhere.
 
     Falsifying (a): forcing the `merge_lww_` branch at rdb_load.cc ~:3821 to never run (skip
-    straight to the plain "expired key on load, drop" `return`) makes B silently drop BOTH keys
-    with no tombstone at all. Nothing then ever challenges A's or C's own still-resident S1/S2 --
-    a genuine 3-way divergence (A and C at "value", B at "absent") `_wait_converged_n` catches
-    directly, never resolving even at its own timeout.
+    straight to the plain "expired key on load, drop" `return`) makes B silently drop both keys
+    with no tombstone at all -- caught immediately by this test's own `tb1["state"] == "tombstone"`
+    pin on B, right after B's full sync, well before any healing or convergence is even attempted
+    (verbatim: `state:absent` where `tombstone` was expected).
 
     Falsifying (b): minting the tombstone from `item->expire_ms` (the deadline) instead of
-    `ExpiryTombstoneFor(incoming)` makes k2's tombstone stamp equal the PX deadline itself, which
-    is strictly NEWER than W_early (minted before that deadline) -- W_early is then wrongly
-    deleted everywhere instead of surviving, caught by this test's own k2 assertion.
+    `ExpiryTombstoneFor(incoming)` makes k1's and k2's tombstone stamps equal the PX deadline
+    itself, caught by this test's own exact-stamp pin on B (mvcc no longer equals S's own) before
+    the k2/W_early survivor check is even reached; the deadline is also strictly NEWER than
+    W_early (minted before that deadline), which is what would separately wrongly delete W_early
+    if the pin did not already catch it first.
 
-    Falsifying (c): see the report -- constructing an observable exact tie (`incoming.AsTombstone
-    ()` verbatim, then a delta re-create landing at exactly S via an unguarded applied floor)
-    needs a raw wire-level delta with a hand-picked author stamp that no ordinary client command
-    can produce; implemented instead as a C++ test in rdb_test.cc, per this task's own escape
-    hatch.
+    Falsifying (c): constructing an observable exact tie (`incoming.AsTombstone()` verbatim, then
+    a delta re-create landing at exactly S via an unguarded applied floor) needs a raw wire-level
+    delta with a hand-picked author stamp that no ordinary client command can produce; implemented
+    instead as a C++ test in multi_master_test.cc
+    (`MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaRecreate`).
     """
     ttl_ms = 400
     a = df_factory.create(**active_args(proactor_threads=2, hz=0))
@@ -1173,6 +1219,13 @@ async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
     w_early = _parse_mvcc(await c_c.execute_command("debug", "mvcc", "k2"))
     assert w_early["state"] == "value", w_early
     assert int(w_early["mvcc"]) > int(s2["mvcc"]), (w_early, s2)
+    # Load-bearing for falsification (b): this construction only demonstrates that mint-from-
+    # deadline is wrong if W_early's own mint time is BEFORE the deadline. A sufficiently slow
+    # run (scheduler/CI jitter eating into the window between S2's mint and this SET) could let
+    # W_early drift past `expire_ms` without anything else here noticing, silently weakening that
+    # falsification instead of failing loudly -- so assert the margin directly, off DEBUG MVCC's
+    # own millisecond field, rather than trusting the sleep timings alone.
+    assert int(w_early["ms"]) < int(s2["ms"]) + ttl_ms, (w_early, s2, ttl_ms)
 
     await asyncio.sleep(ttl_ms / 1000.0 + 0.3)  # past the deadline; --hz=0 leaves it unreaped
 
@@ -1199,7 +1252,7 @@ async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
     await attach(c_b, c)
     await wait_for_peers(c_b, 2)
 
-    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k1", "k2"], "b3-tombstones")
+    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k1", "k2"], "merge-load-tombstones")
     for label, snap in (("a", snaps[0]), ("b", snaps[1]), ("c", snaps[2])):
         s = snap["k1"]["stamp"]
         assert s["state"] == "tombstone", (label, "k1", s)
@@ -1213,7 +1266,7 @@ async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
     w1 = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k1"))
     assert w1["state"] == "value", w1
 
-    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k1"], "b3-later-write")
+    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k1"], "merge-load-later-write")
     for label, snap in (("a", snaps[0]), ("b", snaps[1]), ("c", snaps[2])):
         s = snap["k1"]["stamp"]
         assert s["state"] == "value", (label, s)
@@ -1228,14 +1281,15 @@ async def test_three_node_merge_load_expiry_tombstone_one_tick_above_value(
 async def test_three_node_two_independent_expiry_tombstones_and_intermediate_write(
     df_factory: DflyInstanceFactory,
 ):
-    """T-3 (D-15): A and B each independently diverge k, then independently let it expire --
-    landing on DIFFERENT expiry tombstones (different expired values, different stamps). C writes
-    a genuinely new value in between the two expiries. Healing must converge on the tombstone
-    with the higher stamp everywhere, with C's intermediate write correctly losing to it even
-    though it would have beaten the WEAKER tombstone alone.
+    """D-15 (docs/ISSUE-REGISTER.md): A and B each independently diverge k, then independently let
+    it expire -- landing on DIFFERENT expiry tombstones (different expired values, different
+    stamps). C writes a genuinely new value in between the two expiries. Healing must converge on
+    the tombstone with the higher stamp everywhere, with C's intermediate write correctly losing
+    to it even though it would have beaten the WEAKER tombstone alone.
 
     Topology (default --hz -- each node reaps its OWN diverged copy via its own ordinary local
-    active/lazy expiry, unlike B3's merge-load-elapsed-on-arrival case):
+    active/lazy expiry, unlike the merge-load-elapsed-on-arrival case the sibling test above
+    covers):
       1. A, B, C converge on k=v1, then detach (confirmed).
       2. A: SET k vA PX ttl -- SA. (small real-time margin)
       3. C: SET k vC (no TTL) -- SC, strictly newer than SA.  (small real-time margin)
@@ -1248,16 +1302,23 @@ async def test_three_node_two_independent_expiry_tombstones_and_intermediate_wri
          composition property this test is named for: the weaker tombstone's own resurrection of
          C's write must not survive contact with the stronger one.
 
-    Falsifying: starting B (the node that ends up holding the LARGER tombstone TB) with
+    Falsifying, config: starting B (the node that ends up holding the LARGER tombstone TB) with
     `--multi_master_tombstone_ttl=0` disables tombstoning on B entirely (TombstonesEnabled()
     returns false) -- B's own expiry of vB then erases with no tombstone at all, so TB never
-    exists anywhere in the mesh to challenge C's SC. Measured effect (see the task report for the
-    verbatim run): NOT a `_wait_converged_n` timeout -- all three nodes consistently converge on
-    C's SC instead, a silent resurrection rather than a hung/divergent mesh, since nothing ever
-    remains to disagree about once TB simply never exists anywhere. This test's own `tb["state"]
+    exists anywhere in the mesh to challenge C's SC. Measured effect: NOT a `_wait_converged_n`
+    timeout -- all three nodes consistently converge on C's SC instead, a silent resurrection
+    rather than a hung/divergent mesh, since nothing ever remains to disagree about once TB simply
+    never exists anywhere. This test's own `tb["state"]
     == "tombstone"` sanity assertion (right after both nodes' local expiry, before any healing)
     catches the missing tombstone directly and immediately, well before convergence is even
     attempted.
+
+    Falsifying, code: minting `MvccStamper::CommitOwnTombstone`'s tombstone at reap time (a fresh
+    `HopStamp(now)`) instead of `ExpiryTombstoneFor(prev_stamp)` breaks the one-tick-above pin on
+    both TA and TB directly, and also flips the partial-heal checkpoint below: a reap-time TA is
+    minted long after C's intermediate SC (real time only advances between them), so it wrongly
+    OUTRANKS SC instead of losing to it -- the checkpoint's own `state:value` expectation fails,
+    showing `state:tombstone` instead.
     """
     ttl_ms = 300
     a = df_factory.create(**active_args(proactor_threads=2))
@@ -1295,6 +1356,12 @@ async def test_three_node_two_independent_expiry_tombstones_and_intermediate_wri
     ta = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
     tb = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
     assert ta["state"] == "tombstone" and tb["state"] == "tombstone", (ta, tb)
+    # The one-tick-above claim D-15 names, pinned directly for a LIVE local reap (the
+    # merge-load-elapsed-on-arrival test above pins the same claim for a merge load's synthetic
+    # tombstone instead): each node's own tombstone is exactly ExpiryTombstoneFor(its own expired
+    # value's stamp), never a fresh reap-time mint.
+    assert ta["mvcc"] == sa["mvcc"] and ta["origin"] == _tick_origin(sa["origin"]), (ta, sa)
+    assert tb["mvcc"] == sb["mvcc"] and tb["origin"] == _tick_origin(sb["origin"]), (tb, sb)
     assert (int(tb["mvcc"]), int(tb["origin"], 16)) > (
         int(ta["mvcc"]),
         int(ta["origin"], 16),
@@ -1304,7 +1371,7 @@ async def test_three_node_two_independent_expiry_tombstones_and_intermediate_wri
     await wait_for_peers(c_a, 1)
     await attach(c_c, a)
     await wait_for_peers(c_c, 1)
-    got_a, got_c = await _wait_converged(c_a, c_c, ["k"], "b4-partial-heal-a-c")
+    got_a, got_c = await _wait_converged(c_a, c_c, ["k"], "independent-tombstones-partial-heal-a-c")
     for label, got in (("a", got_a), ("c", got_c)):
         s = got["k"]["stamp"]
         assert s["state"] == "value", (label, s)
@@ -1320,7 +1387,7 @@ async def test_three_node_two_independent_expiry_tombstones_and_intermediate_wri
     await attach(c_b, c)
     await wait_for_peers(c_b, 2)
 
-    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k"], "b4-full-heal")
+    snaps = await _wait_converged_n([c_a, c_b, c_c], ["k"], "independent-tombstones-full-heal")
     for label, client, snap in (("a", c_a, snaps[0]), ("b", c_b, snaps[1]), ("c", c_c, snaps[2])):
         s = snap["k"]["stamp"]
         assert s["state"] == "tombstone", (label, s)

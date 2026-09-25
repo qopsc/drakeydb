@@ -5730,7 +5730,7 @@ TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombston
          "SetExistingMvcc keys its accounting off the NEW stamp's bit, which is still set";
 }
 
-// drakeydb: P4-5 B3(c) -- if a merge load's synthetic expiry tombstone used `S.AsTombstone()`
+// drakeydb: P4-5 -- if a merge load's synthetic expiry tombstone used `S.AsTombstone()`
 // verbatim (the SAME stamp as the expired value S) instead of `ExpiryTombstoneFor(S)` (one
 // origin_hash tick above it), a third peer's unguarded delta re-create authored at exactly S's
 // own {mvcc, origin_hash} would TIE against it under the masked `operator<` MergeAccepts compares
@@ -5743,7 +5743,11 @@ TEST_F(MvccStoreTest, UnguardedAppliedDeleteWithOlderAuthorMvccFloorsTheTombston
 // does not, at the identical delta author stamp -- a direct, reproducible contrast, not just a
 // hypothetical, even though it does not run through rdb_load.cc's own loader code (which already
 // always uses `ExpiryTombstoneFor`, never `AsTombstone()` verbatim, for exactly this reason -- see
-// that function's own doc comment, mvcc.h).
+// that function's own doc comment, mvcc.h). `MergeAccepts` is asserted directly, in BOTH
+// directions, on top of the stamp comparisons below: k1's pair must never accept each other's
+// data either way (the divergence itself, not just a stamp difference that implies it); k2's
+// pair must accept exactly one direction (the real tombstone strictly outranks the recreate, so
+// a later merge still repairs it).
 TEST_F(MvccStoreTest, MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaRecreate) {
   constexpr uint32_t kPeerIdx1 = 33;
   constexpr uint32_t kPeerIdx2 = 34;
@@ -5811,6 +5815,13 @@ TEST_F(MvccStoreTest, MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaR
       << "k1's re-create ties the verbatim tombstone's own {Mvcc, origin_hash} exactly -- "
          "MergeAccepts is false in BOTH directions (a tie favors the stored side either way), so "
          "a peer holding either one permanently refuses the other's data";
+  // The divergence itself, not merely a stamp difference that implies it: neither side ever
+  // accepts the other's data, so two peers that landed on opposite sides of this tie stay
+  // apart forever, with no later merge able to repair it.
+  EXPECT_FALSE(MergeAccepts(verbatim_tomb, *recreated1))
+      << "a peer holding the tombstone must reject the recreate";
+  EXPECT_FALSE(MergeAccepts(recreated1, *verbatim_tomb))
+      << "a peer holding the recreate must ALSO reject the tombstone -- neither side ever heals";
 
   // k2: floors to ONE TICK BELOW the real tombstone -- strictly less, not a tie, so a later
   // merge against that real tombstone still correctly repairs the divergence.
@@ -5818,6 +5829,11 @@ TEST_F(MvccStoreTest, MergeLoadTombstoneAtValueStampVerbatimTiesAThirdPeerDeltaR
   EXPECT_LT(recreated2->origin_hash, real_tomb->origin_hash)
       << "k2's re-create floors strictly BELOW the real tombstone, never tying it -- "
          "ExpiryTombstoneFor's one-tick-above margin is exactly what prevents k1's hazard here";
+  // The opposite of k1's pair: exactly one direction accepts, so a later merge repairs it.
+  EXPECT_TRUE(MergeAccepts(recreated2, *real_tomb))
+      << "a peer holding the recreate must accept the real tombstone -- it strictly outranks it";
+  EXPECT_FALSE(MergeAccepts(real_tomb, *recreated2))
+      << "a peer holding the real tombstone must reject the recreate -- it strictly loses";
 }
 
 // drakeydb: P4-4 Task A5 -- a LIVE applied write over a TOMBSTONED slot. Before this
