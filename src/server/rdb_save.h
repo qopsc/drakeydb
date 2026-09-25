@@ -326,9 +326,10 @@ class RdbSerializer {
 
   // drakeydb: P4-3 Task 5 -- writes {packed, origin_hash} as 16 raw LE bytes: the same wire shape
   // SaveEntry above uses for a per-key RDB_OPCODE_DF_MVCC record's trailing bytes. Factored out
-  // here so RDB_OPCODE_DF_TOMBSTONES's per-entry stamp shares one encoding with the per-key stamp
-  // instead of re-deriving it independently. Does not write an opcode or a key -- callers do that
-  // themselves first (see rdb_extensions.h for RDB_OPCODE_DF_TOMBSTONES's payload layout).
+  // here so RDB_OPCODE_DF_TOMBSTONES_V2's per-entry stamp shares one encoding with the per-key
+  // stamp instead of re-deriving it independently. Does not write an opcode, a key, or the
+  // trailing meta word -- callers do that themselves (see rdb_extensions.h for
+  // RDB_OPCODE_DF_TOMBSTONES_V2's payload layout).
   std::error_code SaveMvccStampBits(const MvccStamp& stamp);
 
   // drakeydb: P4-5 -- writes one COMPLETE RDB_OPCODE_DF_TOMBSTONES_V2 section (opcode, db_index,

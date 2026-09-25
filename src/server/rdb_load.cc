@@ -3497,9 +3497,9 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // and clamps against db_cntx.time_now_ms, which is `now_ms` verbatim -- this method's own
       // caller-supplied parameter, above. For CreateObjectOnShard's merge-load caller that is
       // LoadItemsBuffer's own single per-batch clock reading, threaded through its own db_cntx; for
-      // HandleTombstones' RDB_OPCODE_DF_TOMBSTONES `install` lambda it is a fresh
-      // GetCurrentTimeMs() read there (that caller always passes kTombMetaNone, so the clamp is a
-      // no-op for it regardless). Never a fresh, independently-read GetCurrentTimeMs() taken HERE:
+      // HandleTombstones' `install` lambda it is a fresh GetCurrentTimeMs() read there -- a no-op
+      // for a 225 record (always kTombMetaNone), a genuine clamp for a V2 record's own meta. Never
+      // a fresh, independently-read GetCurrentTimeMs() taken HERE:
       // using the SAME clock reading the caller's own elapsed decision was already made against
       // makes the clamp provably inert for a genuine D (D <= that reading by construction), rather
       // than racing a fresh read taken after this function's own yield (FindMutable's
@@ -4353,7 +4353,7 @@ error_code RdbLoader::HandleShardDocIndex() {
 // is false for a 225 record (meta installs as kTombMetaNone, exactly as before this record kind
 // carried meta at all) and true for a V2 one (meta is this entry's own trailing 8-byte LE word).
 error_code RdbLoader::HandleTombstones(bool has_meta) {
-  const char* const kOpcodeName =
+  const char* const opcode_name =
       has_meta ? "RDB_OPCODE_DF_TOMBSTONES_V2" : "RDB_OPCODE_DF_TOMBSTONES";
   // drakeydb: P4-3 Task 5 review fix (I3) -- mirrors RDB_OPCODE_SELECTDB's own validation
   // (above in this file) exactly: without this, a malformed db_index narrowed silently through
@@ -4403,7 +4403,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
       // A live stamp (bit 63 clear) has no business in the tombstone section -- a malformed
       // file; our own saver never produces this. Diagnostic, not fatal: skip this entry only.
       if (!warned_tombstone_not_flagged_) {
-        LOG(WARNING) << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
+        LOG(WARNING) << opcode_name << " entry for key '" << absl::CHexEscape(key) << "' in DB "
                      << db_index
                      << " has bit 63 clear (not a tombstone) -- skipping; malformed file";
         warned_tombstone_not_flagged_ = true;
@@ -4422,7 +4422,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
       // immortal: never reaped, and the strict minimum of every future merge comparison,
       // blocking a resurrection forever instead of merely delaying it. Reject, never install.
       if (!warned_tombstone_zero_mvcc_) {
-        LOG(WARNING) << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
+        LOG(WARNING) << opcode_name << " entry for key '" << absl::CHexEscape(key) << "' in DB "
                      << db_index
                      << " has Mvcc() == 0 -- skipping; installing it would be immortal (never "
                         "reaped, always wins future merge comparisons)";
@@ -4447,7 +4447,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
     // every loader, not just under merge_lww_.
     const ShardId sid = Shard(key, shard_set->size());
     auto install =
-        [db_index, key, stamp, meta, merge_lww = merge_lww_, kOpcodeName] {
+        [db_index, key, stamp, meta, merge_lww = merge_lww_, opcode_name] {
           DbSlice& db_slice = GetCurrentDbSlice();
           // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
           // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
@@ -4540,7 +4540,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
           // exactly this).
           if (resident_live) {
             LOG_FIRST_N(WARNING, 1)
-                << kOpcodeName << " entry for key '" << absl::CHexEscape(key) << "' in DB "
+                << opcode_name << " entry for key '" << absl::CHexEscape(key) << "' in DB "
                 << db_index
                 << " names a key that already holds a live, resident value on this node -- keeping "
                    "the resident value and skipping the tombstone";
@@ -4561,7 +4561,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
           // --multi_master_tombstone_ttl to 0 and restarts. Checked BEFORE the mvcc-table-missing
           // no-op below so the warning fires on the actually-relevant cause when both are true.
           if (!TombstonesEnabled()) {
-            LOG_FIRST_N(WARNING, 1) << kOpcodeName << " entry for key '" << absl::CHexEscape(key)
+            LOG_FIRST_N(WARNING, 1) << opcode_name << " entry for key '" << absl::CHexEscape(key)
                                     << "' in DB " << db_index
                                     << " skipped -- tombstoning is disabled on this node "
                                        "(--multi_master_tombstone_ttl=0)";
@@ -4617,7 +4617,7 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
           const uint64_t clamped_meta = ClampPeerTombMetaDeadline(meta, now_ms);
           if (DbSlice::TombstoneBornExpired(stamp, clamped_meta, now_ms)) {
             ++cur_table->stats.mvcc_tombstones_born_expired;
-            VLOG(2) << "refusing born-expired " << kOpcodeName << " install: db=" << db_index
+            VLOG(2) << "refusing born-expired " << opcode_name << " install: db=" << db_index
                     << " key=" << absl::CHexEscape(key);
             return;
           }

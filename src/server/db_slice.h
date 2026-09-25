@@ -498,8 +498,9 @@ class DbSlice {
   // (tagged as an anchor unless the value's own type is OBJ_STRING -- only a string can vanish
   // solely through an explicit, guarded, full-state delete, so only a string's own D is a sound
   // veto premise for a later re-create); ApplyMergeTombstoneOnShard's own fallthrough is itself
-  // reached by TWO different upstream sources, and its OTHER one (an RDB_OPCODE_DF_TOMBSTONES
-  // record, whose wire format carries no meta at all yet) passes kTombMetaNone through explicitly.
+  // reached by TWO different upstream sources, and its OTHER one (HandleTombstones' own install
+  // lambda, rdb_load.cc) passes the tombstone opcode's own wire meta straight through:
+  // kTombMetaNone for a 225 record (which carries none), or a V2 record's own trailing word.
   // Clamped via mvcc.h's ClampPeerTombMetaDeadline (which preserves an anchor's own bit 63 -- see
   // its own comment) before being forwarded to SetTombstone: every caller reaches this method
   // because the incoming deadline has ALREADY elapsed (D <= now by construction), so a genuine D
@@ -532,8 +533,8 @@ class DbSlice {
   // TombstoneGcStep (db_slice.cc) and the save filter (snapshot.cc) do, so every caller shares one
   // definition of "born expired" instead of re-deriving the ttl flag itself. Static: no instance
   // state needed, and callable from a file that only has a stamp/meta/clock triple in hand
-  // (rdb_load.cc's opcode-225 install, which never resolves a live
-  // DbSlice::InstallAbsentKeyTombstone call for that record).
+  // (rdb_load.cc's non-merge tombstone install, shared by both 225 and V2 records, which never
+  // resolves a live DbSlice::InstallAbsentKeyTombstone call for that record).
   //
   // drakeydb: P4-5 -- always false when tombstones are disabled (--multi_master_tombstone_ttl=0),
   // never true: see the definition's own comment (db_slice.cc) for why a ttl=0 caller would

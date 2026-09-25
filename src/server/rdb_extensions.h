@@ -91,6 +91,14 @@ constexpr uint8_t RDB_OPCODE_TAGGED_CHUNK = 224;
 // drakeydb: P4-5 -- superseded as a WRITE-side format by RDB_OPCODE_DF_TOMBSTONES_V2 below (an
 // active node no longer emits this opcode at all); the constant and the read side stay, so a file
 // or a peer stream written before this record existed still loads (meta = kTombMetaNone).
+//
+// UPSTREAM-SYNC hazard: 225 is the number upstream's own next sequential DF extension would most
+// likely take (its own highest is 224, RDB_OPCODE_TAGGED_CHUNK) -- this is the MOST likely
+// collision of the two opcodes on this page, not RDB_OPCODE_DF_TOMBSTONES_V2 below (230 was
+// picked with extra clearance precisely to reduce that risk for the newer record). If upstream
+// ever claims 225, this fork's own legacy-tombstone reader would silently misparse an
+// upstream-authored record, or vice versa. Re-verify against upstream's rdb.h/rdb_load.cc before
+// every merge (docs/UPSTREAM-SYNC.md's watchlist).
 constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES = 225;
 
 // drakeydb: P4-5 -- carries a tombstone's meta word (mvcc.h's kTombMetaNone / kTombMetaAnchorOnly
@@ -110,9 +118,10 @@ constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES = 225;
 // Read side: UNCONDITIONAL on every node, exactly like 225's own read-unconditional contract --
 // both opcodes are parsed and, on a non-active node, discarded.
 //
-// UPSTREAM-SYNC hazard: chosen well clear of 226, the number upstream's own next sequential DF
-// extension would most likely take next (its own most recent is 224,
-// RDB_OPCODE_TAGGED_CHUNK) -- an upstream opcode later claiming this exact number would silently
-// misparse against this fork's tombstone-V2 reader, or vice versa. Re-verify this constant
-// against upstream's rdb.h/rdb_load.cc before every merge (docs/UPSTREAM-SYNC.md's watchlist).
+// UPSTREAM-SYNC hazard: chosen with extra clearance beyond 226-229 -- 225 above (upstream's own
+// most likely next sequential DF extension after its own highest, 224) is the MORE likely
+// collision of the two opcodes on this page, but an upstream opcode later claiming 230 would
+// still silently misparse against this fork's tombstone-V2 reader, or vice versa. Re-verify this
+// constant against upstream's rdb.h/rdb_load.cc before every merge (docs/UPSTREAM-SYNC.md's
+// watchlist).
 constexpr uint8_t RDB_OPCODE_DF_TOMBSTONES_V2 = 230;

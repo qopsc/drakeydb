@@ -554,8 +554,8 @@ class RdbLoader : protected RdbLoaderBase {
   // wire shape being parsed: false for a 225 record (no trailing word -- installs with
   // kTombMetaNone, exactly as before this parameter existed), true for a V2 record (one extra
   // trailing 8-byte LE meta word per entry, read and threaded through to the install). See the
-  // .cc for the three reject cases carried over from Task 3's contract, unchanged for either wire
-  // shape.
+  // .cc for the four reject cases (malformed: bit 63 clear, or Mvcc() == 0; a resident live key;
+  // tombstoning disabled) plus the born-expired refusal, unchanged for either wire shape.
   std::error_code HandleTombstones(bool has_meta);
 
   // drakeydb: P4-3 final fix wave (F-1) -- the single merge-LWW tombstone-apply primitive, shared

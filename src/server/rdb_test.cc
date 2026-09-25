@@ -6931,6 +6931,60 @@ TEST_F(RdbMvccTest, V2HostileFarFutureMetaIsClampedAnchorStaysAnchorClassed) {
       << "the anchor's own ms payload must still clamp down to now";
 }
 
+// drakeydb: P4-5 -- the non-merge counterpart to the hostile-far-future-meta test above:
+// HandleTombstones' non-merge install branch (rdb_load.cc) computes its own
+// ClampPeerTombMetaDeadline call, independently of the merge branch's -- a bug that dropped only
+// THIS call (e.g. reverting `clamped_meta` to the raw, unclamped `meta`) would leave the
+// merge-mode test above green. Same shape as that test (a far-future bare deadline and a
+// far-future anchor), but loaded with no SetMergeLww call at all, so it drives the non-merge
+// install path (a local RDB file, DEBUG LOAD, or a plain Dragonfly replica's full sync) directly.
+TEST_F(RdbMvccTest, WithoutMergeLwwHostileFarFutureMetaIsClampedAnchorStaysAnchorClassed) {
+  ASSERT_TRUE(IsActiveReplica());
+  const uint64_t now_before = GetCurrentTimeMs();
+  // Just under MvccClock's own 43-bit ms ceiling (kStampMask >> kCounterBits) -- "as far future
+  // as this encoding allows", roughly year 2248.
+  const uint64_t kFarFutureMs = (1ULL << 43) - 1;
+  ASSERT_GT(kFarFutureMs, now_before);
+
+  const MvccStamp kStampDeadline =
+      MvccStamp{(now_before << MvccClock::kCounterBits) + 0x8003, 0xAAAAULL}.AsTombstone();
+  const MvccStamp kStampAnchor =
+      MvccStamp{(now_before << MvccClock::kCounterBits) + 0x8004, 0xBBBBULL}.AsTombstone();
+
+  std::string body = BuildTombstoneSectionV2(
+      0, {{"ghost_deadline_nm", kStampDeadline, kFarFutureMs},
+          {"ghost_anchor_nm", kStampAnchor, kTombMetaAnchorOnly | kFarFutureMs}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  // No SetMergeLww: exercises the non-merge install branch's own clamp directly.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+  EXPECT_EQ(Run({"get", "after"}), "afterval");
+
+  const uint64_t now_after = GetCurrentTimeMs();
+
+  uint64_t deadline_meta = 0, anchor_meta = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    deadline_meta = db_slice.GetTombMeta(0, std::string_view{"ghost_deadline_nm"});
+    anchor_meta = db_slice.GetTombMeta(0, std::string_view{"ghost_anchor_nm"});
+  });
+
+  EXPECT_EQ(deadline_meta & kTombMetaAnchorOnly, 0u) << "a bare deadline must stay bare";
+  EXPECT_GE(deadline_meta, now_before) << "the clamp target is install-time now, not zero";
+  EXPECT_LE(deadline_meta, now_after) << "a far-future deadline must clamp down to now";
+
+  EXPECT_NE(anchor_meta & kTombMetaAnchorOnly, 0u)
+      << "the anchor bit must survive the clamp -- a far-future anchor must not decay into a "
+         "bare deadline";
+  EXPECT_GE(anchor_meta & ~kTombMetaAnchorOnly, now_before)
+      << "the anchor's own ms payload must clamp against install-time now, not zero";
+  EXPECT_LE(anchor_meta & ~kTombMetaAnchorOnly, now_after)
+      << "the anchor's own ms payload must still clamp down to now";
+}
+
 // drakeydb: P4-5 -- proves the V2 read path's born-expired check genuinely uses `meta`, not just
 // the stamp: a tombstone whose write-time stamp alone is well past its own GC deadline (the
 // exact D-16 shape -- a long-lived key's tombstone floors on write time, not the key's own later
