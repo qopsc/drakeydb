@@ -731,8 +731,7 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   // drakeydb: P4-3 Task 8 -- mvcc_tombstones_dropped (Task 2) beside mvcc_tombstones, same gate.
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
   // drakeydb: P4-5 -- mvcc_tombstones_born_expired (table.h) beside mvcc_tombstones_dropped, same
-  // gate; nothing here yet refuses a peer-sourced install as born-expired, so 0 is the only value
-  // it can hold.
+  // gate; this test never installs or expires a tombstone, so 0 is the only value it can hold here.
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_born_expired:0\r\n"));
 }
 
@@ -1002,6 +1001,26 @@ class MvccStoreTest : public BaseFamilyTest {
     std::atomic<uint64_t> total{0};
     shard_set->pool()->AwaitBrief(
         [&](unsigned, auto*) { total += MvccStamper::tlocal()->stats().unstamped_writes; });
+    return total.load();
+  }
+
+  // drakeydb: P4-5 -- sums DbTableStats::mvcc_tombstones_born_expired (table.h) across every
+  // shard, same atomic-accumulator shape as TotalLwwDropped/TotalUnstampedWrites above (not a
+  // plain `total +=` from RunBriefInParallel's per-shard callbacks, which run on different
+  // proactor threads and would race on a non-atomic accumulator): a born-expired install can land
+  // on any shard depending on key hashing, so reading a single shard would be flaky.
+  uint64_t TotalMvccTombstonesBornExpired() {
+    std::atomic<uint64_t> total{0};
+    shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+      EngineShard* shard = EngineShard::tlocal();
+      if (shard == nullptr)
+        return;
+      total += namespaces->GetDefaultNamespace()
+                   .GetDbSlice(shard->shard_id())
+                   .GetStats()
+                   .db_stats[0]
+                   .mvcc_tombstones_born_expired;
+    });
     return total.load();
   }
 };
@@ -3445,12 +3464,59 @@ TEST_F(MvccStoreTest, GcHonorsTombstoneMetaFromLocalExpiryOverridingStampMs) {
     });
     return total;
   }();
-  // Informational only, not a falsification target of this test: nothing in the codebase yet
-  // refuses a peer-sourced install as born-expired (that refusal rule is a separate change), so
-  // this counter can only ever observe 0 here regardless of what this test's own producer does.
+  // Informational only, not a falsification target of this test: a local expiry commit DOES count
+  // (never refuse) a born-expired tombstone (DbSlice::CommitExpiryTombstone, db_slice.cc), but this
+  // test's own tombstone is deliberately NOT born-expired at its own reap time -- that is exactly
+  // what the GC-survival check above (between T.ms + ttl and D + ttl) already proves -- so this
+  // counter staying put here says nothing about that other rule either way.
   EXPECT_EQ(after_born_expired, before_born_expired)
-      << "a LOCAL expiry's own tombstone must never be counted as born-expired -- that counter is "
-         "reserved for a peer-sourced install of an already-dead key";
+      << "this test's own tombstone is not born-expired at its own reap time, so this counter must "
+         "stay unchanged regardless of what a genuinely born-expired local commit would do";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- B9: the genuinely born-expired counterpart to the test directly above -- a
+// tiny --multi_master_tombstone_ttl and a lazy reap delayed well past D + ttl, so the tombstone
+// this local expiry commits is already GC-eligible the instant it is minted. Unlike a peer-sourced
+// install, a local expiry NEVER refuses its own key: the tombstone is still committed (GC reaps it
+// normally on its very next step), and only the counter moves.
+//
+// Falsifying: removing the TombstoneBornExpired check in DbSlice::CommitExpiryTombstone
+// (db_slice.cc) makes `TotalMvccTombstonesBornExpired()` below stay at `before_born` instead of
+// advancing by one.
+TEST_F(MvccStoreTest, LocalExpiryBornExpiredKeepsTombstoneAndCounts) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "local-born-expired";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "v", "px", "10"}), "OK");
+
+  const uint64_t before_born = TotalMvccTombstonesBornExpired();
+
+  // Push "now" well past D + ttl (10ms + 1000ms) before the lazy reap ever runs, so the reap's own
+  // now already exceeds the tombstone's own GC deadline the instant it is minted -- the reap
+  // "lagged by at least the ttl" case the brief's own Why section names as the only way a local
+  // commit can be born expired.
+  AdvanceTime(2000);
+  Run({"get", key});  // triggers lazy expiry
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass";
+
+  auto tomb = StampOf(key);
+  ASSERT_TRUE(tomb.has_value())
+      << "a born-expired LOCAL commit must still be COMMITTED, never refused";
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf(key), deadline_ms);
+  EXPECT_EQ(TotalMvccTombstonesBornExpired(), before_born + 1);
+
+  // The very next GC step must reap it -- born expired means eligible now, not merely eventually.
+  const ShardId sid = Shard(key, shard_set->size());
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.TombstoneGcStep();
+  });
+  EXPECT_FALSE(StampOf(key).has_value())
+      << "a born-expired tombstone must be reaped on the very next GC step";
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
@@ -3625,15 +3691,43 @@ TEST_F(MvccStoreTest, SetAnchorsByTypeRegardlessOfMemberTtlContentOrReapHistory)
   AdvanceTime(1050);  // past R for both; well before either D
 
   // Reap ONLY reaped_key's own shard: member "a" is removed, leaving only "b". unreaped_key's own
-  // shard is never swept (the two keys are asserted to be on different shards, above), and the
-  // outcome below does not depend on whether this reap step actually ran -- the type (SET) decides
-  // either way, so no precondition guard on the reap's own effect is needed here.
+  // shard is never swept (the two keys are asserted to be on different shards, above). The
+  // classification outcome below does not itself depend on whether this reap step ran -- the type
+  // (SET) decides either way -- but the test's own NAME claims the two keys are in genuinely
+  // different reap states, which the precondition just below actually proves rather than assumes.
   const ShardId reaped_sid = Shard(reaped_key, num_shards);
   shard_set->Await(reaped_sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     DbContext db_cntx{&namespaces->GetDefaultNamespace(), 0, TEST_current_time_ms};
     db_slice.DeleteExpiredStep(db_cntx, 100000);
   });
+
+  // drakeydb: P4-5 -- precondition: confirm the two keys really are in different LOCAL reap states
+  // before asserting they classify identically below, or a broken/no-op DeleteExpiredStep call
+  // above would make this test vacuously prove nothing about reap-history independence. A raw
+  // PrimeTable::Find, not FindReadOnly/a command dispatch: reading via a client command could
+  // itself trigger a lazy per-member reap and quietly erase the very divergence this checks for.
+  bool reaped_has_member_ttl = true;
+  shard_set->Await(reaped_sid, [&] {
+    PrimeTable* table = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetTables(0);
+    auto it = table->Find(reaped_key);
+    if (it != table->end())
+      reaped_has_member_ttl = it->second.HasMemberExpiration();
+  });
+  bool unreaped_has_member_ttl = false;
+  shard_set->Await(Shard(unreaped_key, num_shards), [&] {
+    PrimeTable* table = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetTables(0);
+    auto it = table->Find(unreaped_key);
+    if (it != table->end())
+      unreaped_has_member_ttl = it->second.HasMemberExpiration();
+  });
+  ASSERT_FALSE(reaped_has_member_ttl)
+      << "sanity: the explicit DeleteExpiredStep call above must have cleared "
+         "HasMemberExpiration() on reaped_key, or the two keys below are not actually in "
+         "different reap states";
+  ASSERT_TRUE(unreaped_has_member_ttl)
+      << "sanity: unreaped_key's own shard was never swept -- it must still report "
+         "HasMemberExpiration(), confirming the two keys really are in different reap states";
 
   // Both keys share the identical base_ms (created back-to-back with no AdvanceTime between them),
   // so a single AdvanceTime brings both equally far past their own D = base + 5000: current time is
@@ -6173,7 +6267,10 @@ TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOld
   // X: a guarded SET with an ABSOLUTE deadline already in the past (PXAT 1 -- 1ms since the
   // epoch). The key is absent, so the veto's own MergeAccepts(nullopt, X) accepts it and lets it
   // reach SetCmd::Set's own expire_in_past branch.
-  constexpr uint64_t kXMvcc = 0x5000ULL;
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const uint64_t kXMvcc = (GetCurrentTimeMs() << MvccClock::kCounterBits) | 0x5000ULL;
   ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "x_val", "PXAT", "1"}, kPeerIdx, kXMvcc,
                                    /*lww_guard=*/true),
             facade::DispatchResult::OK);
@@ -6213,6 +6310,40 @@ TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyInstallsTombstoneRejectingOld
   EXPECT_EQ(TotalUnstampedWrites(), 0u);
 }
 
+// drakeydb: P4-5 -- B9: the SET test's own born-expired sibling -- a guarded write whose own mint
+// is old enough that, at a tiny --multi_master_tombstone_ttl, the tombstone this write would
+// install is already GC-eligible the instant it would be installed. Refused outright and counted,
+// unlike the not-born-expired case above, which installs and protects against a later, older
+// write: here nothing is installed, so the key is left genuinely, unprotectedly absent.
+//
+// Falsifying: removing the TombstoneBornExpired check in DbSlice::InstallAbsentKeyTombstone
+// (db_slice.cc) makes StampOf("k") below observe a tombstone instead of nullopt, and
+// TotalMvccTombstonesBornExpired() stay at its prior value instead of advancing by one.
+TEST_F(MvccStoreTest, SetActiveNodeExpiredAbsentKeyBornExpiredInstallsNoneAndCounts) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint32_t kPeerIdx = 99;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000099");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  // X's own mint is 5s in the past -- with ttl tiny (1s), the tombstone this write would install
+  // (X|bit, D=1) is already GC-eligible the instant it would be installed: born expired.
+  const uint64_t kXMvcc = (GetCurrentTimeMs() - 5000) << MvccClock::kCounterBits;
+  const uint64_t before_born = TotalMvccTombstonesBornExpired();
+  ASSERT_EQ(ApplyReplicatedCommand({"set", "k", "x_val", "PXAT", "1"}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "k"}).GetInt(), 0) << "the already-expired write must create nothing";
+
+  EXPECT_FALSE(StampOf("k").has_value())
+      << "a born-expired tombstone must be refused, never installed, against an absent key";
+  EXPECT_EQ(TotalMvccTombstonesBornExpired(), before_born + 1);
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+}
+
 // drakeydb: P4-4 -- OpRestore's own !found_prev sibling of the SET test above: a guarded RESTORE
 // against a key this node does not hold, carrying an ABSOLUTE ttl already in the past, must also
 // install a tombstone -- the common shape for a non-string RESTORE whose TTL has already elapsed
@@ -6239,7 +6370,10 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyInstallsTombstoneRejectin
   // X: a guarded RESTORE with an ABSOLUTE deadline already in the past (ABSTTL "1" -- 1ms since
   // the epoch). The key is absent, so the veto's own MergeAccepts(nullopt, X) accepts it and lets
   // it reach OpRestore's own Expired() + !found_prev branch.
-  constexpr uint64_t kXMvcc = 0x5000ULL;
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const uint64_t kXMvcc = (GetCurrentTimeMs() << MvccClock::kCounterBits) | 0x5000ULL;
   ASSERT_EQ(ApplyReplicatedCommand({"restore", "k", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
                                    /*lww_guard=*/true),
             facade::DispatchResult::OK);
@@ -6387,6 +6521,44 @@ TEST_F(MvccStoreTest, OpRestoreFoundPrevGuardedAttachesDeadlineMeta) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: P4-5 -- the non-string sibling of the test directly above: a guarded RESTORE ...
+// REPLACE whose payload is a SET, against a key this node DOES hold, must attach an ANCHOR
+// (kTombMetaAnchorOnly | D), never a bare D -- exercising ElapsedRestoreTombMeta's own type-byte
+// check at OpRestore's found_prev branch specifically. The string-only test above cannot catch a
+// site that bypassed the helper (a bare D is also the CORRECT answer for a string payload); this
+// one can, since a bare D here would be visibly wrong.
+//
+// Falsifying: reverting OpRestore's found_prev branch to attach a bare `tagged_meta` computed
+// without ElapsedRestoreTombMeta's type check (generic_family.cc) makes the EXPECT_EQ below observe
+// a bare deadline (kTombMetaAnchorOnly clear) instead of an anchor.
+TEST_F(MvccStoreTest, OpRestoreFoundPrevGuardedAttachesAnchorForNonStringPayload) {
+  constexpr uint32_t kPeerIdx = 93;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000093");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  ASSERT_EQ(Run({"sadd", "restore_present_set_donor", "x"}).GetInt(), 1);
+  std::string dump = Run({"dump", "restore_present_set_donor"}).GetString();
+  ASSERT_EQ(Run({"set", "restore_present_set_k", "old"}), "OK");
+  auto s_stamp = StampOf("restore_present_set_k");
+  ASSERT_TRUE(s_stamp.has_value());
+
+  const uint64_t kXMvcc = s_stamp->Mvcc() + 0x1000000ULL;
+  ASSERT_GT(kXMvcc, s_stamp->Mvcc()) << "sanity: X is strictly after S so the guard admits it";
+  ASSERT_EQ(
+      ApplyReplicatedCommand({"restore", "restore_present_set_k", "1", dump, "REPLACE", "ABSTTL"},
+                             kPeerIdx, kXMvcc, /*lww_guard=*/true),
+      facade::DispatchResult::OK);
+  EXPECT_EQ(Run({"exists", "restore_present_set_k"}).GetInt(), 0);
+
+  auto tomb = StampOf("restore_present_set_k");
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf("restore_present_set_k"), kTombMetaAnchorOnly | 1u)
+      << "a set payload must anchor, not attach a bare D, even on the PRESENT-key elapsed path";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 // drakeydb: P4-5 -- Renamer::DeserializeDest's own present-destination sibling of the two tests
 // directly above: a guarded cross-shard RENAME whose SOURCE key's absolute TTL has already
 // elapsed, against a DESTINATION this node DOES hold, must attach meta = D too, mirroring
@@ -6476,8 +6648,77 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesDeadlineMe
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: P4-5 -- the non-string sibling of the test directly above: the RENAME's SOURCE key
+// holds a SET, not a string, so Renamer::DeserializeDest's own present-destination branch must
+// attach an ANCHOR, not a bare D -- exercising ElapsedRestoreTombMeta's type-byte check at this
+// specific call site. The string-only test above cannot catch a site that bypassed the helper (a
+// bare D is also correct for a string source); this one can.
+//
+// Falsifying: reverting DeserializeDest's dest_found_-and-Expired() branch to attach a bare
+// `tagged_meta` computed without ElapsedRestoreTombMeta's type check (generic_family.cc) makes the
+// EXPECT_EQ below observe a bare deadline instead of an anchor.
+TEST_F(MvccStoreTest, DeserializeDestPresentDestinationGuardedAttachesAnchorForNonStringSource) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is exercising the CROSS-shard "
+                               "Renamer::DeserializeDest path, which needs at least 2 shards";
+  constexpr uint32_t kPeerIdx = 94;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-000000000094");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  std::string src_key, dest_key;
+  for (int i = 0; dest_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from src_key";
+    std::string cand = absl::StrCat("dds", i);
+    if (src_key.empty()) {
+      src_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(src_key, num_shards)) {
+      dest_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(src_key, num_shards), Shard(dest_key, num_shards))
+      << "sanity: src_key and dest_key must land on different shards";
+
+  ASSERT_EQ(Run({"set", dest_key, "dest_old"}), "OK");  // dest_found_ = true
+  auto dest_prior_stamp = StampOf(dest_key);
+  ASSERT_TRUE(dest_prior_stamp.has_value());
+  const uint64_t kXMvcc = dest_prior_stamp->Mvcc() + 0x1000000ULL;
+  ASSERT_GT(kXMvcc, dest_prior_stamp->Mvcc()) << "sanity: X is strictly after dest's own prior S";
+
+  // src_key holds a SET (non-string), with an already-elapsed absolute whole-key deadline D.
+  const uint64_t src_deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"sadd", src_key, "m"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", src_key, "10"}).GetInt(), 1);
+  AdvanceTime(50);  // D has elapsed
+
+  const ShardId src_sid = Shard(src_key, num_shards);
+  shard_set->Await(src_sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(false);
+  });
+  absl::Cleanup restore_expire = [&] {
+    shard_set->Await(src_sid, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(true);
+    });
+  };
+
+  ASSERT_EQ(ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  std::move(restore_expire).Invoke();
+
+  EXPECT_EQ(Run({"exists", dest_key}).GetInt(), 0)
+      << "the already-expired src value must not end up stored at dest";
+
+  auto tomb = StampOf(dest_key);
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf(dest_key), kTombMetaAnchorOnly | src_deadline_ms)
+      << "a set source must anchor, not attach a bare D, even on the PRESENT-destination path";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 // drakeydb: P4-5 -- OpRestore's own absent-key sibling of rdb_test.cc's
-// MergeLwwExpiredIncomingAllTtlMembersSetInstallsAnchorTombstone: a guarded RESTORE whose payload
+// MergeLwwExpiredIncomingSetInstallsAnchorTombstone: a guarded RESTORE whose payload
 // is a set, no member TTL at all, whose ABSOLUTE ttl has already elapsed, must still attach an
 // anchor -- not a bare D -- since the payload's own TYPE (not its member-TTL content) is what
 // decides. The payload is not otherwise materialized on this path (OpRestore skips
@@ -6499,7 +6740,10 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeySetPayloadGetsAnchor) {
 
   ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
 
-  constexpr uint64_t kXMvcc = 0x5000ULL;
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const uint64_t kXMvcc = (GetCurrentTimeMs() << MvccClock::kCounterBits) | 0x5000ULL;
   ASSERT_EQ(ApplyReplicatedCommand({"restore", "k", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
                                    /*lww_guard=*/true),
             facade::DispatchResult::OK);
@@ -6530,7 +6774,10 @@ TEST_F(MvccStoreTest, RestoreActiveNodeExpiredAbsentKeyListPayloadGetsAnchor) {
 
   ASSERT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "sanity: kl must start absent";
 
-  constexpr uint64_t kXMvcc = 0x5000ULL;
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const uint64_t kXMvcc = (GetCurrentTimeMs() << MvccClock::kCounterBits) | 0x5000ULL;
   ASSERT_EQ(ApplyReplicatedCommand({"restore", "kl", "1", dump, "ABSTTL"}, kPeerIdx, kXMvcc,
                                    /*lww_guard=*/true),
             facade::DispatchResult::OK);
@@ -6617,6 +6864,75 @@ TEST_F(MvccStoreTest, DeserializeDestPresentDestinationFlooredWriteAttachesNoMet
   EXPECT_EQ(TombMetaOf(dest_key), kTombMetaNone)
       << "a FLOORED delete (X < dest's own prior S) must never attach a deadline-bearing meta -- "
          "it does not represent a genuine win over the destination's own prior value";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- Renamer::DeserializeDest's own ABSENT-destination sibling of the
+// present-destination anchor test above: a guarded cross-shard RENAME whose SOURCE key holds a
+// SET (non-string), already expired, against a DESTINATION this node does NOT hold, must attach an
+// ANCHOR (kTombMetaAnchorOnly | D) via InstallAbsentKeyTombstone -- exercising
+// ElapsedRestoreTombMeta's type-byte check at this call site specifically, the third and last of
+// the three OpRestore/DeserializeDest present/absent sites this rule applies to.
+//
+// Falsifying: reverting DeserializeDest's !dest_found_ branch to attach a bare `tagged_meta`
+// computed without ElapsedRestoreTombMeta's type check (generic_family.cc) makes the EXPECT_EQ
+// below observe a bare deadline instead of an anchor.
+TEST_F(MvccStoreTest, DeserializeDestAbsentDestinationAttachesAnchorForNonStringSource) {
+  const unsigned num_shards = shard_set->size();
+  ASSERT_GT(num_shards, 1u) << "this test's entire point is exercising the CROSS-shard "
+                               "Renamer::DeserializeDest path, which needs at least 2 shards";
+  constexpr uint32_t kPeerIdx = 100;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-a9a9-4000-8000-0000000000a0");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  std::string src_key, dest_key;
+  for (int i = 0; dest_key.empty(); ++i) {
+    CHECK_LT(i, 10000) << "could not find a key on a different shard from src_key";
+    std::string cand = absl::StrCat("dda", i);
+    if (src_key.empty()) {
+      src_key = cand;
+    } else if (Shard(cand, num_shards) != Shard(src_key, num_shards)) {
+      dest_key = cand;
+    }
+  }
+  ASSERT_NE(Shard(src_key, num_shards), Shard(dest_key, num_shards))
+      << "sanity: src_key and dest_key must land on different shards";
+  ASSERT_EQ(Run({"exists", dest_key}).GetInt(), 0) << "sanity: dest_key must start absent";
+
+  // src_key holds a SET (non-string), with an already-elapsed absolute whole-key deadline D.
+  const uint64_t src_deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"sadd", src_key, "m"}).GetInt(), 1);
+  ASSERT_EQ(Run({"pexpire", src_key, "10"}).GetInt(), 1);
+  AdvanceTime(50);  // D has elapsed
+
+  // The destination is absent, so there is no prior stamp to satisfy MergeAccepts against -- any
+  // incoming mvcc is accepted (mirrors OpRestore's own absent-key tests, above).
+  constexpr uint64_t kXMvcc = 0x9000ULL;
+
+  const ShardId src_sid = Shard(src_key, num_shards);
+  shard_set->Await(src_sid, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(false);
+  });
+  absl::Cleanup restore_expire = [&] {
+    shard_set->Await(src_sid, [&] {
+      namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetExpireAllowed(true);
+    });
+  };
+
+  ASSERT_EQ(ApplyReplicatedCommand({"rename", src_key, dest_key}, kPeerIdx, kXMvcc,
+                                   /*lww_guard=*/true),
+            facade::DispatchResult::OK);
+  std::move(restore_expire).Invoke();
+
+  EXPECT_EQ(Run({"exists", dest_key}).GetInt(), 0) << "the already-expired src value must not end "
+                                                      "up stored at the absent destination";
+
+  auto tomb = StampOf(dest_key);
+  ASSERT_TRUE(tomb.has_value());
+  EXPECT_TRUE(tomb->IsTombstone());
+  EXPECT_EQ(TombMetaOf(dest_key), kTombMetaAnchorOnly | src_deadline_ms)
+      << "a set source must anchor, not attach a bare D, even against an ABSENT destination";
+  EXPECT_EQ(TotalUnstampedWrites(), 0u);
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 

@@ -3198,7 +3198,11 @@ TEST_F(RdbMvccTest, MergeLwwWinningTombstoneDeletesResidentLiveKey) {
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
   const MvccStamp kResidentStamp{0x1000, kSelfHash};
-  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   shard_set->Await(0, [&] {
@@ -3339,7 +3343,11 @@ TEST_F(RdbMvccTest, MergeLwwNewerIncomingTombstoneUpdatesResidentTombstone) {
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
   const MvccStamp kResidentTombstone = MvccStamp{0x1000, kSelfHash}.AsTombstone();
-  const MvccStamp kIncomingTombstone = MvccStamp{0x3000, kPeerHash}.AsTombstone();  // newer
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingTombstone =  // newer
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x3000, kPeerHash}.AsTombstone();
 
   size_t tombstones_before = 0;
   shard_set->Await(0, [&] {
@@ -3426,8 +3434,15 @@ TEST_F(RdbMvccTest, WithoutMergeLwwOlderTombstoneStillRegressesResidentTombstone
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
-  const MvccStamp kResidentTombstone = MvccStamp{0x2000, kSelfHash}.AsTombstone();
-  const MvccStamp kIncomingTombstone = MvccStamp{0x1000, kPeerHash}.AsTombstone();  // older
+  // drakeydb: P4-5 -- both ms components must be realistic ("now"), not near-epoch literals: this
+  // test's own non-merge opcode-225 install now runs the TombstoneBornExpired (mvcc.h) refusal
+  // first, and an ancient incoming stamp would refuse the install before the assertions below ever
+  // see it. Kept on the same "now" base, `kResidentTombstone` above `kIncomingTombstone` exactly as
+  // the original near-epoch literals were, so "older" below stays literally true.
+  const uint64_t kNowMs = GetCurrentTimeMs() << MvccClock::kCounterBits;
+  const MvccStamp kResidentTombstone = MvccStamp{kNowMs + 0x2000, kSelfHash}.AsTombstone();
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{kNowMs + 0x1000, kPeerHash}.AsTombstone();  // older
 
   shard_set->Await(0, [&] {
     namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetTombstone(0, std::string_view{"k"},
@@ -3819,7 +3834,11 @@ TEST_F(RdbMvccMultiShardTest, MergeLwwWinningTombstoneDeletesResidentLiveKeyOnNo
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
   const MvccStamp kResidentStamp{0x1000, kSelfHash};
-  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   const ShardId target_shard = Shard("k", shard_set->size());
@@ -4126,7 +4145,10 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsReplica) {
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
   const MvccStamp kResidentStamp{0x2000, kSelfHash};
   // Vastly newer than the resident stamp -- the peer's SET that replaced our value, then expired.
-  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   shard_set->Await(0, [&] {
@@ -4185,7 +4207,10 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
   const MvccStamp kResidentStamp{0x2000, kSelfHash};
-  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
 
   ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
   shard_set->Await(0, [&] {
@@ -4249,7 +4274,10 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingDeletesStaleResidentAsMaster) {
 TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
 
   ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
 
@@ -4283,6 +4311,190 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
   EXPECT_EQ(mismatches, 0u);
 }
 
+// drakeydb: P4-5 -- B9: a merge-load's synthetic expiry tombstone that is already GC-eligible
+// (expire_ms + ttl <= now, DbSlice::TombstoneBornExpired, mvcc.h) the instant it would be installed
+// must be refused outright against an ABSENT key, not installed and left for the very next GC step
+// to reap -- and the refusal is counted. --multi_master_tombstone_ttl is set tiny (1s) so a
+// deadline 5s in the past is unambiguously past D + ttl, without needing a wall-clock-scale wait.
+//
+// Falsifying: removing the TombstoneBornExpired check in DbSlice::InstallAbsentKeyTombstone
+// (db_slice.cc) makes `got.has_value()` below observe true (a tombstone installed) instead of
+// false, and `born_after` stay equal to `born_before` instead of advancing by one.
+TEST_F(RdbMvccTest, MergeLwwBornExpiredSyntheticTombstoneAbsentKeyInstallsNoneAndCounts) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  // The STAMP's own ms must be old too, not just D: TombstoneBornExpired (mvcc.h) floors on
+  // max(stamp.MsPart(), meta), so a stamp minted "now" would dominate D and never be born expired
+  // no matter how far in the past D itself sits -- this is peer B's own write, minted 5s ago.
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const MvccStamp kIncomingStamp{kOldMs << MvccClock::kCounterBits, kPeerHash};
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  const uint64_t expire_ms = kOldMs;  // D + ttl(1s) is well past "now"
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp, expire_ms);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+
+  size_t born_before = 0;
+  shard_set->Await(0, [&] {
+    born_before = namespaces->GetDefaultNamespace()
+                      .GetCurrentDbSlice()
+                      .MutableStats(0)
+                      ->mvcc_tombstones_born_expired;
+  });
+
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil) << "an already-expired incoming key creates nothing";
+
+  std::optional<MvccStamp> got;
+  size_t born_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "a born-expired tombstone must be refused, never installed, against an absent key";
+  EXPECT_EQ(born_after, born_before + 1);
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- B9: the resident-LIVE-key sibling of the absent-key test above. The delete
+// still applies (the peer's write genuinely superseded the resident value), but the born-expired
+// tombstone itself is refused: the placeholder Del() left is erased instead of overwritten, so no
+// tombstone survives and the dense invariant (mvcc->size() - mvcc_tombstones == prime.size())
+// still holds.
+//
+// Falsifying: removing the TombstoneBornExpired check in RdbLoader::ApplyMergeTombstoneOnShard's
+// resident-live-key branch (rdb_load.cc) makes `got.has_value()` below observe true instead of
+// false, and `born_after` stay equal to `born_before` instead of advancing by one.
+TEST_F(RdbMvccTest, MergeLwwBornExpiredSyntheticTombstoneDeletesResidentButInstallsNone) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
+  const MvccStamp kResidentStamp{0x1000, kSelfHash};
+  // The STAMP's own ms must be old too, not just D: TombstoneBornExpired (mvcc.h) floors on
+  // max(stamp.MsPart(), meta), so a stamp minted "now" would dominate D and never be born expired
+  // no matter how far in the past D itself sits -- this is peer B's own write, minted 5s ago.
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const MvccStamp kIncomingStamp{kOldMs << MvccClock::kCounterBits, kPeerHash};
+
+  ASSERT_EQ(Run({"set", "k", "resident_v"}), "OK");
+  shard_set->Await(0, [&] {
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().SetMvcc(0, std::string_view{"k"},
+                                                                  kResidentStamp);
+  });
+
+  const uint64_t expire_ms = kOldMs;  // D + ttl(1s) is well past "now"
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp, expire_ms);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+
+  size_t born_before = 0;
+  shard_set->Await(0, [&] {
+    born_before = namespaces->GetDefaultNamespace()
+                      .GetCurrentDbSlice()
+                      .MutableStats(0)
+                      ->mvcc_tombstones_born_expired;
+  });
+
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil)
+      << "the delete must still apply regardless of the tombstone refusal";
+
+  std::optional<MvccStamp> got;
+  size_t born_after = 0, mismatches = 0, tombstones_after = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
+    tombstones_after = db_slice.MutableStats(0)->mvcc_tombstones;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "a born-expired tombstone must not be installed over the resident delete -- the "
+         "placeholder Del() left must be erased instead of overwritten";
+  EXPECT_EQ(born_after, born_before + 1);
+  EXPECT_EQ(tombstones_after, 0u)
+      << "the placeholder's own mvcc_tombstones credit must be released, not leaked";
+  EXPECT_EQ(mismatches, 0u) << "dense invariant must hold: erased, not tombstoned";
+}
+
+// drakeydb: P4-5 -- B9's own boundary control: the SAME tiny ttl as the two born-expired tests
+// above, but a deadline only 100ms in the past -- D + ttl(1s) is still ~900ms ahead of "now", so
+// this tombstone is NOT yet GC-eligible and must install exactly as it always has. Proves the new
+// refusal is not overly aggressive (a not-yet-eligible tombstone survives), the mirror image of the
+// two tests above.
+TEST_F(RdbMvccTest, MergeLwwNotYetBornExpiredSyntheticTombstoneStillInstalls) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
+
+  ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
+
+  const uint64_t expire_ms = GetCurrentTimeMs() - 100;  // 100ms ago; D + ttl(1s) is still ahead
+  std::string body = BuildExpiredStringEntry("k", "incoming_v", kIncomingStamp, expire_ms);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+
+  size_t born_before = 0;
+  shard_set->Await(0, [&] {
+    born_before = namespaces->GetDefaultNamespace()
+                      .GetCurrentDbSlice()
+                      .MutableStats(0)
+                      ->mvcc_tombstones_born_expired;
+  });
+
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "k"}), kMatchNil) << "an already-expired incoming key creates nothing";
+
+  std::optional<MvccStamp> got;
+  uint64_t got_meta = 0;
+  size_t born_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+    got_meta = db_slice.GetTombMeta(0, std::string_view{"k"});
+    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value())
+      << "a not-yet-eligible tombstone must still install, exactly as before this task";
+  EXPECT_EQ(*got, (MvccStamp{kIncomingStamp.packed | MvccClock::kTombstoneBit, kPeerHash + 1}));
+  EXPECT_EQ(got_meta, expire_ms);
+  EXPECT_EQ(born_after, born_before) << "a not-yet-eligible install must never be counted";
+  EXPECT_EQ(mismatches, 0u);
+}
+
 // drakeydb: P4-5 -- the merge-load synthetic tombstone must apply the type-based rule to the
 // LOADED value, exactly like the local whole-key expiry site (DbSlice::ExpireIfNeeded,
 // db_slice.cc): a peer-sourced already-elapsed SET, no member TTL at all, must still anchor, not
@@ -4297,7 +4509,10 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingAbsentKeyInstallsTombstoneWithMeta) {
 TEST_F(RdbMvccTest, MergeLwwExpiredIncomingSetInstallsAnchorTombstone) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
 
   ASSERT_EQ(Run({"exists", "k"}).GetInt(), 0) << "sanity: k must start absent";
 
@@ -4346,7 +4561,10 @@ TEST_F(RdbMvccTest, MergeLwwExpiredIncomingSetInstallsAnchorTombstone) {
 TEST_F(RdbMvccTest, MergeLwwExpiredIncomingListInstallsAnchorTombstone) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kIncomingStamp{0x0030000000000000ULL, kPeerHash};
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingStamp{GetCurrentTimeMs() << MvccClock::kCounterBits, kPeerHash};
 
   ASSERT_EQ(Run({"exists", "kl"}).GetInt(), 0) << "sanity: kl must start absent";
 
@@ -5909,7 +6127,11 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneOnLazilyExpiredResidentKeySurvivesLaterEpoc
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   constexpr uint64_t kSelfHash = 0x1122334455667788ULL;
-  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   // A whole-key TTL that has already elapsed by the time the load below runs FindMutable on it,
   // but nothing has touched it since, so it is still physically present -- ExpireIfNeeded discovers
@@ -6042,7 +6264,11 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
   absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
 
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal, so this test still
+  // exercises the CAP refusal (mvcc_tombstones_dropped) it names, rather than the unrelated
+  // TombstoneBornExpired (mvcc.h) refusal an ancient stamp would trip first.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   size_t dropped_before = 0;
   shard_set->Await(0, [&] {
@@ -6107,7 +6333,11 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
 TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyDoesNotStealConcurrentArm) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kIncomingTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
+  // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
+  // install refuse itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   shard_set->Await(0, [&] {
     auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
@@ -6171,8 +6401,13 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneUpdateForAbsentKeyIgnoresCapWhenNoGrowth) {
   absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
 
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  // kOldTombstone is pre-seeded directly via SetTombstone below, never through a call
+  // TombstoneBornExpired (mvcc.h) gates -- its own antiquity is irrelevant. kNewTombstone DOES
+  // reach InstallAbsentKeyTombstone via the merge fallthrough, so its ms must be realistic ("now"),
+  // or this test's own cap refusal (the point of its name) would never be reached.
   const MvccStamp kOldTombstone = MvccStamp{0x1000, kPeerHash}.AsTombstone();
-  const MvccStamp kNewTombstone = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  const MvccStamp kNewTombstone =
+      MvccStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000, kPeerHash}.AsTombstone();
 
   // Pre-install an OLDER tombstone directly (SetTombstone has no cap of its own -- the cap lives
   // only at call sites) so "ghost" already occupies a tombstone slot before the merge fallthrough
@@ -6226,8 +6461,12 @@ TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
   absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1);
 
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
-  const MvccStamp kFirst = MvccStamp{0x1000, kPeerHash}.AsTombstone();
-  const MvccStamp kSecond = MvccStamp{0x2000, kPeerHash}.AsTombstone();
+  // drakeydb: P4-5 -- both ms components must be realistic ("now"), not near-epoch literals, so
+  // this test still exercises the CAP refusal (mvcc_tombstones_dropped) it names, rather than the
+  // unrelated TombstoneBornExpired (mvcc.h) refusal an ancient stamp would trip first for both.
+  const uint64_t kNowMs = GetCurrentTimeMs() << MvccClock::kCounterBits;
+  const MvccStamp kFirst = MvccStamp{kNowMs + 0x1000, kPeerHash}.AsTombstone();
+  const MvccStamp kSecond = MvccStamp{kNowMs + 0x2000, kPeerHash}.AsTombstone();
 
   size_t dropped_before = 0, tombstones_before = 0;
   shard_set->Await(0, [&] {
@@ -6272,6 +6511,61 @@ TEST_F(RdbMvccTest, WithoutMergeLwwTombstoneInstallHonorsCapForAbsentKeys) {
       << "the at-cap drop must be counted in mvcc_tombstones_dropped (DEBUG MVCC / INFO), not "
          "silently discarded";
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold";
+}
+
+// drakeydb: P4-5 -- B9's opcode-225 case: an RDB_OPCODE_DF_TOMBSTONES record whose own stamp is
+// already GC-eligible (TombstoneBornExpired, mvcc.h) must be refused outright, before the cap is
+// even consulted, and counted -- installing it would do nothing but cost a slot until the very next
+// GC step reaps it. No SetMergeLww call: exercises the NON-merge install directly (the ordinary
+// restart-from-own-RDB path), not the merge twin the tests above already cover.
+//
+// Falsifying: removing the TombstoneBornExpired check in HandleTombstones' non-merge `install`
+// lambda (rdb_load.cc) makes `got.has_value()` below observe true instead of false, and
+// `born_after` stay equal to `born_before` instead of advancing by one.
+TEST_F(RdbMvccTest, WithoutMergeLwwBornExpiredTombstoneInstallsNoneAndCounts) {
+  ASSERT_TRUE(IsActiveReplica());
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore_ttl = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  // opcode 225 carries no meta at all (kTombMetaNone): TombstoneBornExpired reduces to
+  // stamp.MsPart() + ttl <= now here, and ttl(1s) is nowhere near enough to cover a 5s-old stamp.
+  const uint64_t kOldMs = GetCurrentTimeMs() - 5000;
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{kOldMs << MvccClock::kCounterBits, kPeerHash}.AsTombstone();
+
+  size_t born_before = 0;
+  shard_set->Await(0, [&] {
+    born_before = namespaces->GetDefaultNamespace()
+                      .GetCurrentDbSlice()
+                      .MutableStats(0)
+                      ->mvcc_tombstones_born_expired;
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  // No SetMergeLww: merge_lww_ stays false, exercising the non-merge opcode-225 install directly.
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "ghost"}), kMatchNil);
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+
+  std::optional<MvccStamp> got;
+  size_t born_after = 0, mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    born_after = db_slice.MutableStats(0)->mvcc_tombstones_born_expired;
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  EXPECT_FALSE(got.has_value())
+      << "a born-expired RDB_OPCODE_DF_TOMBSTONES record must be refused, never installed";
+  EXPECT_EQ(born_after, born_before + 1);
+  EXPECT_EQ(mismatches, 0u);
 }
 
 }  // namespace dfly
