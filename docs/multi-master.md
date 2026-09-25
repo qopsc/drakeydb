@@ -642,32 +642,41 @@ MVCC` requires `--active_replica` (above), and `MvccEnabled` is exactly `IsActiv
 
 ## Compatibility: the RDB one-way doors
 
-Two RDB opcodes are drakeydb-specific and hard-fail an older loader:
+Three RDB opcodes are drakeydb-specific and hard-fail an older loader:
 
 - **`RDB_OPCODE_DF_MVCC` (221)**, added in P4-2: per-key `{mvcc, origin_hash}`. A stock
   (upstream) Dragonfly or a pre-P4-2 drakeydb cannot parse it — see
   [`docs/differences.md`](differences.md) for the exact failure text.
-- **`RDB_OPCODE_DF_TOMBSTONES` (225)**, added in this phase (P4-3): a per-shard tombstone section.
-  A stock Dragonfly or a P4-2-era (pre-P4-3) drakeydb cannot parse this one either, for the same
-  reason.
+- **`RDB_OPCODE_DF_TOMBSTONES` (225)**, added in P4-3: a per-shard tombstone section, read side
+  only as of P4-5 (see below) — a stock Dragonfly or a P4-2-era (pre-P4-3) drakeydb cannot parse
+  this one either, for the same reason.
+- **`RDB_OPCODE_DF_TOMBSTONES_V2` (230)**, added in this phase (P4-5): the same per-shard
+  tombstone section, with each entry's meta word (its whole-key GC deadline or anchor) appended
+  so it survives a full sync or restart instead of reverting to a plain write-time deadline. An
+  active node's save path now emits V2 **only** — never 225 — so any drakeydb older than P4-5,
+  including one that already understands opcode 225, cannot parse this one.
 
-Both opcodes are written **only** by an active-replica node's save path, and the read side parses
-them unconditionally (any drakeydb binary, active or not, consumes and — if not active — discards
-them). `kDrakeydbReplVersion` (currently `68`, bumped from `67` in P4-4) is the fork's own
-replication protocol version, exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB byte is
-sent; an active node refuses to admit a consumer advertising a version older than its own, so a
-pre-P4-3 drakeydb peer is refused *before* full sync rather than being admitted and hard-failing
-mid-stream on opcode 225 — and, since the P4-4 bump, a pre-P4-4 peer (one that predates the
-streaming LWW guard) is refused at that same handshake step too, even though it carries no new RDB
-opcode of its own to hard-fail on. Upgrade a mesh in lockstep (see below).
+All three opcodes are written **only** by an active-replica node's save path, and the read side
+parses them unconditionally (any drakeydb binary, active or not, consumes and — if not active —
+discards them). `kDrakeydbReplVersion` (currently `69`, bumped from `68` in P4-5) is the fork's
+own replication protocol version, exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB
+byte is sent; an active node refuses to admit a consumer advertising a version older than its
+own, so a pre-P4-3 drakeydb peer is refused *before* full sync rather than being admitted and
+hard-failing mid-stream on opcode 225, a pre-P4-4 peer (one that predates the streaming LWW
+guard) is refused at that same handshake step even though it carries no new RDB opcode of its
+own to hard-fail on, and — since the P4-5 bump — a pre-P4-5 peer (one that only understands
+opcode 225, not V2) is refused there too, before it could otherwise hard-fail mid-stream on
+opcode V2. Upgrade a mesh in lockstep (see below).
 
 **The remaining one-way door is a file handed by hand.** Live drakeydb-to-drakeydb replication is
 protected by the version gate above; there is no way to receive an incompatible stream over the
 wire. Copying an active node's RDB **file** onto an older binary's `--dir` (or loading it there
-via `DEBUG RELOAD`) bypasses that gate entirely and hard-fails on the first opcode 221 or 225 byte
-it cannot recognize. To move a snapshot backward deliberately, load it with a current drakeydb
-under `--active_replica=false` and save it again — the non-active write side omits both opcodes,
-producing an older-compatible file at the cost of discarding all stamps and tombstones.
+via `DEBUG RELOAD`) bypasses that gate entirely and hard-fails on the first opcode 221, 225, or
+V2 byte it cannot recognize — concretely: a v69 RDB file carries opcode V2, which v68 (and every
+older drakeydb) cannot load. To move a snapshot backward deliberately, load it with a current
+drakeydb under `--active_replica=false` and save it again — the non-active write side omits every
+one of these opcodes, producing an older-compatible file at the cost of discarding all stamps and
+tombstones.
 
 **Upgrade a mesh in lockstep.** Because the version gate refuses admission rather than negotiating
 a reduced feature set, an active mesh should be upgraded node by node with each new binary able to
