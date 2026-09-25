@@ -229,9 +229,10 @@ Governing choices:
    refuse replication consumers that didn't negotiate the fork protocol, so stock readers never
    see v2.
 4. **Fork protocol version** (`kDrakeydbReplVersion`, `node_identity.h`; originally 65, bumped to
-   66 by P4-2 for RDB opcode 221; **67 as of P4-3**, for opcode 225 — see `docs/multi-master.md`), sent
-   via existing `REPLCONF DRAKEY-VERSION` — far above upstream's VER6 so future upstream bumps
-   never collide. Non-active nodes interop with stock Dragonfly unchanged.
+   66 by P4-2 for RDB opcode 221, 67 for P4-3's opcode 225, 68 for P4-4's streaming LWW guard,
+   **69 as of P4-5** for opcode V2 — see `docs/multi-master.md`), sent via existing `REPLCONF
+   DRAKEY-VERSION` — far above upstream's VER6 so future upstream bumps never collide. Non-active
+   nodes interop with stock Dragonfly unchanged.
 5. **Persistent node UUID** in `<dir>/drakeydb.uuid` (fixes KeyDB's per-boot regeneration),
    exchanged KeyDB-style: `REPLCONF UUID <36char>` → `+<peer uuid> <peer ms-clock>` (clock echo
    enables skew warnings). Works against DF and real KeyDB masters.
@@ -786,7 +787,7 @@ metrics; 4-node chaos pytest (random kills + seeder + convergence assert).
 | # | Risk | Mitigation |
 |---|---|---|
 | 1 | Serialize-once journal vs per-consumer filtering (ring-buffer partial replay must filter without reparsing) | `JournalItem.origin_idx` memory-side field; filter in live + `MaybePartialStreamLSNs` paths; C++ mixed-origin backlog test |
-| 2 | Upstream owns the deprecated varint / journal code | Version constant 67 (originally 65) dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
+| 2 | Upstream owns the deprecated varint / journal code | Version constant 69 (originally 65) dodges upstream VERs; `docs/UPSTREAM-SYNC.md` watchlist; multimaster pytest suite is the merge gate; framing diff is ~30 lines in one low-churn file |
 | 3 | LSN/partial-sync semantics across peers | Each peer pair is its own lineage; peer-mode `Replica` never adopts lineage / never `StartJournalAtOwnLSN`; cascaded flag mutually exclusive with active mode; per-peer restart partial-sync test |
 | 4 | Clock skew breaks LWW | Hybrid stamp absorbs small skew; handshake skew warning + metric; NTP documented as hard requirement |
 | 5 | Concurrent same-key RMW diverges (arrival order) | Same hole as KeyDB; loud docs; LWW guard covers state commands; recommend per-node key ownership for RMW |

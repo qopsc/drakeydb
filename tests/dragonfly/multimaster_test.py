@@ -2513,12 +2513,14 @@ async def test_stamps_survive_full_sync_and_restart(df_factory, tmp_path):
 # deadline floors on its own write-time stamp instead of its own later expiry, starving the
 # resurrection-protection window `--multi_master_tombstone_ttl` is meant to provide.
 #
-# `--multi_master_tombstone_ttl` is set well BELOW the key's own PX here specifically so the
-# regression would be externally observable, not just a wrong number: without meta, this
-# tombstone would be born already GC-eligible (write_time + tiny_ttl is behind the key's own,
-# much later expiry) and the idle-task GC could reap it before this test ever gets to look.
+# The regression is caught by the exact `meta == D` and `gc_at_ms == D + ttl` equalities below,
+# not by observing an early GC reap: `--multi_master_tombstone_ttl` (15s) comfortably exceeds the
+# key's own PX (1.5s) so a slow (e.g. ASAN) runner's DEBUG RELOAD and restart legs -- which each
+# cost real wall-clock time -- cannot themselves push this tombstone past its own GC deadline and
+# trip the loader's unrelated born-expired refusal; only the meta value, and its effect on
+# gc_at_ms, is under test here.
 async def test_tombstone_meta_survives_debug_reload_and_restart(df_factory, tmp_path):
-    ttl_seconds = 5
+    ttl_seconds = 15
     a_args = active_args(
         dir=str(tmp_path / "a"),
         dbfilename="dump",

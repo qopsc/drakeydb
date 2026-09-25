@@ -656,8 +656,9 @@ Three RDB opcodes are drakeydb-specific and hard-fail an older loader:
   active node's save path now emits V2 **only** — never 225 — so any drakeydb older than P4-5,
   including one that already understands opcode 225, cannot parse this one.
 
-All three opcodes are written **only** by an active-replica node's save path, and the read side
-parses them unconditionally (any drakeydb binary, active or not, consumes and — if not active —
+Of the three, only 221 and V2 are ever written — **only** by an active-replica node's save path;
+225 is a read-only legacy format as of P4-5 (see above), never emitted again. The read side parses
+all three unconditionally (any drakeydb binary, active or not, consumes and — if not active —
 discards them). `kDrakeydbReplVersion` (currently `69`, bumped from `68` in P4-5) is the fork's
 own replication protocol version, exchanged via `REPLCONF DRAKEY-VERSION` before a single RDB
 byte is sent; an active node refuses to admit a consumer advertising a version older than its
@@ -680,9 +681,20 @@ tombstones.
 
 **Upgrade a mesh in lockstep.** Because the version gate refuses admission rather than negotiating
 a reduced feature set, an active mesh should be upgraded node by node with each new binary able to
-admit and be admitted by the others before traffic depends on it — there is no mixed-version
-"tombstones on some links, not others" steady state; a link either meets the minimum version and
-gets the full feature set, or it is refused at handshake.
+admit and be admitted by the others before traffic depends on it — a link either meets the minimum
+version and gets the full feature set, or it is refused at handshake.
+
+**The gate is one-directional, not a true mutual-version check.** Each active master refuses a
+consumer advertising a version *older* than its own (`rinfo.repl_drakey_version <
+kDrakeydbReplVersion`, `server_family.cc`) — it never checks whether the consumer's version is
+*newer*. `replica.cc` (the consumer side) does not check the master's version at all either. So an
+un-upgraded v68 active master still admits a v69 consumer: `68 < 69` is false from the v68 master's
+own perspective, and nothing on the consumer side refuses attaching to an older master. That link
+is not fully broken — the v69 consumer's loader parses opcode 225 fine (D-7's unconditional read
+side) — but it is reduced: the v68 master can only ever send meta-less 225 tombstones, so D-16
+persists on that one link specifically until the master itself is upgraded, even though the
+consumer already understands V2. Upgrading masters first (or in lockstep with their consumers)
+avoids relying on this reduced guarantee.
 
 ## Known residual exposures
 
