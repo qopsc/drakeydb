@@ -2202,11 +2202,14 @@ TEST_F(MvccStoreTest, TombstoneGcServicesEveryDatabaseUnderRoundRobin) {
 namespace {
 // drakeydb: P4-5 -- builds a key that is unconditionally heap-allocated (never inline, never
 // INT_TAG), the same shape TableBytesAccountsForDuplicatedKeyHeapBytes above already validated:
-// a 32-char string with a non-numeric leading byte, so CompactObj::SetString's int-parse fast
-// path never fires, and > 20 chars so its inline/small fast paths never fire either.
-std::string LongHeapKey(char prefix, int i) {
+// a non-numeric leading byte (so CompactObj::SetString's int-parse fast path never fires) and a
+// length over kInlineLen (16) so it is never inline either. `len` also picks which non-inline
+// encoding SetString lands on (SMALL_TAG vs LARGE_STR_TAG), which changes whether re-encoding to
+// SDS_TTL_TAG grows, shrinks, or leaves MallocUsed() unchanged -- see the two call sites below,
+// which deliberately use different lengths for that reason.
+std::string HeapKey(char prefix, size_t len, int i) {
   std::string suffix = std::to_string(i);
-  std::string key(32, '0');
+  std::string key(len, '0');
   key[0] = prefix;
   key.replace(key.size() - suffix.size(), suffix.size(), suffix);
   return key;
@@ -2214,18 +2217,22 @@ std::string LongHeapKey(char prefix, int i) {
 }  // namespace
 
 // drakeydb: P4-5 -- SetTombMeta's own accounting (SetTombMetaOnSlot, db_slice.cc) must keep
-// mvcc_key_dup_bytes exact whether the key was inline (<=16B, MallocUsed()==0 before any meta,
-// so the whole delta comes from the new SDS_TTL_TAG allocation) or already heap-allocated (a
-// 32-char key -- LongHeapKey above -- re-encoded into a fresh sds buffer of very similar size,
-// per prb-replan.md's own "about ±8 B" estimate). Computes each key's own expected delta from an
-// unrelated scratch PrimeKey built from the identical bytes, rather than a hardcoded byte count:
-// SetExpireTime's exact allocation size is an sds/CompactObj implementation detail, not something
-// this test should pin directly.
+// mvcc_key_dup_bytes exact whether the key was inline (<=16B, MallocUsed()==0 before any meta, so
+// the whole delta comes from the new SDS_TTL_TAG allocation) or already heap-allocated (re-encoded
+// into a fresh sds buffer, whose size relative to the old encoding is not fixed -- it can grow,
+// shrink, or land exactly on the old size depending on which non-inline encoding the original key
+// used). Computes each key's own expected delta from an unrelated scratch PrimeKey built from the
+// identical bytes, rather than a hardcoded byte count: SetExpireTime's exact allocation size is an
+// sds/CompactObj implementation detail, not something this test should pin directly. Asserts the
+// computed delta is non-zero before using it, so a key whose particular non-inline encoding
+// happens to re-encode to the exact same size (observed for a 32-char HeapKey, whose SMALL_TAG
+// encoding round-trips through SDS_TTL_TAG at an unchanged size) cannot make the accounting check
+// below pass vacuously.
 //
-// Falsification (captured verbatim in the report): replacing SetTombMetaOnSlot's body with a
-// version that skips the mvcc_key_dup_bytes adjustment entirely made both EXPECT_EQ calls below
-// fail, for the inline key (expected 0, got a nonzero delta -- wait, the reverse: expected the
-// real delta, observed 0 unadjusted) and for the heap key alike.
+// Falsification: replacing SetTombMetaOnSlot's own byte-adjustment lines with `(void)old_bytes;
+// (void)new_bytes;` made the first EXPECT_EQ below fail for BOTH keys -- for "k" (inline), got 0
+// instead of the real (positive) delta; for the 20-char heap key, got 0 instead of the real
+// (non-zero) delta this test's own ASSERT_NE now requires.
 TEST_F(MvccStoreTest, SetTombMetaAccountsKeyDupBytesExactlyForInlineAndHeapKeys) {
   auto check = [&](const std::string& key) {
     const ShardId sid = Shard(key, shard_set->size());
@@ -2239,6 +2246,11 @@ TEST_F(MvccStoreTest, SetTombMetaAccountsKeyDupBytesExactlyForInlineAndHeapKeys)
       const int64_t before = static_cast<int64_t>(scratch.MallocUsed());
       scratch.SetExpireTime(123456789);
       const int64_t expected_delta = static_cast<int64_t>(scratch.MallocUsed()) - before;
+      ASSERT_NE(expected_delta, 0)
+          << "key=" << key
+          << " -- this key's own encoding must actually change size when it grows a TTL word, or "
+             "this test cannot tell a correctly-accounted delta from a skipped one; pick a "
+             "different key/length if this fires";
 
       const size_t bytes_before = db_slice.GetStats().db_stats[0].mvcc_table_bytes;
       db_slice.SetTombMeta(0, key, 123456789);
@@ -2252,7 +2264,7 @@ TEST_F(MvccStoreTest, SetTombMetaAccountsKeyDupBytesExactlyForInlineAndHeapKeys)
   };
 
   check("k");                  // inline, well under kInlineLen (16)
-  check(LongHeapKey('m', 0));  // forced heap: never inline
+  check(HeapKey('m', 20, 0));  // forced heap, chosen for its non-zero re-encoding delta
 
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
@@ -2322,9 +2334,13 @@ TEST_F(MvccStoreTest, ClearTombMetaRestoresKeyDupBytesBaseline) {
 // meta), so this isolates meta's own contribution regardless of whether `key` itself is inline.
 //
 // Falsification: removing EnsureMvcc's own SetTombMetaOnSlot(..., kTombMetaNone) clear
-// (db_slice.cc) left the re-created key's TombMetaOf() at 42 instead of 0, and separately fired
-// TEST_VerifyMvccTable's new meta invariant (SumMvccMismatchesAcrossShards() > 0), because the
-// slot was now live yet still HasExpire().
+// (db_slice.cc) made the bytes check below fail (mvcc_table_bytes stayed above no_meta_bytes) and
+// separately fired TEST_VerifyMvccTable's new meta invariant (SumMvccMismatchesAcrossShards() >
+// 0), because the slot was now live yet still HasExpire(). The TombMetaOf() check right below is
+// informational only, not a falsification target: GetTombMeta (db_slice.cc) gates on
+// IsTombstone() before ever reading the word, so it reads back kTombMetaNone here regardless of
+// whether the underlying clear ran -- it cannot, on its own, distinguish this bug from correct
+// behavior.
 TEST_F(MvccStoreTest, EnsureMvccClearsMetaOnRecreateViaSet) {
   const std::string key = "recreate-via-set";
   const ShardId sid = Shard(key, shard_set->size());
@@ -2339,6 +2355,7 @@ TEST_F(MvccStoreTest, EnsureMvccClearsMetaOnRecreateViaSet) {
 
   Run({"set", key, "v"});  // EnsureMvcc's tombstone-clearing branch runs here
 
+  // Informational only -- see this test's own comment above.
   EXPECT_EQ(TombMetaOf(key), kTombMetaNone);
   auto st = StampOf(key);
   ASSERT_TRUE(st.has_value());
@@ -2350,24 +2367,27 @@ TEST_F(MvccStoreTest, EnsureMvccClearsMetaOnRecreateViaSet) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- the SetMvcc path's own tombstone->live clearing branch. rdb_load.cc:3934
-// (RdbLoader::ApplyMergeTombstoneOnShard's caller) is the only production call site that can
-// land a live stamp on a tombstoned slot -- simulated directly at the DbSlice level here, the
-// same way LiveKeyStampMasksTombstoneBitAndSurvivesGc above simulates the loader's opcode-221
-// SetMvcc call without standing up a real RDB file. Unlike that test, this one never creates a
-// matching db.prime entry (the real loader's own prime-side write is a separate call this test
-// does not need to reproduce to isolate SetMvcc's own meta-clearing arithmetic), so it does not
-// check TEST_VerifyMvccTable -- the "stamp with no live key" mismatch that check would report
-// here is expected and belongs to what this test deliberately left out, not a real violation.
+// drakeydb: P4-5 -- the SetMvcc path's own tombstone->live clearing branch. RdbLoader::
+// CreateObjectOnShard (rdb_load.cc:3934) is the only production call site that can land a live
+// stamp on a tombstoned slot -- simulated directly at the DbSlice level here, the same way
+// LiveKeyStampMasksTombstoneBitAndSurvivesGc above simulates the loader's opcode-221 SetMvcc call
+// without standing up a real RDB file. Unlike that test, this one never creates a matching
+// db.prime entry (the real loader's own prime-side write is a separate call this test does not
+// need to reproduce to isolate SetMvcc's own meta-clearing arithmetic), so it does not check
+// TEST_VerifyMvccTable -- the "stamp with no live key" mismatch that check would report here is
+// expected and belongs to what this test deliberately left out, not a real violation.
 //
 // Falsification: removing SetMvcc's own SetTombMetaOnSlot(..., kTombMetaNone) call (db_slice.cc)
-// left mvcc_table_bytes stuck above no_meta_bytes (30304 vs 30272) -- the freshly-live slot's key
-// keeps carrying its now-orphaned SDS_TTL_TAG allocation. GetTombMeta itself still read back 0
-// even with the underlying word untouched: it gates on IsTombstone() first, which SetMvcc's own
-// live_stamp already made false, so only the byte leak -- not a wrong GetTombMeta -- is what this
-// assertion catches.
+// left mvcc_table_bytes stuck above no_meta_bytes -- the freshly-live slot's key keeps carrying
+// its now-orphaned SDS_TTL_TAG allocation. GetTombMeta itself still read back 0 even with the
+// underlying word untouched: it gates on IsTombstone() first, which SetMvcc's own live_stamp
+// already made false, so only the byte leak -- not a wrong GetTombMeta -- is what this assertion
+// catches.
 TEST_F(MvccStoreTest, SetMvccClearsMetaOnRecreateViaMergeInstall) {
-  const std::string key = "recreate-via-setmvcc";  // inline: meta's own growth is unambiguous
+  // 20 chars: heap-allocated (old MallocUsed() == 8, not inline), same encoding class as
+  // HeapKey(_, 20, _) above -- meta's own growth is still unambiguous because it is measured as a
+  // delta off no_meta_bytes below, not assumed to start from an inline (zero-cost) key.
+  const std::string key = "recreate-via-setmvcc";
   const ShardId sid = Shard(key, shard_set->size());
   shard_set->Await(sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
@@ -2422,6 +2442,11 @@ TEST_F(MvccStoreTest, EraseMvccOnMetaBearingTombstoneLeavesNoLeak) {
 // Falsification: reverting TombstoneGcStep's meta read back to kTombMetaNone (db_slice.cc) made
 // the first "must survive" assertion below fail -- the tombstone was reaped by the very first
 // TombstoneGcStep call, before AdvanceTime ever ran.
+//
+// Also covers the GC-erase byte side: EraseMvcc (TombstoneGcStep's own erase call, db_slice.cc)
+// must read the meta-bearing key's MallocUsed() before it destroys the key, not after, the same
+// property EraseMvccOnMetaBearingTombstoneLeavesNoLeak above pins for a direct EraseMvcc call --
+// this exercises the same accounting reached from GC's own reap path instead.
 TEST_F(MvccStoreTest, GcHonorsMetaDeadlineOverridingStampMs) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
   absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
@@ -2433,9 +2458,13 @@ TEST_F(MvccStoreTest, GcHonorsMetaDeadlineOverridingStampMs) {
   const MvccStamp tomb{MvccClock::kTombstoneBit | (1ULL << 20), 4};
   constexpr uint64_t kTenDaysMs = 10ULL * 24 * 3600 * 1000;
   const uint64_t deadline_ms = TEST_current_time_ms + kTenDaysMs;
+  size_t baseline;
   shard_set->Await(sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    baseline = db_slice.GetStats().db_stats[0].mvcc_table_bytes;
     db_slice.SetTombstone(0, key, tomb, deadline_ms);
+    ASSERT_GT(db_slice.GetStats().db_stats[0].mvcc_table_bytes, baseline)
+        << "installing a meta-bearing tombstone must grow mvcc_table_bytes";
   });
 
   shard_set->RunBriefInParallel([&](EngineShard* shard) {
@@ -2468,6 +2497,11 @@ TEST_F(MvccStoreTest, GcHonorsMetaDeadlineOverridingStampMs) {
 
   EXPECT_FALSE(StampOf(key).has_value())
       << "once past its meta deadline + ttl, the tombstone must be reaped";
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    EXPECT_EQ(db_slice.GetStats().db_stats[0].mvcc_table_bytes, baseline)
+        << "GC reaping a meta-bearing tombstone must leave no residual mvcc_table_bytes";
+  });
 }
 
 // drakeydb: P4-5 -- TEST_VerifyMvccTable's new meta invariant (db_slice.cc): meta may only sit on
