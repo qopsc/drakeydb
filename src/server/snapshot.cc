@@ -257,7 +257,11 @@ void SliceSnapshot::SerializeTombstones() {
         cursor = db->mvcc->Traverse(cursor, [&](auto it) {
           if (!it->second.IsTombstone() || it->second.Mvcc() == 0)
             return;
-          if (TombstoneExpiredAt(it->second, kTombMetaNone, ttl_ms, now_ms))
+          // drakeydb: P4-5 -- reads the meta straight off this iterator's own key, the same
+          // TombstoneGcStep technique (db_slice.cc): a whole-key tombstone must not drop off the
+          // save before its deadline D, not just its own stamp's ms component.
+          const uint64_t meta = it->first.HasExpire() ? it->first.GetExpireTime() : kTombMetaNone;
+          if (TombstoneExpiredAt(it->second, meta, ttl_ms, now_ms))
             return;
           chunk.emplace_back(std::string(it->first.GetSlice(&scratch)), it->second);
         });

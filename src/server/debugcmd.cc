@@ -750,8 +750,10 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    Inspect the per-key MVCC/LWW stamp side table (--active_replica only). With <key>,",
         "    hops to that key's shard and prints its stamp: 'state:value mvcc:<u64> ms:<u64>",
         "    counter:<u32> origin:<hex16> shard:<n>', 'state:tombstone mvcc:<u64> ms:<u64>",
-        "    origin:<hex16> shard:<n> gc_at_ms:<u64>' (no counter: field; gc_at_ms is 0 when",
-        "    --multi_master_tombstone_ttl=0 disables tombstone GC), or 'state:absent shard:<n>'.",
+        "    origin:<hex16> shard:<n> gc_at_ms:<u64> meta:<u64>' (no counter: field; gc_at_ms is",
+        "    0 when --multi_master_tombstone_ttl=0 disables tombstone GC; meta is the raw",
+        "    tombstone meta word, 0 when none, with bit 63 set marking an anchor-only meta), or",
+        "    'state:absent shard:<n>'.",
         "    With no key, prints per-shard aggregates (entries/tombstones/tombstones_dropped/",
         "    tombstones_born_expired/bytes/clock_last/clock_ahead_ms/unstamped_writes). VERIFY",
         "    runs the from-scratch dense-invariant check on every shard and every db, returning",
@@ -1439,12 +1441,14 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       // drakeydb: P4-5 -- ttl_ms==0 means --multi_master_tombstone_ttl disabled tombstone GC
       // entirely (TombstonesEnabled() is false): there is no deadline to report, so this prints
       // gc_at_ms:0 rather than a real TombstoneGcAtMs value that would misleadingly suggest GC
-      // is still scheduled to run.
+      // is still scheduled to run. meta is read regardless of ttl_ms -- it is a stored fact about
+      // the slot, independent of whether GC is currently enabled.
       const uint64_t ttl_ms = absl::GetFlag(FLAGS_multi_master_tombstone_ttl) * 1000;
-      const uint64_t gc_at_ms = ttl_ms == 0 ? 0 : TombstoneGcAtMs(*stamp, kTombMetaNone, ttl_ms);
+      const uint64_t meta = ns->GetCurrentDbSlice().GetTombMeta(db_index, key);
+      const uint64_t gc_at_ms = ttl_ms == 0 ? 0 : TombstoneGcAtMs(*stamp, meta, ttl_ms);
       StrAppend(&out, "state:tombstone mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
                 " origin:", absl::Hex(stamp->origin_hash, absl::kZeroPad16), " shard:", sid,
-                " gc_at_ms:", gc_at_ms);
+                " gc_at_ms:", gc_at_ms, " meta:", meta);
     } else {
       StrAppend(&out, "state:value mvcc:", stamp->Mvcc(), " ms:", stamp->MsPart(),
                 " counter:", (stamp->Mvcc() & MvccClock::kCounterMask),

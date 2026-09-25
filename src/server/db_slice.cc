@@ -734,6 +734,18 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
   do {
     mvcc_cursor = db.mvcc->Traverse(mvcc_cursor, [&](auto it) {
       const bool has_live_key = !db.prime.Find(it->first.GetSlice(&scratch)).is_done();
+      // drakeydb: P4-5 -- meta (HasExpire() on the mvcc key itself) may only ever sit on a
+      // committed tombstone (IsTombstone() && Mvcc() != 0): never a live slot (EnsureMvcc/SetMvcc
+      // clear it on every tombstone->live transition, above in this file) and never the
+      // synchronous, zero-authority placeholder SetTombstone installs pre-journal (SetTombMeta's
+      // own DCHECK, above, is what keeps meta off that placeholder in the first place). A
+      // distinct reason from the two checks below, which are about the tombstone/live-key
+      // pairing itself, not this word.
+      if (it->first.HasExpire() && !(it->second.IsTombstone() && it->second.Mvcc() != 0)) {
+        LOG(ERROR) << "mvcc: meta present on a non-committed-tombstone slot: "
+                   << it->first.ToString();
+        ++mismatches;
+      }
       if (it->second.IsTombstone()) {
         ++tombstones_found;
         if (has_live_key) {
@@ -1581,8 +1593,15 @@ void DbSlice::SetMvcc(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
   }
   // live_stamp.IsTombstone() is always false (masked above); kept explicit rather than simplified
   // to `if (was_tombstone)` so this reads the same as SetTombstone's symmetric check below.
-  if (was_tombstone && !live_stamp.IsTombstone())
+  if (was_tombstone && !live_stamp.IsTombstone()) {
     --db.stats.mvcc_tombstones;
+    // drakeydb: P4-5 -- a tombstone->live transition must never keep meta: this is the RDB
+    // merge-load live-key install (RdbLoader::ApplyMergeTombstoneOnShard's caller, rdb_load.cc)
+    // landing on a key this node still held tombstoned, the SetMvcc-path counterpart to
+    // EnsureMvcc's own tombstone-clearing branch below. Runs before any journal write reaches
+    // this slot, so the reallocation ClearExpireTime may do here is fine.
+    SetTombMetaOnSlot(db, it, kTombMetaNone);
+  }
 }
 
 MvccStamp DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
@@ -1618,6 +1637,12 @@ MvccStamp DbSlice::EnsureMvcc(DbIndex db_ind, string_view key) {
     const MvccStamp prev = it->second;
     it->second = MvccStamp{};
     --db.stats.mvcc_tombstones;
+    // drakeydb: P4-5 -- meta must never survive a tombstone->live transition: SetExistingMvcc
+    // (below in this file) runs after this write's own journal commit and DCHECKs meta is
+    // already gone rather than clearing it there (it must stay allocation-free). This is the
+    // synchronous half of that contract, run here, before the journal, where allocating or
+    // freeing the key's TTL word is fine.
+    SetTombMetaOnSlot(db, it, kTombMetaNone);
     return prev;
   }
   return it->second;  // already live -- unchanged, and IS this key's pre-mutation stamp
@@ -1638,9 +1663,17 @@ void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& 
                        << " key=" << key;
   const bool was_tombstone = it->second.IsTombstone();
   it->second = stamp;
-  if (was_tombstone && !stamp.IsTombstone())
+  if (was_tombstone && !stamp.IsTombstone()) {
+    // drakeydb: P4-5 -- meta must already be gone by the time a tombstone->live transition
+    // reaches here: EnsureMvcc's own tombstone-clearing branch (above in this file) runs
+    // synchronously on this SAME write, strictly before AddLogRecord, and clears it there. This
+    // method runs strictly after and must stay allocation-free (its own doc comment, db_slice.h),
+    // so it DCHECKs rather than clears -- unreachable in practice, not a second producer of the
+    // clear.
+    DCHECK(!it->first.HasExpire())
+        << "tombstone->live transition must not carry meta: db=" << db_ind << " key=" << key;
     --db.stats.mvcc_tombstones;
-  else if (!was_tombstone && stamp.IsTombstone())
+  } else if (!was_tombstone && stamp.IsTombstone())
     ++db.stats.mvcc_tombstones;
 }
 
@@ -1653,7 +1686,7 @@ void DbSlice::SetExistingMvcc(DbIndex db_ind, string_view key, const MvccStamp& 
 // (placeholder, then the delete's real minted stamp overwrites it later) -- and SetTombstone is
 // also the landing spot for a later task's RDB tombstone-section apply, which has no uniqueness
 // guarantee of its own either.
-void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp) {
+void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp, uint64_t meta) {
   auto& db = *db_arr_[db_ind];
   if (!db.mvcc)
     return;
@@ -1671,6 +1704,72 @@ void DbSlice::SetTombstone(DbIndex db_ind, string_view key, const MvccStamp& sta
   }
   if (!was_tombstone)
     ++db.stats.mvcc_tombstones;
+  // drakeydb: P4-5 -- sets (a fresh insert never carries one) or overwrites this slot's meta to
+  // match `meta`, whatever it held before -- a full tombstone overwrite specifies the complete
+  // new state, meta included. No production caller passes a non-zero meta yet (kTombMetaNone is
+  // this parameter's default), so this is a no-op for every caller today.
+  SetTombMetaOnSlot(db, it, meta);
+}
+
+// drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract.
+// `it->first.MallocUsed()` before and after is the same technique AddExpire/RemoveExpire (above in
+// this file) use for the prime table's own embedded TTL word: HasExpire()/GetExpireTime() ignore
+// the KEY CONTENT they sit beside (CompactKey::HashCode/operator== hash and compare only the
+// sds/inline bytes, never SdsTtlString::exp_ms, compact_object.cc), so hashing, equality, and every
+// other DashTable traversal in this file are unaffected by whatever this call does to the key's TTL
+// word.
+void DbSlice::SetTombMetaOnSlot(DbTable& db, DbTable::MvccTable::iterator it, uint64_t meta) {
+  const size_t old_bytes = it->first.MallocUsed();
+  if (meta == kTombMetaNone) {
+    if (it->first.HasExpire())
+      it->first.ClearExpireTime();
+  } else {
+    it->first.SetExpireTime(meta);
+  }
+  const size_t new_bytes = it->first.MallocUsed();
+  if (new_bytes >= old_bytes)
+    db.stats.mvcc_key_dup_bytes += (new_bytes - old_bytes);
+  else
+    db.stats.mvcc_key_dup_bytes -= (old_bytes - new_bytes);
+}
+
+uint64_t DbSlice::GetTombMeta(DbIndex db_ind, string_view key) const {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return kTombMetaNone;
+  auto it = db.mvcc->Find(key);
+  if (it.is_done() || !it->second.IsTombstone())
+    return kTombMetaNone;
+  return it->first.HasExpire() ? it->first.GetExpireTime() : kTombMetaNone;
+}
+
+void DbSlice::SetTombMeta(DbIndex db_ind, string_view key, uint64_t meta) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  auto it = db.mvcc->Find(key);
+  if (it.is_done())
+    return;
+  // drakeydb: P4-5 -- Mvcc() != 0 excludes PerformDeletionAtomic's own synchronous, zero-
+  // authority placeholder (MvccStamp{kTombstoneBit, 0}, written before the delete's own journal
+  // commit lands -- TombstoneGcStep's own comment, above in this file, explains why that window
+  // is real). A caller must never attach meta to that half-committed slot; only to a genuinely
+  // committed tombstone, which is what its eventual committer (SetExistingMvcc) expects to find.
+  DCHECK(it->second.IsTombstone() && it->second.Mvcc() != 0)
+      << "SetTombMeta requires a committed tombstone: db=" << db_ind << " key=" << key;
+  if (!it->second.IsTombstone())
+    return;
+  SetTombMetaOnSlot(db, it, meta);
+}
+
+void DbSlice::TEST_ForceTombMeta(DbIndex db_ind, string_view key, uint64_t meta) {
+  auto& db = *db_arr_[db_ind];
+  if (!db.mvcc)
+    return;
+  auto it = db.mvcc->Find(key);
+  if (it.is_done())
+    return;
+  SetTombMetaOnSlot(db, it, meta);
 }
 
 // drakeydb: P4-4 -- see the declaration (db_slice.h) for the full contract. `would_grow` mirrors
@@ -3210,8 +3309,13 @@ bool DbSlice::TombstoneGcStep() {
       // is still holding `it` (a bucket-relative iterator) from mid-traversal.
       FiberAtomicGuard g;
       cursor = mt.Traverse(cursor, [&](auto it) {
-        if (!it->second.IsTombstone() || it->second.Mvcc() == 0 ||
-            !TombstoneExpiredAt(it->second, kTombMetaNone, ttl_ms, now_ms))
+        if (!it->second.IsTombstone() || it->second.Mvcc() == 0)
+          return;
+        // drakeydb: P4-5 -- reads the meta straight off this same iterator's key rather than a
+        // second DbSlice::GetTombMeta lookup: this callback already holds the one Find() this
+        // Traverse produced, and GetTombMeta would just re-Find the same slot.
+        const uint64_t meta = it->first.HasExpire() ? it->first.GetExpireTime() : kTombMetaNone;
+        if (!TombstoneExpiredAt(it->second, meta, ttl_ms, now_ms))
           return;
         // drakeydb: review fix (C2ii) -- confirm no live prime counterpart before erasing; see
         // the comment on this function's declaration above for why IsTombstone() alone is not

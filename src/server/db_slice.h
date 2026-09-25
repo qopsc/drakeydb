@@ -439,7 +439,12 @@ class DbSlice {
   // tombstone loaded from a peer's RDB). Tolerates an absent slot by inserting one (mirroring
   // SetMvcc's insert-or-overwrite shape) rather than CHECK-failing -- unlike SetExistingMvcc
   // above, which no longer delegates here (review fix I5).
-  void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
+  //
+  // drakeydb: P4-5 -- `meta` sets (or, at kTombMetaNone, clears) the tombstone's meta word in the
+  // same call; every existing caller passes nothing and keeps installing a meta-less tombstone,
+  // exactly as before this parameter existed.
+  void SetTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
+                    uint64_t meta = kTombMetaNone);
   // drakeydb: P4-4 -- installs `stamp` as an ABSENT key's tombstone: the caller has already
   // established there is no live PrimeKey slot for `key` and that
   // MergeAccepts(GetMvcc(db_ind, key), stamp) holds -- this call does not re-check either. Gated
@@ -459,6 +464,27 @@ class DbSlice {
   // a merge-load raises the lower one. This present-key path predates this call.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp);
   std::optional<MvccStamp> GetMvcc(DbIndex db_ind, std::string_view key) const;
+  // drakeydb: P4-5 -- reads the tombstone meta word (mvcc.h's kTombMetaNone/kTombMetaAnchorOnly
+  // encoding), stored in the mvcc slot's own CompactKey TTL word rather than a third MvccStamp
+  // field (SetExpireTime/GetExpireTime, compact_object.cc; see mvcc.h's own comment on kTombMeta*
+  // for why). kTombMetaNone when the slot is absent, live, or a meta-less tombstone -- never a
+  // guess or a dereference of a slot that isn't a genuine committed tombstone.
+  uint64_t GetTombMeta(DbIndex db_ind, std::string_view key) const;
+  // drakeydb: P4-5 -- sets (or, at kTombMetaNone, clears) a committed tombstone's meta word.
+  // DCHECKs the slot is a tombstone with Mvcc() != 0 -- a genuine commit, never
+  // PerformDeletionAtomic's own synchronous, zero-authority placeholder (SetTombstone's own
+  // comment above) -- because that placeholder is not yet the tombstone its eventual committer
+  // will finish installing, and this word must not survive past that placeholder into whatever
+  // the commit turns the slot into. Keeps mvcc_key_dup_bytes exact across set/clear/overwrite via
+  // SetTombMetaOnSlot below, the same MallocUsed()-delta technique AddExpire/RemoveExpire use for
+  // the prime table's own embedded TTL word (db_slice.cc).
+  void SetTombMeta(DbIndex db_ind, std::string_view key, uint64_t meta);
+  // drakeydb: P4-5 -- test-only: forces `meta` onto whatever slot `key` currently has, live or
+  // tombstone, bypassing SetTombMeta's committed-tombstone DCHECK. Exists solely so a test can
+  // construct the exact invariant violation (meta on a live slot, or on an uncommitted
+  // placeholder) TEST_VerifyMvccTable's own meta check exists to catch -- production code has no
+  // legitimate reason to ever bypass that DCHECK, so this must never be called outside a test.
+  void TEST_ForceTombMeta(DbIndex db_ind, std::string_view key, uint64_t meta);
   void EraseMvcc(DbIndex db_ind, const PrimeKey& key);
   // drakeydb: Phase 4, P4-1 Task 8 -- same F4 split as SetMvcc above, for the same reason:
   // PerformDeletionAtomic already holds a free string_view (the iterator's del_it.key()) one line
@@ -826,6 +852,12 @@ class DbSlice {
 
  private:
   friend class ReaperJournalFamilyTest;
+
+  // drakeydb: P4-5 -- converts `it`'s key to carry `meta` (kTombMetaNone clears it), accounting
+  // the resulting MallocUsed() delta into mvcc_key_dup_bytes. Shared by SetTombstone,
+  // SetTombMeta, TEST_ForceTombMeta, and the tombstone->live clearing branches of EnsureMvcc/
+  // SetMvcc, so every writer of this word keeps the same stat exact the same way.
+  void SetTombMetaOnSlot(DbTable& db, DbTable::MvccTable::iterator it, uint64_t meta);
 
   void PreUpdateBlocking(DbIndex db_ind, const Iterator& it);
   void PostUpdate(DbIndex db_ind, std::string_view key, bool arm_mvcc);
