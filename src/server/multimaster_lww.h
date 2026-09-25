@@ -123,17 +123,39 @@ inline bool LwwShouldDropKey(const std::optional<MvccStamp>& stored, const MvccS
 // LOG(INFO) -- a conflicting workload drops thousands per second.
 void NoteLwwDrop(std::string_view journaled_name, std::string_view key);
 
-// drakeydb: P4-5 -- the expired-delta veto's own deny-list (D-27, ISSUE-REGISTER.md): a JOURNALED
-// name that changes a key's whole-key TTL without also shipping the resulting value. Every one of
-// these classifies kUnguarded above (none of them appear in kJournaledClasses), so without this
-// check Transaction::ShouldDropExpiredDelta (transaction.cc) would otherwise treat one as an
-// ordinary delta and compare it against a string's own whole-key deadline tombstone. An ACTIVE
-// author never journals these six under their own name -- every TTL change normalizes down to a
-// guarded SET/RESTORE/DEL first (see this header's own ClassifyJournaledCommand comment) -- so the
-// only real path that can still reach this table is a stale-binary or mixed-version peer that
-// journals one of them verbatim with a real mvcc attached; that entry must apply exactly as any
-// other unguarded write does (plain arrival order, floored by FloorAppliedStamp when it lands
-// behind the local stamp), never vetoed outright by comparing it to an unrelated deadline.
+// drakeydb: P4-5 -- the expired-delta veto's own ALLOW-list (D-27, ISSUE-REGISTER.md): the only
+// JOURNALED names Transaction::ShouldDropExpiredDelta (transaction.cc) may ever act on, checked
+// AFTER `classified == kUnguarded` already holds. Every entry targets an OBJ_STRING value only,
+// never a container: APPEND/PREPEND (concat), DECR/DECRBY/INCR/INCRBY/INCRBYFLOAT (numeric),
+// SETBIT/SETRANGE/BITFIELD (byte-level), PFADD (a HyperLogLog, stored as an OBJ_STRING value --
+// the same reason PFMERGE's own destination write ships full state under SET, JournalFullStateSet
+// above), and CL.THROTTLE (a packed rate-limiter bucket, also OBJ_STRING, string_family.cc).
+// Restricting to these matters for two reasons, not one: first, a delta targeting the SAME key
+// name but a DIFFERENT type is a guaranteed misfire regardless -- the author's own copy could only
+// have journaled it against a value that was NOT the expiring string (mvcc.h's own kTombMeta*
+// comment: every non-string type's own whole-key tombstone carries an ANCHOR, never a bare
+// deadline, so the anchor check in ShouldDropExpiredDelta already excludes those on its own);
+// second, and more urgently, at least two handlers OUTSIDE this list crash when their own callback
+// is skipped this way and they read an unfilled default OpResult regardless -- BF.ADD
+// (bloom_family.cc) and LPOP (list_family.cc) each unconditionally dereference an empty vector on
+// OpStatus::OK, which is exactly what a never-populated default OpResult<vector<...>> still
+// reports. Every allow-listed handler here was individually audited for that same failure mode and
+// found safe: each reads a plain scalar, a fixed-size array, or a container whose own reply path
+// already branches on size()==0 before indexing into it.
+bool IsStringOnlyDelta(std::string_view journaled_name);
+
+// drakeydb: P4-5 -- the expired-delta veto's own deny-list (D-27, ISSUE-REGISTER.md), predating
+// IsStringOnlyDelta above: none of these six names were ever on that allow-list to begin with
+// (EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT/PERSIST/GETEX are whole-key TTL changes, not a string-only
+// value delta), so IsStringOnlyDelta's own absence already excludes every one of them from
+// Transaction::ShouldDropExpiredDelta (transaction.cc) on its own -- this check is kept as
+// defense-in-depth alongside it, not the first line of defense. An ACTIVE author never journals
+// these six under their own name regardless -- every TTL change normalizes down to a guarded
+// SET/RESTORE/DEL first (see this header's own ClassifyJournaledCommand comment) -- so the only
+// real path that could otherwise reach here is a stale-binary or mixed-version peer that journals
+// one of them verbatim with a real mvcc attached; that entry must apply exactly as any other
+// unguarded write does (plain arrival order, floored by FloorAppliedStamp when it lands behind the
+// local stamp), never vetoed outright by comparing it to an unrelated deadline.
 bool IsWholeKeyTtlChanging(std::string_view journaled_name);
 
 // Records one delta the D-27 veto dropped: ++ServerState::tlocal()->stats.

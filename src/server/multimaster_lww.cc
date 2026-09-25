@@ -154,17 +154,35 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key) {
                         << " replicated writes so far on this shard";
 }
 
+// drakeydb: P4-5 -- the expired-delta veto's own allow-list (see this table's own
+// declaration comment, multimaster_lww.h, for the per-name and per-handler justification). No
+// case-folding: `journaled_name` is always cid_->name(), already upper-case in the command table
+// (ShouldDropForLww's own comment, transaction.cc, documents the identical guarantee for its own
+// classify call) -- callers here are internal to this veto, not a public API third parties feed
+// arbitrary casing into, unlike ClassifyJournaledCommand above.
+constexpr std::string_view kStringOnlyDeltaNames[] = {
+    "APPEND", "BITFIELD",    "CL.THROTTLE", "DECR",    "DECRBY", "INCR",
+    "INCRBY", "INCRBYFLOAT", "PFADD",       "PREPEND", "SETBIT", "SETRANGE",
+};
+
+bool IsStringOnlyDelta(std::string_view journaled_name) {
+  return std::find(std::begin(kStringOnlyDeltaNames), std::end(kStringOnlyDeltaNames),
+                   journaled_name) != std::end(kStringOnlyDeltaNames);
+}
+
 // drakeydb: P4-5 -- the six names D-27's veto must never act on regardless of what a whole-key
 // deadline tombstone says (see this table's own declaration comment, multimaster_lww.h). Kept as
 // a plain linear scan, not a sorted table like kJournaledClasses above: this list is a fraction of
-// that table's size and is only ever consulted on the veto's own (already narrow) kUnguarded path.
+// that table's size and is only ever consulted on the veto's own (already narrow) allow-listed
+// path.
 constexpr std::string_view kWholeKeyTtlChangingNames[] = {"PEXPIREAT", "PEXPIRE", "EXPIRE",
                                                           "EXPIREAT",  "PERSIST", "GETEX"};
 
+// drakeydb: P4-5 -- no case-folding here either, for the identical reason
+// IsStringOnlyDelta's own comment above gives.
 bool IsWholeKeyTtlChanging(std::string_view journaled_name) {
-  const std::string upper = absl::AsciiStrToUpper(journaled_name);
   return std::find(std::begin(kWholeKeyTtlChangingNames), std::end(kWholeKeyTtlChangingNames),
-                   upper) != std::end(kWholeKeyTtlChangingNames);
+                   journaled_name) != std::end(kWholeKeyTtlChangingNames);
 }
 
 void NoteExpiredDeltaDrop(std::string_view journaled_name, std::string_view key) {

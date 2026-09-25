@@ -633,20 +633,23 @@ class Transaction {
   // for this hop; a local write could land in the window between that read and the apply, and the
   // dropped peer write would then never be retried -- a permanent, silent divergence instead of a
   // merely reordered one. `db_slice` is the caller's own GetDbSlice(shard->shard_id()) -- passed
-  // in rather than looked up again here.
-  bool ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const;
+  // in rather than looked up again here. `classified` is RunCallback's own single
+  // ClassifyJournaledCommand(cid_->name()) call, shared with ShouldDropExpiredDelta below rather
+  // than each computing it separately.
+  bool ShouldDropForLww(EngineShard* shard, DbSlice& db_slice, LwwClass classified) const;
 
   // drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md), called right after
-  // ShouldDropForLww above and OR'd into the same `lww_dropped` local: a kUnguarded delta
-  // (INCR/APPEND/...) applied against a STRING key whose whole-key deadline D already passed here
-  // is dropped outright, never re-creating the key with no TTL. Unlike ShouldDropForLww, this can
-  // itself trigger a lazy reap (an unreaped-but-expired key must be reaped through the ordinary
-  // path BEFORE the tombstone/meta read this decides on) -- see the definition's own comment
-  // (transaction.cc) for why that reap must complete before the last read this function performs,
-  // and why the tombstone is left exactly as it was rather than advanced. Non-const because the
-  // lazy reap it may trigger mutates `db_slice`'s own tables, unlike ShouldDropForLww's plain
-  // read-only compare.
-  bool ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice);
+  // ShouldDropForLww above and OR'd into the same `lww_dropped` local: a delta on an explicit
+  // allow-list of string-only names (IsStringOnlyDelta, multimaster_lww.h/.cc) applied against a
+  // STRING key whose whole-key deadline D already passed here is dropped outright, never
+  // re-creating the key with no TTL. Unlike ShouldDropForLww, this can itself trigger a lazy reap
+  // (an unreaped-but-expired key must be reaped through the ordinary path BEFORE the tombstone/
+  // meta read this decides on) -- see the definition's own comment (transaction.cc) for why that
+  // reap must complete before the last read this function performs, and why the tombstone is left
+  // exactly as it was rather than advanced. Non-const because the lazy reap it may trigger mutates
+  // `db_slice`'s own tables, unlike ShouldDropForLww's plain read-only compare. `classified` is
+  // the same shared ClassifyJournaledCommand result ShouldDropForLww above takes.
+  bool ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice, LwwClass classified);
 
   // Whether the callback can be run directly on this fiber without dispatching on the shard queue.
   // It checks internally that there are no possible suspension points.

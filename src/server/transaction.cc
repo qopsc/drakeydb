@@ -737,20 +737,31 @@ void Transaction::RunCallback(EngineShard* shard) {
 
   shard->set_running_tx(this);
 
-  // drakeydb: P4-4 -- computed once, as a local, BEFORE the try block: RunCallback runs
-  // concurrently on several shard threads for one Transaction (one call per shard, each with its
-  // own EngineShard*), so the veto decision must never live on the Transaction itself -- doing so
+  // drakeydb: P4-4 -- a local, never a Transaction member: RunCallback runs concurrently on
+  // several shard threads for one Transaction (one call per shard, each with its own
+  // EngineShard*), so the veto decision must never live on the Transaction itself -- doing so
   // would race across shards for a multi-key command. See ShouldDropForLww's own comment
   // (transaction.h) for why the compare runs here, under the key's lock, rather than pre-dispatch.
-  // drakeydb: P4-5 -- ShouldDropExpiredDelta only ever fires for a kUnguarded name,
-  // ShouldDropForLww only for kSingleKey -- disjoint classifications, so evaluation order does not
-  // matter for correctness; short-circuiting on the more common (guarded full-state write) check
-  // first avoids the second call's own DbTable/tombstone reads on that path.
-  const bool lww_dropped =
-      ShouldDropForLww(shard, db_slice) || ShouldDropExpiredDelta(shard, db_slice);
-
+  // drakeydb: P4-5 -- declared here (default false), not as a `const` computed in one statement,
+  // and assigned INSIDE the try block below alongside the classify call it depends on:
+  // ShouldDropExpiredDelta's own lazy reap can itself allocate (a reap that journals a DEL), so a
+  // bad_alloc from either veto must reach the SAME catch handling `cb_ptr_`'s own throws does, or
+  // it would propagate out of this function without clearing running_tx_ below, leaving that
+  // pointer stale for the next callback this shard thread runs.
+  bool lww_dropped = false;
   RunnableResult result;
   try {
+    // drakeydb: P4-5 -- classified once, passed to both vetoes: ClassifyJournaledCommand itself
+    // upper-cases and allocates (absl::AsciiStrToUpper), so computing it twice per applied delta
+    // cost a second allocation for no reason. ShouldDropExpiredDelta only ever fires for
+    // kUnguarded, ShouldDropForLww only for kSingleKey -- disjoint classifications, so evaluation
+    // order does not matter for correctness; short-circuiting on the more common (guarded
+    // full-state write) check first avoids the second call's own DbTable/tombstone reads on that
+    // path.
+    const LwwClass classified = ClassifyJournaledCommand(cid_->name());
+    lww_dropped = ShouldDropForLww(shard, db_slice, classified) ||
+                  ShouldDropExpiredDelta(shard, db_slice, classified);
+
     // drakeydb: P4-4 -- a dropped write's callback never runs at all: nothing is written, and
     // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either --
     // every guarded kSingleKey name that would otherwise still auto-journal verbatim is either
@@ -809,15 +820,18 @@ void Transaction::RunCallback(EngineShard* shard) {
   // entry exists. See server/mvcc.h.
 }
 
-bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const {
+bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice,
+                                   LwwClass classified) const {
   if (!IsLwwGuarded())
     return false;
 
   // drakeydb: P4-4 -- keyed on the JOURNALED name (cid_->name(), always upper-case in the command
   // table), matching ClassifyJournaledCommand's own contract (multimaster_lww.h): a streamed
   // apply's Transaction is built from the peer's already-journaled command name, so this IS that
-  // name, never the client-facing one the master may have normalized away.
-  if (ClassifyJournaledCommand(cid_->name()) != LwwClass::kSingleKey)
+  // name, never the client-facing one the master may have normalized away. `classified` is the
+  // caller's own ClassifyJournaledCommand(cid_->name()) result, computed once in RunCallback and
+  // shared with ShouldDropExpiredDelta's own identical need for it.
+  if (classified != LwwClass::kSingleKey)
     return false;
 
   ShardArgs keys = GetShardArgs(shard->shard_id());
@@ -846,14 +860,20 @@ bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const 
   return true;
 }
 
-// drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md): drops an unguarded delta
-// (INCR/APPEND/...) authored strictly before a STRING's own whole-key deadline D, once this node
-// already holds (or, after the lazy reap below, comes to hold) a tombstone carrying that D. The
-// tombstone is left completely untouched here -- no advance -- per the owner's 2026-09-25
-// revision of the original design: with 3+ nodes, a peer stream carries no cross-link causality,
-// so advancing this tombstone above a genuine re-create authored by a THIRD node (one this node
-// has not yet seen) can permanently delete that re-create once a later full sync propagates the
-// advanced stamp to every peer, including the one that authored it.
+// drakeydb: P4-5 -- the D-27 expired-delta veto (ISSUE-REGISTER.md): drops a delta authored
+// strictly before a STRING's own whole-key deadline D, once this node already holds (or, after
+// the lazy reap below, comes to hold) a tombstone carrying that D. Restricted to an explicit
+// allow-list of string-only delta names (IsStringOnlyDelta, multimaster_lww.h/.cc), not every
+// kUnguarded name: any OTHER type's delta targeting the SAME key name is a guaranteed misfire (the
+// author's own copy could only have journaled it against a value that was NOT the expiring
+// string), and several of those handlers read an unfilled default OpResult when their own callback
+// is skipped this way -- BF.ADD (bloom_family.cc) and LPOP (list_family.cc) both dereference an
+// empty vector unconditionally on OpStatus::OK, which a skipped callback's default-constructed
+// OpResult<vector<...>> still reports. The tombstone is left completely untouched here -- no
+// advance: with 3+ nodes, a peer stream carries no cross-link causality, so advancing this
+// tombstone above a genuine re-create authored by a THIRD node (one this node has not yet seen)
+// can permanently delete that re-create once a later full sync propagates the advanced stamp to
+// every peer, including the one that authored it.
 //
 // Soundness:
 // - If the author itself already saw `key` as expired when it minted `incoming`, its own now was
@@ -863,27 +883,36 @@ bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice) const 
 // - If incoming.MsPart() < D, the author applied its delta to a value that ALSO expires at D on
 //   the author's own node, so the net effect there is that same value vanishing at D regardless of
 //   what the delta did to it. Dropping the delta here matches that outcome.
-// - This node keeps its own (older) tombstone. The author's own eventual expiry of that same key
-//   mints a NEWER tombstone of its own ({incoming-derived stamp, +1}), which a later full sync's
-//   merge propagates here and converges both sides -- no advance is needed for that to happen.
-// - If the premise is wrong (the author's live key truly has a newer stamp than this reasoning
-//   assumed -- reachable when a third peer's delete reaches the author late, or the author itself
-//   evicted the key under memory pressure), the author's own copy still carries that newer stamp,
-//   and it wins the next full sync the ordinary way. A misfire here can defer a write's visibility
-//   until the next full sync; it can never lose one outright.
-// - Strings only: every other type's whole-key tombstone carries an ANCHOR, never a bare deadline
-//   (mvcc.h's kTombMeta* comment), so the anchor check below already excludes them. Explicit
-//   deletes carry no meta at all (RecordAbsentKeyRemoval, generic_family.cc, installs a meta-less
-//   tombstone for every replayed removal of an already-absent key), so this never acts on one
-//   either.
-bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice) {
+// - Registered residual (D-23, ISSUE-REGISTER.md), more likely the more all-master nodes a mesh
+//   has: a drop here can still leave this node holding a STALE tombstone, reachable only when a
+//   THIRD node's own guarded delete of the same key -- stamped between this node's tombstone and
+//   the author's re-create -- has not yet arrived here (the cross-link reorder this drop-only
+//   design exists to survive) AND the author never follows the re-create with a later full-state
+//   write (a rate-limiter's own EXPIRE, for instance, ships full state and heals this on its own).
+//   Once that third node's own delete DOES arrive and wins the per-key compare here (replacing the
+//   stale tombstone with its own, newer one), the author's very NEXT delta on that key commits its
+//   incoming stamp verbatim on this node too (FloorAppliedStamp, mvcc.h, does that for any stamp
+//   not older than what is stored) -- landing this node and the author on the IDENTICAL stamp with
+//   DIFFERENT values, D-23's own mechanism. Ties favor the stored side, so neither a later full
+//   sync nor a full re-mesh can tell the two apart afterward: a misfire here can turn into a
+//   PERMANENT split, not merely a deferred write, in this specific narrow shape.
+bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice,
+                                         LwwClass classified) {
   if (!IsLwwGuarded())
     return false;
 
   // drakeydb: P4-5 -- only a genuine delta: a guarded full-state write (kSingleKey) already
   // compares against the tombstone via ShouldDropForLww above; kMultiKeySelfGuarded (MSET, DEL)
-  // guards itself per-key inside its own Op function.
-  if (ClassifyJournaledCommand(cid_->name()) != LwwClass::kUnguarded)
+  // guards itself per-key inside its own Op function. `classified` is the caller's own
+  // ClassifyJournaledCommand(cid_->name()) result (RunCallback), shared with ShouldDropForLww.
+  if (classified != LwwClass::kUnguarded)
+    return false;
+
+  // drakeydb: P4-5 -- the allow-list itself: every other unguarded name, string-typed or not, is
+  // excluded here regardless of what ClassifyJournaledCommand alone would have said -- see this
+  // function's own header comment for why a non-string delta is both a guaranteed misfire and,
+  // for at least two handlers, unsafe to have its callback skipped.
+  if (!IsStringOnlyDelta(cid_->name()))
     return false;
 
   // drakeydb: P4-5 -- a TTL-changing name reachable here only from a stale-binary or
@@ -893,21 +922,34 @@ bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice) 
     return false;
 
   // drakeydb: P4-5 -- a technical squasher hop (MultiCommandSquasher's own outer container
-  // transaction over a batch of squashed sub-commands) is not itself a real command with a key
-  // set of its own -- GetShardArgs below DCHECKs against ever being called on one. Its own
-  // synthetic name is never a recognized guarded name either, so it reaches here (kUnguarded is
-  // the fail-safe default for any unrecognized name) unlike ShouldDropForLww above, which only
-  // continues past kSingleKey names and so never reaches its own GetShardArgs call for one. Each
-  // real squashed sub-command still reaches this veto separately, on its own squashed-stub
-  // sub-transaction -- mirrors LogAutoJournalOnShard's own "Ignore technical squasher hops" gate.
+  // transaction over a batch of squashed sub-commands, built over the client's own outer command
+  // -- EXEC, or EVAL/pipeline-batch for the squasher's other two callers -- never a string-only
+  // delta name) is not itself a real command with a key set of its own: GetShardArgs below
+  // DCHECKs against ever being called on one. The allow-list check above already excludes it in
+  // every case reachable today (none of EXEC/EVAL/a pipeline batch is on it), so this check is a
+  // second, independent layer, not the first: without IT ALONE (allow-list still active), nothing
+  // observable changes, because the allow-list already returned false first; removing BOTH checks
+  // together is what reaches GetShardArgs and its own DCHECK (confirmed directly, see
+  // GuardedSquashedStubTripwireFiresInDebug's own comment, multi_master_test.cc). A squashed
+  // sub-command's own per-shard stub never reaches either veto at all regardless of any of this:
+  // it runs through RunSquashedMultiCb, not RunCallback, and that path consults neither -- a
+  // GUARDED stub instead trips RunSquashedMultiCb's own DFATAL tripwire outright (it has no
+  // batch-safe way to compare one stamp against a whole batch), and an unguarded one (mvcc==0, the
+  // only shape a classic Redis/KeyDB link's own squashed EVAL can carry) never needed comparing in
+  // the first place.
   if (multi_ && multi_->role == SQUASHER)
     return false;
 
-  // drakeydb: P4-5 -- a multi-key or cross-shard delta (cross-shard LMOVE/SMOVE, a multi-shard
-  // EXEC, ...) has no single key this veto can safely compare against: GetShardArgs below returns
-  // only THIS shard's own slice of the full key set, and picking its first entry would silently
-  // ignore the rest. unique_shard_cnt_==1 rules out cross-shard; keys.Size()==1 below rules out a
-  // same-shard multi-key command.
+  // drakeydb: P4-5 -- unique_shard_cnt_==1 and keys.Size()==1 below are a structural safeguard,
+  // not what actually excludes a client-issued LMOVE/SMOVE or a multi-shard EXEC in practice: on a
+  // real peer link, none of those ever reach here as a single multi-key entry at all. A same- or
+  // cross-shard LMOVE/SMOVE is NO_AUTOJOURNAL and hand-journals its own two single-key halves
+  // instead (list_family.cc's own LPOP/RPUSH RecordJournal pair, set_family.cc's own SREM/SADD
+  // pair) -- each half arrives here as its own already-single-key entry, and it is the allow-list
+  // above, not this gate, that excludes them (SREM/SADD/LPOP/RPUSH are not on it). A multi-shard
+  // EXEC is excluded by the SQUASHER check above instead. This gate remains as defense-in-depth
+  // against a hypothetical future unguarded name, or a caller (like a test) that dispatches a
+  // multi-key command name directly rather than through its own decomposed journal form.
   if (unique_shard_cnt_ != 1)
     return false;
 
