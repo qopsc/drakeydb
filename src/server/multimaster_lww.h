@@ -127,21 +127,32 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key);
 // JOURNALED names Transaction::ShouldDropExpiredDelta (transaction.cc) may ever act on, checked
 // AFTER `classified == kUnguarded` already holds. Every entry targets an OBJ_STRING value only,
 // never a container: APPEND/PREPEND (concat), DECR/DECRBY/INCR/INCRBY/INCRBYFLOAT (numeric),
-// SETBIT/SETRANGE/BITFIELD (byte-level), PFADD (a HyperLogLog, stored as an OBJ_STRING value --
-// the same reason PFMERGE's own destination write ships full state under SET, JournalFullStateSet
-// above), and CL.THROTTLE (a packed rate-limiter bucket, also OBJ_STRING, string_family.cc).
-// Restricting to these matters for two reasons, not one: first, a delta targeting the SAME key
-// name but a DIFFERENT type is a guaranteed misfire regardless -- the author's own copy could only
-// have journaled it against a value that was NOT the expiring string (mvcc.h's own kTombMeta*
-// comment: every non-string type's own whole-key tombstone carries an ANCHOR, never a bare
-// deadline, so the anchor check in ShouldDropExpiredDelta already excludes those on its own);
-// second, and more urgently, at least two handlers OUTSIDE this list crash when their own callback
-// is skipped this way and they read an unfilled default OpResult regardless -- BF.ADD
-// (bloom_family.cc) and LPOP (list_family.cc) each unconditionally dereference an empty vector on
-// OpStatus::OK, which is exactly what a never-populated default OpResult<vector<...>> still
-// reports. Every allow-listed handler here was individually audited for that same failure mode and
-// found safe: each reads a plain scalar, a fixed-size array, or a container whose own reply path
-// already branches on size()==0 before indexing into it.
+// SETBIT/SETRANGE/BITFIELD (byte-level), and PFADD (a HyperLogLog, stored as an OBJ_STRING value
+// -- the same reason PFMERGE's own destination write ships full state under SET,
+// JournalFullStateSet above). Restricting to these matters for two reasons, not one: first, a
+// delta targeting the SAME key name but a DIFFERENT type is a guaranteed misfire regardless -- the
+// author's own copy could only have journaled it against a value that was NOT the expiring string
+// (mvcc.h's own kTombMeta* comment: every non-string type's own whole-key tombstone carries an
+// ANCHOR, never a bare deadline, so the anchor check in ShouldDropExpiredDelta already excludes
+// those on its own); second, and more urgently, at least two handlers OUTSIDE this list crash when
+// their own callback is skipped this way and they read an unfilled default OpResult regardless --
+// BF.ADD (bloom_family.cc) and LPOP (list_family.cc) each unconditionally dereference an empty
+// vector on OpStatus::OK, which is exactly what a never-populated default OpResult<vector<...>>
+// still reports. Every allow-listed handler here was individually audited for that same failure
+// mode and found safe: each reads a plain scalar, a fixed-size array, or a container whose own
+// reply path already branches on size()==0 before indexing into it.
+//
+// CL.THROTTLE is deliberately NOT on this list: it fails the veto's own soundness
+// premise, not the crash-safety one. Every allow-listed name above shares one property this
+// module's soundness argument (ShouldDropExpiredDelta's own header comment, transaction.cc) rests
+// on -- the author's own copy of the key ALSO vanishes at D, so a delta authored before D is
+// dropping nothing the author itself kept either. CL.THROTTLE breaks that: a non-limited call sets
+// or extends its OWN key's TTL on every invocation (`AddExpire`/`AddNew` with `new_tat_ms`,
+// string_family.cc's own Throttle) -- the author's key does NOT vanish at D, it re-arms its own
+// deadline every time it is called, guarded or not. Vetoing it here would therefore drop a live
+// rate-limiter bucket for a re-create that was never actually TTL-less to begin with -- D-27's own
+// premise (an unguarded delta re-creating the key with NO TTL) cannot happen with CL.THROTTLE
+// regardless, since every one of its own applies writes a fresh TTL unconditionally.
 bool IsStringOnlyDelta(std::string_view journaled_name);
 
 // drakeydb: P4-5 -- the expired-delta veto's own deny-list (D-27, ISSUE-REGISTER.md), predating

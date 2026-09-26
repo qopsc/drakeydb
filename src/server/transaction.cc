@@ -751,16 +751,23 @@ void Transaction::RunCallback(EngineShard* shard) {
   bool lww_dropped = false;
   RunnableResult result;
   try {
-    // drakeydb: P4-5 -- classified once, passed to both vetoes: ClassifyJournaledCommand itself
-    // upper-cases and allocates (absl::AsciiStrToUpper), so computing it twice per applied delta
-    // cost a second allocation for no reason. ShouldDropExpiredDelta only ever fires for
-    // kUnguarded, ShouldDropForLww only for kSingleKey -- disjoint classifications, so evaluation
-    // order does not matter for correctness; short-circuiting on the more common (guarded
-    // full-state write) check first avoids the second call's own DbTable/tombstone reads on that
-    // path.
-    const LwwClass classified = ClassifyJournaledCommand(cid_->name());
-    lww_dropped = ShouldDropForLww(shard, db_slice, classified) ||
-                  ShouldDropExpiredDelta(shard, db_slice, classified);
+    // drakeydb: P4-5 -- gated on IsLwwGuarded() FIRST, not merely inside each veto: this saves the
+    // classify call itself, not only what it feeds. ClassifyJournaledCommand upper-cases and
+    // allocates (absl::AsciiStrToUpper) before its lookup, a cost every RunCallback on every shard
+    // thread would otherwise pay on every command -- a plain client-issued write, a classic
+    // Redis/KeyDB link, or any apply on a non-active node -- none of which this veto pair ever acts
+    // on regardless, since both already return false the instant they check the same guard
+    // themselves. Classified once inside this gate, passed to both vetoes: computing it twice per
+    // applied delta would cost a second allocation for no reason. ShouldDropExpiredDelta only ever
+    // fires for kUnguarded, ShouldDropForLww only for kSingleKey -- disjoint classifications, so
+    // evaluation order does not matter for correctness; short-circuiting on the more common
+    // (guarded full-state write) check first avoids the second call's own DbTable/tombstone reads
+    // on that path.
+    if (IsLwwGuarded()) {
+      const LwwClass classified = ClassifyJournaledCommand(cid_->name());
+      lww_dropped = ShouldDropForLww(shard, db_slice, classified) ||
+                    ShouldDropExpiredDelta(shard, db_slice, classified);
+    }
 
     // drakeydb: P4-4 -- a dropped write's callback never runs at all: nothing is written, and
     // (via LogAutoJournalOnShard's own lww_dropped parameter below) nothing is journaled either --
@@ -884,12 +891,21 @@ bool Transaction::ShouldDropForLww(EngineShard* shard, DbSlice& db_slice,
 //   the author's own node, so the net effect there is that same value vanishing at D regardless of
 //   what the delta did to it. Dropping the delta here matches that outcome.
 // - Registered residual (D-23, ISSUE-REGISTER.md), more likely the more all-master nodes a mesh
-//   has: a drop here can still leave this node holding a STALE tombstone, reachable only when a
-//   THIRD node's own guarded delete of the same key -- stamped between this node's tombstone and
-//   the author's re-create -- has not yet arrived here (the cross-link reorder this drop-only
-//   design exists to survive) AND the author never follows the re-create with a later full-state
-//   write (a rate-limiter's own EXPIRE, for instance, ships full state and heals this on its own).
-//   Once that third node's own delete DOES arrive and wins the per-key compare here (replacing the
+//   has: a drop here can still leave this node holding a STALE tombstone, provided the author never
+//   follows the re-create with a later full-state write (a rate-limiter's own EXPIRE, for instance,
+//   ships full state and heals this on its own). Three independent paths reach that stale-tombstone
+//   state, not one:
+//   (a) a THIRD node's own guarded delete of the same key -- stamped between this node's tombstone
+//       and the author's re-create -- has not yet arrived here (the cross-link reorder this
+//       drop-only design exists to survive);
+//   (b) author-side eviction: the author's own eviction DEL of the expiring key carries the
+//       expired flag and is filtered from every peer (never forwarded), so two nodes already
+//       suffice -- no third node is needed for this path at all;
+//   (c) a third node's own full-state write that removes or moves D before the author's delta
+//       arrives here, e.g. PERSIST, EXPIRE, or a plain SET with no PX/EX -- any of these installs a
+//       DIFFERENT (or absent) whole-key deadline ahead of the author's re-create, the same as (a)'s
+//       guarded delete but without a DEL.
+//   Once whichever of these three DOES arrive and wins the per-key compare here (replacing the
 //   stale tombstone with its own, newer one), the author's very NEXT delta on that key commits its
 //   incoming stamp verbatim on this node too (FloorAppliedStamp, mvcc.h, does that for any stamp
 //   not older than what is stored) -- landing this node and the author on the IDENTICAL stamp with
@@ -929,8 +945,8 @@ bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice,
   // every case reachable today (none of EXEC/EVAL/a pipeline batch is on it), so this check is a
   // second, independent layer, not the first: without IT ALONE (allow-list still active), nothing
   // observable changes, because the allow-list already returned false first; removing BOTH checks
-  // together is what reaches GetShardArgs and its own DCHECK (confirmed directly, see
-  // GuardedSquashedStubTripwireFiresInDebug's own comment, multi_master_test.cc). A squashed
+  // together is what reaches GetShardArgs and its own DCHECK -- see
+  // GuardedSquashedStubTripwireFiresInDebug's own comment (multi_master_test.cc). A squashed
   // sub-command's own per-shard stub never reaches either veto at all regardless of any of this:
   // it runs through RunSquashedMultiCb, not RunCallback, and that path consults neither -- a
   // GUARDED stub instead trips RunSquashedMultiCb's own DFATAL tripwire outright (it has no
@@ -941,13 +957,17 @@ bool Transaction::ShouldDropExpiredDelta(EngineShard* shard, DbSlice& db_slice,
     return false;
 
   // drakeydb: P4-5 -- unique_shard_cnt_==1 and keys.Size()==1 below are a structural safeguard,
-  // not what actually excludes a client-issued LMOVE/SMOVE or a multi-shard EXEC in practice: on a
-  // real peer link, none of those ever reach here as a single multi-key entry at all. A same- or
-  // cross-shard LMOVE/SMOVE is NO_AUTOJOURNAL and hand-journals its own two single-key halves
-  // instead (list_family.cc's own LPOP/RPUSH RecordJournal pair, set_family.cc's own SREM/SADD
-  // pair) -- each half arrives here as its own already-single-key entry, and it is the allow-list
-  // above, not this gate, that excludes them (SREM/SADD/LPOP/RPUSH are not on it). A multi-shard
-  // EXEC is excluded by the SQUASHER check above instead. This gate remains as defense-in-depth
+  // not what actually excludes a client-issued LMOVE/SMOVE in practice: on a real peer link, that
+  // never reaches here as a single multi-key entry at all. A same- or cross-shard LMOVE/SMOVE is
+  // NO_AUTOJOURNAL and hand-journals its own two single-key halves instead (list_family.cc's own
+  // LPOP/RPUSH RecordJournal pair, set_family.cc's own SREM/SADD pair) -- each half arrives here as
+  // its own already-single-key entry, and it is the allow-list above, not this gate, that excludes
+  // them (SREM/SADD/LPOP/RPUSH are not on it). A multi-shard EXEC never reaches this gate, or the
+  // SQUASHER check above, at all: a peer link never delivers an EXEC as such -- each journal
+  // COMMAND entry is its own TransactionData, executed alone, one inner command at a time
+  // (TransactionData::AddEntry, journal/tx_executor.cc; DflyShardReplica::ExecuteTx's own
+  // non-global-cmd branch, replica.cc), so every inner command reaching this veto is judged by its
+  // own name, never batched under EXEC's. This gate remains as defense-in-depth
   // against a hypothetical future unguarded name, or a caller (like a test) that dispatches a
   // multi-key command name directly rather than through its own decomposed journal form.
   if (unique_shard_cnt_ != 1)

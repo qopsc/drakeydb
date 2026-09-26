@@ -161,8 +161,8 @@ void NoteLwwDrop(std::string_view journaled_name, std::string_view key) {
 // classify call) -- callers here are internal to this veto, not a public API third parties feed
 // arbitrary casing into, unlike ClassifyJournaledCommand above.
 constexpr std::string_view kStringOnlyDeltaNames[] = {
-    "APPEND", "BITFIELD",    "CL.THROTTLE", "DECR",    "DECRBY", "INCR",
-    "INCRBY", "INCRBYFLOAT", "PFADD",       "PREPEND", "SETBIT", "SETRANGE",
+    "APPEND",      "BITFIELD", "DECR",    "DECRBY", "INCR",     "INCRBY",
+    "INCRBYFLOAT", "PFADD",    "PREPEND", "SETBIT", "SETRANGE",
 };
 
 bool IsStringOnlyDelta(std::string_view journaled_name) {
