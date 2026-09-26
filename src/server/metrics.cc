@@ -752,9 +752,10 @@ void Metrics::Merge(const Metrics& src) {
                              sizeof(std::optional<Metrics::ReplicaInfo>) + sizeof(LoadingStats) +
                              sizeof(absl::flat_hash_map<std::string, hdr_histogram*>) +
                              sizeof(InternedStringStats) + sizeof(acl::UserRegistry::AclStats) +
-                             200,  // scalar fields (22 fields: +3 for P4-1 Task 11's
-                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch)
-                                   // + 4-byte alignment padding
+                             208,  // scalar fields (23 fields: +3 for P4-1 Task 11's
+                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch,
+                                   // +1 for P4-5's mvcc_foreign_arms_seen) + 4-byte alignment
+                                   // padding
       "Metrics size changed - update Merge() and InitFromThread()");
 
   // Per-db stats / events / small_string_bytes are merged element-wise.
@@ -795,6 +796,7 @@ void Metrics::Merge(const Metrics& src) {
   lsn_buffer_bytes += src.lsn_buffer_bytes;
   mvcc_unstamped_writes += src.mvcc_unstamped_writes;
   mvcc_stale_epoch += src.mvcc_stale_epoch;
+  mvcc_foreign_arms_seen += src.mvcc_foreign_arms_seen;
 
   // Non-sum reductions.
   tx_queue_len = std::max(tx_queue_len, src.tx_queue_len);
@@ -831,9 +833,10 @@ void Metrics::InitFromThread(Namespace* ns, const CommandRegistry* registry,
                              sizeof(std::optional<Metrics::ReplicaInfo>) + sizeof(LoadingStats) +
                              sizeof(absl::flat_hash_map<std::string, hdr_histogram*>) +
                              sizeof(InternedStringStats) + sizeof(acl::UserRegistry::AclStats) +
-                             200,  // scalar fields (22 fields: +3 for P4-1 Task 11's
-                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch)
-                                   // + 4-byte alignment padding
+                             208,  // scalar fields (23 fields: +3 for P4-1 Task 11's
+                                   // mvcc_clock_ahead_ms/mvcc_unstamped_writes/mvcc_stale_epoch,
+                                   // +1 for P4-5's mvcc_foreign_arms_seen) + 4-byte alignment
+                                   // padding
       "Metrics size changed - update Merge() and InitFromThread()");
   EngineShard* shard = EngineShard::tlocal();
   ServerState* ss = ServerState::tlocal();
@@ -882,6 +885,7 @@ void Metrics::InitFromThread(Namespace* ns, const CommandRegistry* registry,
       mvcc_clock_ahead_ms = stamper->clock().AheadMs(GetCurrentTimeMs());
       mvcc_unstamped_writes = stamper->stats().unstamped_writes;
       mvcc_stale_epoch = stamper->stats().stale_epoch;
+      mvcc_foreign_arms_seen = stamper->stats().foreign_arms_seen;
     }
 
     if (shard->journal()) {

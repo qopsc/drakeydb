@@ -392,6 +392,15 @@ class MvccStamper {
   struct Stats {
     uint64_t unstamped_writes = 0;  // arms discarded with no journal entry -- see INFO
     uint64_t stale_epoch = 0;       // hop memo re-minted by the backstop above
+    // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: every time Commit, EndOfWriteEpoch or
+    // LocalMintFloor (all three owner-agnostic by design, below) encounters an arm placed by a
+    // DIFFERENT fiber than the one running right now, or CommitOwnTombstone's own scoped search
+    // (below) skips one for that reason. A nonzero reading means the owner-agnostic trio's own
+    // design premise -- no foreign arm is ever present when they run -- has stopped holding, and
+    // they would need scoping too (see their own comments below for why they are not scoped
+    // today). A production canary (LOG_EVERY_T(WARNING, 60), mvcc.cc) fires alongside every
+    // increment.
+    uint64_t foreign_arms_seen = 0;
   };
 
   static MvccStamper* tlocal();
@@ -668,8 +677,11 @@ class MvccStamper {
     // CommitOwnTombstone's search, Arm()'s own placeholder-inheritance scan, and LocalMintFloor
     // (mvcc.cc) all restrict themselves to arms whose owner matches the CALLING fiber, so one
     // fiber's in-flight arm on a shared shard thread can never be mistaken for another's.
-    // Commit() and EndOfWriteEpoch() are deliberately left UNSCOPED still -- measuring how often
-    // either would actually see a foreign arm comes first (D-14, ISSUE-REGISTER.md).
+    // Commit() and EndOfWriteEpoch() are deliberately left UNSCOPED: neither transactions nor
+    // the loader can leave a foreign arm pending when either runs (see their own comments in the
+    // .cc for why), so scoping them would only pay a scan cost against a case the design already
+    // rules out. foreign_arms_seen (Stats, above) plus its warning canary (mvcc.cc) is the guard
+    // that would catch it if that premise ever stops holding (D-14, ISSUE-REGISTER.md).
     // No default member initializer either, for the same reason `tombstone` above has none.
     util::fb2::detail::FiberInterface* owner;
   };
@@ -689,7 +701,10 @@ class MvccStamper {
   // InlinedVector is only cheaper for callbacks that arm <=4 keys, and worse for every other one.
   std::vector<Armed> armed_;
   std::vector<uint64_t> origin_hash_cache_;  // dense by origin_idx; index 0 == self
-  Stats stats_;
+  // drakeydb: P4-5 -- D-14(b): mutable so that LocalMintFloor() (a const query, below) can still
+  // bump foreign_arms_seen -- the one field this canary touches from a const method. Nothing
+  // else about Stats needs this; every other mutation already happens from a non-const method.
+  mutable Stats stats_;
   // >0 while Commit() is mid-iteration over armed_/arena_. Guards Arm(), Disarm(), and a
   // re-entrant Commit() call from a CommitFn -- see Commit()'s comment above for why each would
   // corrupt that iteration. A counter, not a bool: a bool reentrancy flag reset by an inner

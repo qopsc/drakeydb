@@ -110,7 +110,16 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 // decides whether scoping either is worth it (D-14, ISSUE-REGISTER.md).
 uint64_t MvccStamper::LocalMintFloor() const {
   uint64_t floor = 0;
+  // drakeydb: P4-5 -- D-14(b): measures, without changing anything else about this owner-agnostic
+  // read, how often it actually sees an arm placed by a different fiber -- see Stats::
+  // foreign_arms_seen (mvcc.h) and Commit()'s own identical measurement below for the full why.
+  const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
+    if (a.owner != self) {
+      ++stats_.foreign_arms_seen;
+      LOG_EVERY_T(WARNING, 60) << "MvccStamper::LocalMintFloor saw a foreign fiber's arm for key "
+                               << "\"" << ArmedKey(a) << "\" (db_index: " << a.db_index << ")";
+    }
     const uint64_t prev_mvcc = a.prev_stamp.Mvcc();
     if (prev_mvcc == 0)
       continue;
@@ -298,8 +307,20 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
     armed_.clear();
     arena_.clear();  // keeps capacity
   };
-  for (const Armed& a : armed_)
+  // drakeydb: P4-5 -- D-14(b): measures, without changing anything else about this owner-agnostic
+  // sweep, how often it actually stamps an arm placed by a different fiber than the one running
+  // this Commit() call -- see Stats::foreign_arms_seen (mvcc.h) and the Armed::owner comment
+  // (mvcc.h) for the full why this stays a measurement, not a scope, until the count says
+  // otherwise.
+  const auto* const self = util::fb2::detail::FiberActive();
+  for (const Armed& a : armed_) {
+    if (a.owner != self) {
+      ++stats_.foreign_arms_seen;
+      LOG_EVERY_T(WARNING, 60) << "MvccStamper::Commit saw a foreign fiber's arm for key \""
+                               << ArmedKey(a) << "\" (db_index: " << a.db_index << ")";
+    }
     fn(a.db_index, ArmedKey(a), a.tombstone ? tomb_stamp : stamp, a.tombstone, a.prev_stamp);
+  }
 }
 
 // drakeydb: P4-4 -- see the declaration (mvcc.h) for the contract. RecordExpiryBlocking
@@ -334,7 +355,20 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, con
                                  "iteration over the same container";
   const auto* const self = util::fb2::detail::FiberActive();
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
-    if (it->owner == self && it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
+    if (it->db_index != db_index || !it->tombstone || ArmedKey(*it) != key)
+      continue;
+    // drakeydb: P4-5 -- D-14(b): this arm otherwise matches the search (same db_index/key, a
+    // tombstone) but was placed by a DIFFERENT fiber -- exactly the case the owner conjunct
+    // below exists to reject (D-14(a), ISSUE-REGISTER.md). Counted and warned about here, then
+    // skipped, so the search keeps looking for THIS fiber's own match instead of stopping short.
+    if (it->owner != self) {
+      ++stats_.foreign_arms_seen;
+      LOG_EVERY_T(WARNING, 60) << "MvccStamper::CommitOwnTombstone skipped a foreign fiber's "
+                                  "tombstone arm for key \""
+                               << key << "\" (db_index: " << db_index << ")";
+      continue;
+    }
+    {  // Found THIS fiber's own tombstone arm for (db_index, key).
       // drakeydb: P4-4 -- `ExpiryTombstoneFor` (mvcc.h) applied to `it->prev_stamp` (this exact
       // arm's own captured pre-delete stamp): one origin_hash tick above the value this tombstone
       // replaces, tombstone bit set -- never that value's own stamp reused verbatim, and never a
@@ -405,7 +439,19 @@ void MvccStamper::EndOfWriteEpoch(const EraseFn& erase_fn) {
     hop_stamp_ = 0;
     hop_started_ms_ = 0;
   };
+  // drakeydb: P4-5 -- D-14(b): measures, without changing anything else about this owner-agnostic
+  // discard, how often it actually abandons an arm placed by a different fiber than the one
+  // ending the epoch -- see Stats::foreign_arms_seen (mvcc.h) and Commit()'s own identical
+  // measurement above for the full why. Checked for EVERY still-armed key, not only the
+  // tombstone ones erase_fn touches below: every arm here is about to be discarded by the
+  // Cleanup above regardless of its own tombstone flag.
+  const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
+    if (a.owner != self) {
+      ++stats_.foreign_arms_seen;
+      LOG_EVERY_T(WARNING, 60) << "MvccStamper::EndOfWriteEpoch saw a foreign fiber's arm for key "
+                               << "\"" << ArmedKey(a) << "\" (db_index: " << a.db_index << ")";
+    }
     if (a.tombstone)
       erase_fn(a.db_index, ArmedKey(a));
   }

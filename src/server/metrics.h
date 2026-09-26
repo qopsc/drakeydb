@@ -115,6 +115,9 @@ struct Metrics {
   uint64_t mvcc_clock_ahead_ms = 0;
   uint64_t mvcc_unstamped_writes = 0;
   uint64_t mvcc_stale_epoch = 0;
+  // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: MvccStamper::Stats::foreign_arms_seen
+  // (mvcc.h), summed across shards the same way as its two siblings above.
+  uint64_t mvcc_foreign_arms_seen = 0;
 
   // Meaningful only on a master (zero on replicas / no replicas).
   ReplicationMemoryStats replication_stats;

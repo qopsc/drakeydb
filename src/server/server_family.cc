@@ -3151,6 +3151,12 @@ string ServerFamily::FormatInfoMetrics(
         append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
         append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
         append("mvcc_stale_epoch", m.mvcc_stale_epoch);
+        // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: MvccStamper::Stats::foreign_arms_seen
+        // (mvcc.h) -- Commit/EndOfWriteEpoch/LocalMintFloor encountering, or CommitOwnTombstone's
+        // own scoped search skipping, an arm placed by a different fiber. Healthy operation keeps
+        // this at 0; a nonzero reading means their shared owner-agnostic design premise no longer
+        // holds. Same gate/aggregation path as its siblings above.
+        append("mvcc_foreign_arms_seen", m.mvcc_foreign_arms_seen);
         // drakeydb: P4-4 -- replicated writes the streaming LWW guard (multimaster_lww.h,
         // NoteLwwDrop) has dropped on this node's peer links. The counter itself lives on
         // ServerState::Stats (per shard/proactor thread); m.coordinator_stats is already the sum

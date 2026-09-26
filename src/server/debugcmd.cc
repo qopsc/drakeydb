@@ -1366,6 +1366,8 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       uint64_t clock_last = 0;
       uint64_t clock_ahead_ms = 0;
       uint64_t unstamped_writes = 0;
+      // drakeydb: P4-5 -- see MvccStamper::Stats::foreign_arms_seen (mvcc.h).
+      uint64_t foreign_arms_seen = 0;
     };
     vector<ShardMvccInfo> infos(shard_set->size());
     // Captured once and handed to every shard's AheadMs() below, so all shards are judged
@@ -1398,6 +1400,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       info.clock_last = stamper->clock().last();
       info.clock_ahead_ms = stamper->clock().AheadMs(now_ms);
       info.unstamped_writes = stamper->stats().unstamped_writes;
+      info.foreign_arms_seen = stamper->stats().foreign_arms_seen;
     });
 
     string resp;
@@ -1409,7 +1412,8 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
                 "_tombstones_born_expired:", info.tombstones_born_expired, " shard", i,
                 "_bytes:", info.bytes, " shard", i, "_clock_last:", info.clock_last, " shard", i,
                 "_clock_ahead_ms:", info.clock_ahead_ms, " shard", i,
-                "_unstamped_writes:", info.unstamped_writes);
+                "_unstamped_writes:", info.unstamped_writes, " shard", i,
+                "_foreign_arms_seen:", info.foreign_arms_seen);
     }
     return rb->SendSimpleString(resp);
   }
