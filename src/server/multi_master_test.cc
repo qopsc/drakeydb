@@ -2430,6 +2430,71 @@ TEST_F(MvccStoreTest, TombstoneGcSkipsAnUncommittedPlaceholder) {
   });
 }
 
+// drakeydb: P4-5 -- defence in depth alongside the Mvcc()==0 guard the test above pins: that
+// guard alone stops matching this exact placeholder shape, but says nothing about a slot that
+// somehow ended up with a real-looking, non-zero Mvcc() while a delete's own arm was still
+// pending on it -- the shape a peer-sourced install would leave behind if it ever overwrote a
+// placeholder before that placeholder's own owner committed. Reproduces that shape directly
+// (SetTombstone, twice, on the SAME fiber -- matching the neighbouring test's own precedent of
+// constructing the shape rather than actually racing a stalled peer link), rather than via a real
+// two-fiber race: this check does not care who owns the arm, only that one exists, so a
+// single-fiber setup already exercises it fully.
+//
+// Falsifying: removing the IsArmedByAnyFiber check from TombstoneGcStep's erase branch
+// (db_slice.cc) makes GC reap `key` outright, `stamp` below comes back empty, and the final
+// Commit()-driven landing never happens because there is no slot left for it to land on --
+// exactly the CHECK(!it.is_done()) precondition SetExistingMvcc would hit for a real delete's own
+// commit resuming into that gap.
+TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
+  absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
+
+  const std::string key = "gc-armed-overwrite";
+  // Already well past the 1s ttl above, so TombstoneExpiredAt alone would call this reapable --
+  // exactly the peer-sourced stamp an unguarded install would have left over the placeholder.
+  const uint64_t old_ms = GetCurrentTimeMs() - 5000;
+  const MvccStamp kPeerStamp = MvccStamp{old_ms << MvccClock::kCounterBits, 0xABCDu}.AsTombstone();
+
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Mirrors PerformDeletionAtomic's own synchronous placeholder + arm (db_slice.cc) for a
+    // concurrent DEL that has not yet reached its own journal Commit(), then overwrites the slot
+    // directly with an already-expired stamp -- what an unguarded peer-sourced install would have
+    // done to it.
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, key, MvccStamp{});
+    db_slice.SetTombstone(0, key, kPeerStamp);
+
+    // A handful of calls, not a while-loop-to-convergence: this slot's own arm never resolves
+    // during this test, so a correctly-behaving TombstoneGcStep keeps reporting it pending
+    // forever (unlike the neighbouring test above, whose placeholder has nothing else pinning
+    // it) -- looping until it returns false would never terminate.
+    for (int i = 0; i < 5; ++i)
+      db_slice.TombstoneGcStep();
+
+    auto stamp = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(stamp.has_value())
+        << "GC erased a slot that still had a pending arm -- the arm's own eventual commit would "
+           "have hit CHECK(!it.is_done()) the instant it resumed";
+    EXPECT_EQ(*stamp, kPeerStamp) << "GC must leave the slot's own value untouched, not merely "
+                                     "its existence";
+
+    // The armed fiber's own eventual commit (Commit()'s CommitFn calls SetExistingMvcc) must
+    // still find the slot and succeed, landing its own stamp over the peer's -- exactly what
+    // would instead CHECK-fail had GC erased it above.
+    const uint64_t kOwnMvcc = GetCurrentTimeMs() << MvccClock::kCounterBits;
+    MvccStamper::tlocal()->Commit(
+        kOwnMvcc, /*origin_idx=*/0,
+        [&db_slice](DbIndex db, std::string_view k, const MvccStamp& st, bool /*tombstone*/,
+                    const MvccStamp& /*prev_stamp*/) { db_slice.SetExistingMvcc(db, k, st); });
+    auto landed = db_slice.GetMvcc(0, key);
+    ASSERT_TRUE(landed.has_value());
+    EXPECT_EQ(landed->Mvcc(), kOwnMvcc) << "the owner's own commit must land its own stamp";
+    EXPECT_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
+        << "Commit() must have consumed the arm";
+  });
+}
+
 // drakeydb: P4-3 Task 3, review fix (C1), Critical -- the reviewer's own repro: with
 // --multi_master_tombstone_gc_budget=0 (bypassing ValidateMultiMasterFlags via absl::SetFlag,
 // the same way a future CONFIG SET could), TombstoneGcStep returned true on every one of 5
