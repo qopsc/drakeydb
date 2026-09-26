@@ -2483,18 +2483,19 @@ TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
   });
 
   // A handful of calls, not a while-loop-to-convergence: a correctly-behaving TombstoneGcStep
-  // does NOT report this arm-skipped slot as pending (that busy-spin is exactly what the M-1 fix
-  // removed), so this tiny one-key table finishes its lap and returns false on the very first
-  // call regardless -- looping to convergence would just repeat that same false a few more times.
-  // Calling it a few times anyway is a stronger check on `gc_pending`'s own LAST value (below):
-  // it must stay false across repeated calls, not just the first one.
+  // does NOT report this arm-skipped slot as pending, so this tiny one-key table finishes its lap
+  // and returns false on the very first call regardless -- looping to convergence would just
+  // repeat that same false a few more times. Every one of the 5 calls' own return value is
+  // collected below (any_pending), not just the last one, so this is a real check that none of
+  // them busy-spins -- checking only gc_pending's own final value would miss an EARLIER call
+  // wrongly reporting pending work.
   bool stamp_survived = false;
   MvccStamp stamp_after_gc;
-  bool gc_pending = true;
+  bool any_pending = false;
   util::fb2::Fiber fiber_gc = shard_proactor->LaunchFiber([&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     for (int i = 0; i < 5; ++i)
-      gc_pending = db_slice.TombstoneGcStep();
+      any_pending = any_pending || db_slice.TombstoneGcStep();
     if (auto stamp = db_slice.GetMvcc(0, key); stamp.has_value()) {
       stamp_survived = true;
       stamp_after_gc = *stamp;
@@ -2507,11 +2508,11 @@ TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
          "have hit CHECK(!it.is_done()) the instant it resumed";
   EXPECT_EQ(stamp_after_gc, kPeerStamp)
       << "GC must leave the slot's own value untouched, not merely its existence";
-  EXPECT_FALSE(gc_pending)
-      << "a lap in which only arm-skipped slots remain must report no pending work -- marking "
-         "pending on that skip would busy-spin the on-idle task for as long as the arm stays "
-         "armed, the exact zero-progress hazard the budget==0 guard elsewhere in this function "
-         "already exists to prevent";
+  EXPECT_FALSE(any_pending)
+      << "a lap in which only arm-skipped slots remain must report no pending work on ANY call, "
+         "not just the last one -- marking pending on that skip would busy-spin the on-idle task "
+         "for as long as the arm stays armed, the exact zero-progress hazard the budget==0 guard "
+         "elsewhere in this function already exists to prevent";
 
   // Commit back on the owner: the SAME shard queue fiber the arm was placed from
   // (shard_set->Await again). The owner's own eventual commit must still find the slot and
