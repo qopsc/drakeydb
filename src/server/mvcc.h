@@ -341,7 +341,11 @@ uint64_t NodeUuidHash(std::string_view uuid);
 //
 // Contract: DbSlice::PostUpdate ARMS the keys a shard callback touched; journal::RecordEntry
 // COMMITS the entry's stamp to every armed key at the moment the entry is emitted; the end of the
-// callback DISCARDS whatever is still armed. That is what enforces the phase's central invariant:
+// callback DISCARDS whatever is still armed. Commit/EndOfWriteEpoch (below) scope both of the
+// latter two to the CALLING fiber's own arms (D-14(b), ISSUE-REGISTER.md): a different fiber's
+// own callback can genuinely still have arms pending on this same shard thread when either runs,
+// and "every armed key" here has always meant this callback's
+// own. That is what enforces the phase's central invariant:
 //
 //   a key's stamp advances if and only if that same stamp is propagated to peers.
 //
@@ -393,12 +397,18 @@ class MvccStamper {
     uint64_t unstamped_writes = 0;  // arms discarded with no journal entry -- see INFO
     uint64_t stale_epoch = 0;       // hop memo re-minted by the backstop above
     // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: every time Commit, EndOfWriteEpoch or
-    // LocalMintFloor (all three owner-agnostic by design, below) encounters an arm placed by a
-    // DIFFERENT fiber than the one running right now, or CommitOwnTombstone's own scoped search
-    // (below) skips one for that reason. A nonzero reading means the owner-agnostic trio's own
-    // design premise -- no foreign arm is ever present when they run -- has stopped holding, and
-    // they would need scoping too (see their own comments below for why they are not scoped
-    // today). A production canary (LOG_EVERY_T(WARNING, 60), mvcc.cc) fires alongside every
+    // LocalMintFloor -- all three scoped to the CALLING fiber's own arms, below, same as
+    // CommitOwnTombstone's search -- steps over an arm placed by a DIFFERENT fiber and correctly
+    // leaves it alone for its own owner to eventually commit or roll back. This is BENIGN, not a
+    // bug signal: a paused transaction's own arm can legitimately still be pending when an
+    // unrelated command's Commit/EndOfWriteEpoch runs on the same shard thread (DEBUG POPULATE's
+    // squashed stub while an inline SET is paused in AddLogRecord; the loader's own lazy expiry
+    // reaching LocalMintFloor), and skipping it correctly is exactly the point of scoping these
+    // three at all. Kept as an operational metric, not a correctness gate: an operator watching
+    // this rise over time learns how often that interleaving actually happens in practice. Counts
+    // ENCOUNTERS, not distinct arms -- the same still-pending foreign arm can be seen (and
+    // counted again) by more than one of these three calls, e.g. LocalMintFloor and then Commit
+    // for the same journal entry. A diagnostic-only VLOG(1) (mvcc.cc) fires alongside every
     // increment.
     uint64_t foreign_arms_seen = 0;
   };
@@ -430,10 +440,13 @@ class MvccStamper {
   // MvccClock::Next: ratcheting the shared clock would let one fast/skewed peer's write poison
   // every LATER, unrelated local mint on this shard too, which the spec explicitly rejects.
   //
-  // Returns the highest (prev_stamp.Mvcc() + 1) among currently-armed keys that carry a real
-  // prior stamp (Mvcc() != 0 -- a fresh {0,0} slot or an uncommitted placeholder has none to floor
-  // against, same check as FloorAppliedStamp's), or 0 if none does -- a no-op floor, so
-  // std::max(HopStamp(now), LocalMintFloor()) degrades to a bare HopStamp exactly as before D3.
+  // Returns the highest (prev_stamp.Mvcc() + 1) among the CALLING fiber's own currently-armed
+  // keys that carry a real prior stamp (Mvcc() != 0 -- a fresh {0,0} slot or an uncommitted
+  // placeholder has none to floor against, same check as FloorAppliedStamp's), or 0 if none does
+  // -- a no-op floor, so std::max(HopStamp(now), LocalMintFloor()) degrades to a bare HopStamp
+  // exactly as before D3. Scoped to this fiber's own arms, in lock-step with Commit() (mvcc.cc):
+  // this floors exactly the arms this entry's own Commit() call is about to stamp, never a
+  // different fiber's still-pending one (D-14(b), ISSUE-REGISTER.md).
   // Capped at MvccClock::kStampMask (P4-4 Task A5b): a corrupt or hostile peer stamp
   // with Mvcc() exactly kStampMask would otherwise overflow prev+1 into precisely kTombstoneBit,
   // silently marking a LIVE write's stamp as a tombstone (Mvcc() masks bit 63 back to 0).
@@ -531,11 +544,13 @@ class MvccStamper {
   // drakeydb: P4-4 Task A5 -- fn's 4th argument is that arm's own Armed::tombstone
   // (ground truth), its 5th is that arm's own Armed::prev_stamp, both passed through verbatim --
   // see CommitFn's own comment for what each means and when it matters.
-  // Clears the arm list -- unconditionally,
-  // even if fn throws (RAII in the .cc): a surviving armed_ after a partial failure would either
-  // let EndOfWriteEpoch() over-count already-attempted keys as unstamped, or, worse, let a LATER
-  // Commit() in the same epoch (e.g. a second RecordEntry from one Lua script) stamp these
-  // leftover keys with an unrelated entry's mvcc. Decided and documented in Task 7 -- see the .cc.
+  // Removes every arm THIS CALL processed -- unconditionally, even if fn throws (RAII in the
+  // .cc): a surviving own-arm after a partial failure would either let EndOfWriteEpoch() over-
+  // count already-attempted keys as unstamped, or, worse, let a LATER Commit() in the same epoch
+  // (e.g. a second RecordEntry from one Lua script) stamp these leftover keys with an unrelated
+  // entry's mvcc. Decided and documented in Task 7 -- see the .cc. D-14(b), ISSUE-REGISTER.md: a
+  // DIFFERENT fiber's own arm is left exactly as it was, for that fiber's own eventual Commit()
+  // to process -- never removed, stamped, or even inspected beyond noting it was skipped.
   //
   // fn must not call Arm(), Disarm(), Commit(), or EndOfWriteEpoch(): this call is mid-iteration
   // over armed_/arena_, and any of the four would corrupt that iteration -- Arm()/a nested
@@ -600,8 +615,12 @@ class MvccStamper {
   // calling this would corrupt Commit()'s own in-progress iteration.
   //
   // drakeydb: P4-3 Task 2 review fix (I3) -- calls erase_fn (see its own comment above) for every
-  // still-armed tombstone arm, BEFORE armed_/arena_ are cleared (so ArmedKey is still valid
-  // inside erase_fn), then clears armed_/arena_/hop_stamp_ exactly as before. No default: every
+  // still-armed tombstone arm OWNED BY THIS FIBER, BEFORE armed_ is pruned (so ArmedKey is still
+  // valid inside erase_fn), then removes exactly those own arms from armed_ (D-14(b),
+  // ISSUE-REGISTER.md: a DIFFERENT fiber's own arm is left untouched, for that fiber's own
+  // eventual Commit()/EndOfWriteEpoch() to process), clears arena_ only once armed_ is fully
+  // empty (a still-pending foreign arm's own key bytes must survive this call), and always
+  // resets hop_stamp_ regardless -- that memo is per-thread, not per-fiber. No default: every
   // call site must consciously supply a rollback, or a tombstone-earning delete on that path
   // degrades from "no peer learns about this delete" (already the accepted, bounded-risk fallback
   // at the cap) to "no peer ever CAN learn about this delete, permanently" -- worse, and silent.
@@ -619,21 +638,25 @@ class MvccStamper {
   // that point; this lets each one confirm that with a DCHECK rather than relying on it staying
   // true by accident as the callers around CommitOwnTombstone change.
   //
-  // drakeydb: P4-5 -- D-14(a): the RAW total, every owner included. Stays the one every
-  // derived-DEL DCHECK site (db_slice.cc, set_family.cc, hset_family.cc) uses: each of those
-  // runs immediately before journal::RecordEntry's own generic per-arm Commit() sweep, which is
-  // itself owner-agnostic (paired with the unscoped LocalMintFloor, mvcc.cc) -- that sweep would
-  // floor ANY still-armed key regardless of which fiber placed it, so the DCHECK must count
-  // every arm too, not just this fiber's own.
+  // drakeydb: P4-5 -- D-14(a): the RAW total, every owner included -- diagnostic only (e.g. a
+  // test confirming a foreign fiber's own arm is still intact after this fiber's own Commit()/
+  // EndOfWriteEpoch() runs). NOT used by the derived-DEL DCHECK sites (db_slice.cc,
+  // set_family.cc, hset_family.cc) -- see OwnedArmedCount() below for those.
   size_t ArmedCount() const {
     return armed_.size();
   }
 
-  // drakeydb: P4-5 -- D-14(a): like ArmedCount() above, but counts only arms owned by the
-  // CALLING fiber -- util::fb2::detail::FiberActive() at call time. Used by the ABA guard at
+  // drakeydb: P4-5 -- D-14(a)/D-14(b): like ArmedCount() above, but counts only arms owned by
+  // the CALLING fiber -- util::fb2::detail::FiberActive() at call time. Used by the ABA guard at
   // every rdb_load.cc loader-callback exit (that callback's own bookkeeping specifically, not
-  // "is armed_ empty for every fiber sharing this shard thread") and by OwnsArm-adjacent callers
-  // -- NOT by the derived-DEL DCHECK sites, which need the raw ArmedCount() above instead.
+  // "is armed_ empty for every fiber sharing this shard thread"), by OwnsArm-adjacent callers,
+  // and by the derived-DEL DCHECK sites: each of those runs immediately before
+  // journal::RecordEntry's own per-arm Commit() sweep, which is itself scoped to this fiber
+  // (D-14(b), ISSUE-REGISTER.md) -- the DCHECK confirms no OTHER key of THIS fiber's own is
+  // still armed at that point (that sweep would floor it against the tombstone's own stamp
+  // instead of its real author stamp); a different fiber's own unrelated arm is not this sweep's
+  // concern at all now, so counting it via the raw ArmedCount() above would make the DCHECK fire
+  // on a case that is not actually a bug.
   size_t OwnedArmedCount() const;
 
   const Stats& stats() const {
@@ -674,14 +697,18 @@ class MvccStamper {
     // ThreadLocalMutex already uses (synchronization.h/.cc) to tell fibers on one shard thread
     // apart. Yield-stable by construction (unlike an ambient RAII scope id, which the loader's
     // own yield inside FindMutable, rdb_load.cc, would misattribute across): Disarm,
-    // CommitOwnTombstone's search, Arm()'s own placeholder-inheritance scan, and LocalMintFloor
-    // (mvcc.cc) all restrict themselves to arms whose owner matches the CALLING fiber, so one
-    // fiber's in-flight arm on a shared shard thread can never be mistaken for another's.
-    // Commit() and EndOfWriteEpoch() are deliberately left UNSCOPED: neither transactions nor
-    // the loader can leave a foreign arm pending when either runs (see their own comments in the
-    // .cc for why), so scoping them would only pay a scan cost against a case the design already
-    // rules out. foreign_arms_seen (Stats, above) plus its warning canary (mvcc.cc) is the guard
-    // that would catch it if that premise ever stops holding (D-14, ISSUE-REGISTER.md).
+    // CommitOwnTombstone's search, Arm()'s own placeholder-inheritance scan, Commit(), and
+    // EndOfWriteEpoch() (all in mvcc.cc) restrict themselves to arms whose owner matches the
+    // CALLING fiber, so one fiber's in-flight arm on a shared shard thread can never be mistaken
+    // for another's. LocalMintFloor() (mvcc.cc) is scoped the same way, in lock-step with
+    // Commit(): it floors exactly the arms that fiber's own Commit() is about to stamp, never a
+    // different fiber's. D-14(b), ISSUE-REGISTER.md: a foreign arm CAN be genuinely pending when
+    // any of these run -- a paused transaction's own arm while an unrelated command's squashed
+    // stub commits on the same shard thread (DEBUG POPULATE while an inline SET is paused in
+    // AddLogRecord), or the loader's own lazy expiry reaching LocalMintFloor -- which is exactly
+    // why they are scoped rather than sweeping every arm regardless of owner. foreign_arms_seen
+    // (Stats, above) plus its diagnostic VLOG(1) (mvcc.cc) is a benign encounter counter, not a
+    // correctness gate: it counts how often that interleaving actually happens.
     // No default member initializer either, for the same reason `tombstone` above has none.
     util::fb2::detail::FiberInterface* owner;
   };

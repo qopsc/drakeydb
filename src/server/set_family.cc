@@ -1071,7 +1071,7 @@ OpStatus OpPop(const OpArgs& op_args, string_view key, unsigned count, cmn::Back
               }
             });
         if (found_tombstone) {
-          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+          DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
               << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
                  "about to run its generic per-arm sweep -- that sweep would floor the sibling "
                  "against this tombstone's own stamp instead of its real author stamp";
@@ -1775,7 +1775,7 @@ bool SetFamily::DeleteSetIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, st
               }
             });
         if (found_tombstone) {
-          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+          DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
               << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
                  "about to run its generic per-arm sweep -- that sweep would floor the sibling "
                  "against this tombstone's own stamp instead of its real author stamp";

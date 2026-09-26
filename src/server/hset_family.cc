@@ -1719,7 +1719,7 @@ bool HSetFamily::DeleteIfEmpty(DbSlice& db_slice, const DbContext& db_cntx, std:
               }
             });
         if (found_tombstone) {
-          DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
+          DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
               << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
                  "about to run its generic per-arm sweep -- that sweep would floor the sibling "
                  "against this tombstone's own stamp instead of its real author stamp";

@@ -3151,11 +3151,17 @@ string ServerFamily::FormatInfoMetrics(
         append("mvcc_clock_ahead_ms", m.mvcc_clock_ahead_ms);
         append("mvcc_unstamped_writes", m.mvcc_unstamped_writes);
         append("mvcc_stale_epoch", m.mvcc_stale_epoch);
-        // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: MvccStamper::Stats::foreign_arms_seen
-        // (mvcc.h) -- Commit/EndOfWriteEpoch/LocalMintFloor encountering, or CommitOwnTombstone's
-        // own scoped search skipping, an arm placed by a different fiber. Healthy operation keeps
-        // this at 0; a nonzero reading means their shared owner-agnostic design premise no longer
-        // holds. Same gate/aggregation path as its siblings above.
+        // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md:
+        // MvccStamper::Stats::foreign_arms_seen (mvcc.h) -- Commit/EndOfWriteEpoch/
+        // LocalMintFloor/CommitOwnTombstone (all scoped to the calling fiber's own arms)
+        // correctly skipping an arm placed by a DIFFERENT fiber, leaving it for its own owner.
+        // This is a BENIGN operational metric, not a correctness gate: a paused transaction's
+        // own arm can legitimately be seen and skipped while an unrelated command's squashed
+        // stub commits on the same shard thread (DEBUG POPULATE while an inline write is paused
+        // in AddLogRecord), or while the loader's own lazy expiry runs -- rising over time says
+        // how often that interleaving actually happens, nothing more. Counts ENCOUNTERS, not
+        // distinct arms: the same still-pending foreign arm can be seen (and counted again) by
+        // more than one of these four calls. Same gate/aggregation path as its siblings above.
         append("mvcc_foreign_arms_seen", m.mvcc_foreign_arms_seen);
         // drakeydb: P4-4 -- replicated writes the streaming LWW guard (multimaster_lww.h,
         // NoteLwwDrop) has dropped on this node's peer links. The counter itself lives on
