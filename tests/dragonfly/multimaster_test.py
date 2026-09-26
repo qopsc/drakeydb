@@ -3173,10 +3173,14 @@ async def test_expired_delta_veto_survives_three_node_cross_link_reorder(
          directly (converges there too); queued behind ITS OWN paused proxy toward A.
       5. The wall clock is advanced past D (a real sleep). B's INCR's own stamp still predates D --
          only "now", as read on whichever node processes it, has moved.
-      6. A's B-facing proxy alone is resumed: B's already-stamped, pre-D INCR is delivered to A's
-         still-live (now provably past-D, unreaped) slot. The veto's own lazy reap installs A's
-         local whole-key tombstone (this node's own {S, o+1}+D, unrelated to either B's or C's own
-         stamps), then drops the delta outright: A ends this step lacking the key.
+      6. A's B-facing proxy alone is resumed: B's already-stamped, pre-D INCR is delivered to A.
+         A's own copy is NOT still-live and unreaped at this point -- the plain `EXISTS k` check
+         run immediately after step 5's sleep (an ordinary read, not the veto) already lazily
+         reaped it, installing A's local whole-key tombstone (this node's own {S, o+1}+D, unrelated
+         to either B's or C's own stamps) one step earlier. The veto's own compare-and-drop runs
+         directly against that already-installed tombstone here: A ends this step lacking the key.
+         (The veto's own lazy reap of a still-live, unreaped slot is exercised elsewhere -- case
+         (c) of the unit suite -- not by this particular reorder.)
       7. A's C-facing proxy is THEN resumed too, and C's own DEL is drained through to A by
          ordinary streaming (not yet a full sync): C's DEL is a guarded write, and its own stamp
          (minted at C's real wall-clock DEL time, after every node's initial convergence) is newer
@@ -3388,6 +3392,12 @@ async def test_expired_delta_veto_reorder_residual_identical_stamp_split_survive
     await _pause_and_settle(proxy_ac, c_c, "settle-residual-c")
 
     assert await c_c.delete("k") == 1
+    # C's own local stamp for its DEL, captured before it propagates anywhere -- an explicit,
+    # meta-less tombstone (D-20's own RecordAbsentKeyRemoval fix) that this test later confirms A
+    # ends up holding VERBATIM (same mvcc, same origin), not merely "some" tombstone.
+    c_tomb_after_del = _parse_mvcc(await c_c.execute_command("debug", "mvcc", "k"))
+    assert c_tomb_after_del["state"] == "tombstone", c_tomb_after_del
+    assert c_tomb_after_del["meta"] == "0", c_tomb_after_del
 
     @assert_eventually(timeout=10)
     async def _b_sees_del():
@@ -3415,14 +3425,27 @@ async def test_expired_delta_veto_reorder_residual_identical_stamp_split_survive
     await c_c.set("drain-residual-2", "x")
     await wait_for_value(c_a, "drain-residual-2", "x")
     a_tomb = _parse_mvcc(await c_a.execute_command("debug", "mvcc", "k"))
+    # `state == "tombstone"` alone is also satisfied by A's OWN pre-drain tombstone (the veto's own
+    # lazy reap of its still-live copy, back at the "A must lazily expire" assert above) -- that one
+    # carries a whole-key D in `meta` and A's own origin, not C's. Pin the drop-in EXPLICITLY: meta
+    # must read back 0 (C's DEL installs a meta-less tombstone, D-20's own fix), and both mvcc and
+    # origin must match C's own post-DEL stamp captured above VERBATIM -- proving this is actually
+    # C's DEL that landed here, not merely "some" tombstone that happens to share the same state.
     assert a_tomb["state"] == "tombstone", a_tomb
+    assert a_tomb["meta"] == "0", a_tomb
+    assert a_tomb["mvcc"] == c_tomb_after_del["mvcc"], (a_tomb, c_tomb_after_del)
+    assert a_tomb["origin"] == c_tomb_after_del["origin"], (a_tomb, c_tomb_after_del)
 
     # B's SECOND INCR, deliberately with no EXPIRE after it -- the residual's own trigger.
     assert await c_b.incr("k") == 2
     b_stamp2 = _parse_mvcc(await c_b.execute_command("debug", "mvcc", "k"))
     assert b_stamp2["state"] == "value", b_stamp2
 
-    await c_c.set("drain-residual-3", "x")
+    # Drain B's own second INCR itself, not C's unrelated traffic: the INCR under test travels over
+    # B's OWN links (B->A and B->C), so the marker must be written on B and waited for on BOTH A and
+    # C -- writing it on C only drains C->A (and trivially C->C), which never serializes against a
+    # delayed B->A hop and can flake under exactly that delay.
+    await c_b.set("drain-residual-3", "x")
     await wait_for_value(c_a, "drain-residual-3", "x")
     await wait_for_value(c_c, "drain-residual-3", "x")
 
