@@ -67,9 +67,10 @@ async def assert_no_foreign_mvcc_arms(df_factory: DflyInstanceFactory):
             await c.aclose()
         seen = int(info.get("mvcc_foreign_arms_seen", 0))
         assert seen == 0, (
-            f"instance on port {instance.port} saw {seen} foreign MVCC arm(s) -- "
-            "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
-            "fiber's arm"
+            f"instance on port {instance.port} saw {seen} foreign MVCC arm encounter(s) during "
+            "this test -- 0 organic encounters expected: no test in this file deliberately "
+            "overlaps two fibers' own arms, so Commit/EndOfWriteEpoch/LocalMintFloor/"
+            "CommitOwnTombstone should never meet another fiber's arm here"
         )
 
 

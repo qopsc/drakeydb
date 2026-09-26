@@ -29,6 +29,13 @@ FIXED_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 # lifecycle churn. mvcc_foreign_arms_seen is absent from INFO replication entirely on a
 # non-active instance (server_family.cc gates it on IsActiveReplica()), so `.get(...)` below
 # reads back 0 for one, exactly like it should.
+#
+# Gates 0 ORGANIC encounters: no test in this file deliberately overlaps two fibers' own arms on
+# one shard thread, so none of them should ever make Commit/EndOfWriteEpoch/LocalMintFloor/
+# CommitOwnTombstone step over another fiber's still-pending arm. The metric is benign on its own
+# (Stats::foreign_arms_seen, mvcc.h) -- a nonzero reading here means two of this file's own fibers
+# unexpectedly overlapped their arms during the test, worth investigating, not that the scoping
+# mechanism itself is broken.
 @pytest.fixture(autouse=True)
 async def assert_no_foreign_mvcc_arms(df_factory: DflyInstanceFactory):
     yield
@@ -44,9 +51,10 @@ async def assert_no_foreign_mvcc_arms(df_factory: DflyInstanceFactory):
             await c.aclose()
         seen = int(info.get("mvcc_foreign_arms_seen", 0))
         assert seen == 0, (
-            f"instance on port {instance.port} saw {seen} foreign MVCC arm(s) -- "
-            "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
-            "fiber's arm"
+            f"instance on port {instance.port} saw {seen} foreign MVCC arm encounter(s) during "
+            "this test -- 0 organic encounters expected: no test in this file deliberately "
+            "overlaps two fibers' own arms, so Commit/EndOfWriteEpoch/LocalMintFloor/"
+            "CommitOwnTombstone should never meet another fiber's arm here"
         )
 
 

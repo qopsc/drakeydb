@@ -714,11 +714,16 @@ void Transaction::RunCallback(EngineShard* shard) {
   // every DbSlice caches the same boot-time value regardless of namespace, so it does not matter
   // that this db_slice may be a non-default namespace's (see LogJournalOnShard/F1's comment).
   //
-  // This epoch is thread-local, not fiber- or transaction-local (MvccStamper::tlocal(), mvcc.h).
-  // Its correctness rests entirely on the running_tx_ serialization invariant enforced elsewhere:
-  // EngineShard::PollExecution and ::Heartbeat both refuse to proceed while running_tx_ is set
-  // (engine_shard.cc) -- only one Transaction's callback can be mid-flight on a given shard thread
-  // at a time, so "the epoch" and "this callback" coincide for as long as that invariant holds.
+  // armed_/arena_ are thread-local (MvccStamper::tlocal(), mvcc.h), but Commit/EndOfWriteEpoch
+  // are scoped to the CALLING fiber's own arms (D-14(b), ISSUE-REGISTER.md) -- never "every arm
+  // placed on this thread since the epoch began" -- so this call does not need running_tx_'s own
+  // at-most-one-callback-mid-flight invariant to hold, and in fact that invariant does not always
+  // hold: DEBUG POPULATE's own squashed-stub commit can run its EndOfWriteEpoch while an inline
+  // SET on this same shard thread is paused mid-callback inside AddLogRecord (journal.cc), its
+  // own arm still pending (CommitScopingKeepsDebugPopulateFromStampingAPausedSet,
+  // multi_master_test.cc). That paused SET's arm belongs to a DIFFERENT fiber, so this call
+  // leaves it exactly as it was, for that fiber's own, later EndOfWriteEpoch/Commit to process --
+  // see Stats::foreign_arms_seen (mvcc.h) for the metric counting exactly that encounter.
   auto& db_slice = GetDbSlice(shard->shard_id());
   const bool mvcc_enabled = db_slice.mvcc_enabled();
   // drakeydb: P4-3 Task 2 review fix (I3) -- &db_slice, not [=this]/by-value: rolls back any
@@ -1845,9 +1850,13 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   // function has none for LogAutoJournalOnShard/MaybeInvokeTrackingCb either), and this function
   // -- unlike RunCallback -- has no catch (std::exception&) at all, so a non-bad_alloc throw from
   // cb() propagates immediately. Gated on mvcc_enabled for the same reason as RunCallback (avoids
-  // the non-inlinable MvccStamper::tlocal() call on a non-active node). This epoch is
-  // thread-local, not fiber- or transaction-local -- see RunCallback's comment for the
-  // running_tx_ serialization invariant this relies on.
+  // the non-inlinable MvccStamper::tlocal() call on a non-active node). armed_/arena_ are
+  // thread-local, but this call's own EndOfWriteEpoch is scoped to THIS fiber's own arms
+  // (D-14(b), ISSUE-REGISTER.md) -- see RunCallback's comment above for why that scoping, not any
+  // at-most-one-callback-mid-flight invariant, is what makes this safe: this is precisely the
+  // squashed-stub commit RunCallback's own comment names (DEBUG POPULATE's DoPopulateBatch,
+  // debugcmd.cc), which can run this very call while a DIFFERENT, unrelated inline command is
+  // paused elsewhere on this same shard thread with its own arm still pending.
   const bool mvcc_enabled = db_slice.mvcc_enabled();
   // drakeydb: P4-3 Task 2 review fix (I3) -- see RunCallback's identical comment above for why
   // &db_slice is always the right target here too.
