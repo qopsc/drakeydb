@@ -5493,9 +5493,9 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverFiresWithGuardOff) {
 // Falsifying: removing BOTH checks together (IsStringOnlyDelta's own early-return AND
 // IsWholeKeyTtlChanging's, ShouldDropExpiredDelta, transaction.cc) makes the counter advance for
 // BOTH sub-cases below instead of staying flat -- removing either ALONE has no observable effect
-// here, since the other still excludes them (confirmed directly: removing only
-// IsWholeKeyTtlChanging's check left this test green, because IsStringOnlyDelta's own check ran
-// first and already excluded both names).
+// here, since the other still excludes them: removing only IsWholeKeyTtlChanging's check leaves
+// this test green, because IsStringOnlyDelta's own check runs first and already excludes both
+// names.
 TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnDenyListedTtlCommands) {
   constexpr uint32_t kPeerIdx = 208;
   const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000208");
@@ -5579,9 +5579,51 @@ TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnMultiKeySameShardDelta) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
-// drakeydb: P4-5 -- the Critical regression this allow-list exists to fix: gating the veto on
-// kUnguarded alone (its original shape) let it drop ANY single-key unguarded handler's callback,
-// including container-element deltas that were never a string in the first place. Against a
+// drakeydb: P4-5 -- case (k): CL.THROTTLE is deliberately NOT on IsStringOnlyDelta's own
+// allow-list (multimaster_lww.h/.cc), even though it is an OBJ_STRING-only delta and would
+// otherwise be crash-safe like every other allow-listed name: a non-limited call always sets or
+// extends its OWN key's TTL (`AddExpire`/`AddNew` with `new_tat_ms`, string_family.cc's own
+// Throttle), so the author's own copy of the key never actually vanishes at D the way this veto's
+// soundness premise (this function's own header comment, above) requires. A guarded CL.THROTTLE
+// authored strictly before an existing string's whole-key deadline D must therefore still apply
+// here exactly as an ordinary unguarded delta would with no veto at all.
+//
+// Falsifying: temporarily re-adding "CL.THROTTLE" to kStringOnlyDeltaNames (multimaster_lww.cc)
+// makes the call below get wrongly dropped instead of applied: `Run({"exists", key})` observes 0
+// instead of 1, and the counter wrongly advances instead of staying flat.
+TEST_F(MvccStoreTest, ExpiredDeltaVetoNeverActsOnClThrottleDespiteOlderAuthorStamp) {
+  constexpr uint32_t kPeerIdx = 211;
+  const uint64_t peer_hash = NodeUuidHash("6f1c4c3e-b0b0-4000-8000-000000000211");
+  RegisterPeerOriginHash(kPeerIdx, peer_hash);
+
+  const std::string key = "evd_k_clthrottle";
+  const uint64_t deadline_ms = TEST_current_time_ms + 10;
+  ASSERT_EQ(Run({"set", key, "5", "px", "10"}), "OK");
+  AdvanceTime(50);
+  ASSERT_EQ(Run({"exists", key}).GetInt(), 0) << "guard against a vacuous pass -- must be reaped "
+                                                 "before the delta ever arrives";
+  ASSERT_EQ(TombMetaOf(key), deadline_ms) << "sanity: a whole-key D from the earlier string expiry";
+
+  const uint64_t pre_dropped = TotalExpiredDeltaDropped();
+  const uint64_t author_mvcc = (deadline_ms - 1) << MvccClock::kCounterBits;  // I < D
+
+  auto res = ApplyReplicatedCommand({"cl.throttle", key, "4", "1", "10"}, kPeerIdx, author_mvcc,
+                                    /*lww_guard=*/true);
+  EXPECT_EQ(res, facade::DispatchResult::OK);
+
+  EXPECT_EQ(Run({"exists", key}).GetInt(), 1)
+      << "CL.THROTTLE must apply -- it is not on the allow-list, so the veto never engages";
+  EXPECT_GT(Run({"pttl", key}).GetInt(), 0)
+      << "CL.THROTTLE always writes its own TTL on the receiver -- D-27's TTL-less re-create "
+         "cannot happen with it regardless of whether the veto would have fired";
+  EXPECT_EQ(TotalExpiredDeltaDropped(), pre_dropped) << "must not be counted as a drop";
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
+// drakeydb: P4-5 -- the failure mode this allow-list exists to fix: gating the veto on
+// kUnguarded alone (its original shape, before this allow-list existed) let it drop ANY
+// single-key unguarded handler's callback, including container-element deltas that were never a
+// string in the first place. Against a
 // STRING's own whole-key deadline tombstone with I.ms < D, a container delta targeting that SAME
 // key name is a guaranteed misfire if ever vetoed -- the author's own copy could only have
 // journaled it against a value that was not the expiring string -- and at least two of the five
@@ -9517,10 +9559,19 @@ namespace {
 // guard never compares it. Built by enumerating the live command registry (RegistryClosure
 // below) and reviewed one family at a time:
 //
-//  - numeric/string delta RMW (APPEND, BITFIELD, CL.THROTTLE, DECR, DECRBY, INCR, INCRBY,
-//    INCRBYFLOAT, PREPEND, SETBIT, SETRANGE): reads whatever is currently stored and composes the
-//    client's own args onto it -- a stale replay re-applies the SAME delta, never a blind clobber
-//    of unrelated newer content.
+//  - numeric/string delta RMW (APPEND, BITFIELD, DECR, DECRBY, INCR, INCRBY, INCRBYFLOAT, PREPEND,
+//    SETBIT, SETRANGE): reads whatever is currently stored and composes the client's own args onto
+//    it -- a stale replay re-applies the SAME delta, never a blind clobber of unrelated newer
+//    content.
+//  - CL.THROTTLE is NOT a plain instance of the bullet above, despite also being journaled
+//    verbatim against an OBJ_STRING bucket: its own op function (Throttle, string_family.cc)
+//    recomputes the bucket's new TAT from the RECEIVER's own wall-clock `now_ns`, not merely from
+//    whatever is currently stored plus the client's own args -- the whole-key counterpart of D-28's
+//    already-registered member-TTL replay (ISSUE-REGISTER.md). A stale replay therefore does NOT
+//    re-apply the identical delta the author computed; it recomputes a new one against this node's
+//    own clock. Still safe to leave unguarded regardless: the bucket only ever tracks this key's
+//    own rate, so a stale replay still never clobbers unrelated newer content, only redoes this
+//    key's own rate-limit accounting against a different `now`.
 //  - container element delta RMW, touching one member/field/path/entry and leaving the rest of
 //    the key's value untouched (BF.ADD, BF.MADD, CF.ADD, CF.COMPACT, CF.DEL, CF.INSERT,
 //    CMS.INCRBY, FIELDEXPIRE, GEOADD, HDEL, HEXPIRE, HGETEX, HINCRBY, HINCRBYFLOAT, HMSET, HSET,
@@ -11705,8 +11756,8 @@ TEST_F(OriginJournalFamilyTest, SquashedStubInheritsParentOrigin) {
 // ShouldDropForLww, which never reaches its own GetShardArgs call for a squasher's own name at all
 // (never kSingleKey either). IsStringOnlyDelta's own allow-list check already excludes "EXEC" on
 // its own (checked before the SQUASHER guard), so removing the SQUASHER guard ALONE, with the
-// allow-list intact, changes nothing observable here -- confirmed directly: this test still
-// passes with only that guard removed. Removing BOTH checks together is what reaches GetShardArgs
+// allow-list intact, changes nothing observable here: this test still passes with only that guard
+// removed. Removing BOTH checks together is what reaches GetShardArgs
 // on the squasher container itself, which DCHECKs against exactly that (transaction.cc's own
 // GetShardArgs) -- this test then died with the WRONG message (`Check failed: !multi_ ||
 // multi_->role != SQUASHER`) instead of the one asserted above, and EXPECT_DEBUG_DEATH reported
