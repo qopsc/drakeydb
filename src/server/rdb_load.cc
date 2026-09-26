@@ -3931,7 +3931,31 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     // value the fast-path check above used -- including, per Task 13, a classic-PSYNC unstamped
     // key's ctime-derived stamp -- so this recheck applies uniformly to every key merge_lww_
     // covers, with no bypass for any of them.
-    if (!MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming)) {
+    const std::optional<MvccStamp> stored = db_slice->GetMvcc(db_cntx.db_index, item->key);
+    // drakeydb: P4-5 -- `stored` may be a DIFFERENT fiber's still-uncommitted {kTombstoneBit, 0}
+    // placeholder (PerformDeletionAtomic's synchronous pre-commit write, db_slice.cc) for an
+    // inline client DEL that yielded in AddLogRecord: AddOrFind's own insert branch above found
+    // no live prime entry (the DEL already erased it) and force-inserted a fresh one, and
+    // MergeAccepts(stored, incoming) trivially accepts (Mvcc()==0 is the strict minimum) since the
+    // placeholder is not the DEL's real stamp. Left unrefused, SetMvcc below would turn the slot
+    // live (mvcc_tombstones down by one), and the DEL's own later Commit() would then call
+    // SetExistingMvcc on that now-LIVE slot -- not missing, so no CHECK(!it.is_done()) there, but
+    // it re-tombstones a slot the loader just made live (mvcc_tombstones back up by one) while
+    // `prime` still holds the loader's value: the dense invariant (mvcc->size() - mvcc_tombstones
+    // == prime.size()) breaks, caught by TEST_VerifyMvccTable/OnCbFinishBlocking's own CHECKs in a
+    // debug build, silent parity corruption in a release one. Same predicate and same counter as
+    // the tombstone installs (IsArmedByAnyFiber() && !OwnsArm(), db_slice.cc/rdb_load.cc): a
+    // placeholder with no arm at all, or one this fiber itself owns, is not refused.
+    const bool foreign_placeholder =
+        stored.has_value() && stored->IsTombstone() && stored->Mvcc() == 0 &&
+        MvccStamper::tlocal()->IsArmedByAnyFiber(db_cntx.db_index, item->key) &&
+        !MvccStamper::tlocal()->OwnsArm(db_cntx.db_index, item->key);
+    if (foreign_placeholder || !MergeAccepts(stored, incoming)) {
+      if (foreign_placeholder) {
+        ++db_slice->MutableStats(db_cntx.db_index)->mvcc_foreign_placeholder_skips;
+        VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db="
+                << db_cntx.db_index << " key=" << item->key;
+      }
       if (updater.is_new) {
         // drakeydb: fix round 1 (M2) -- a FRESH insert can be rejected two ways, both landing here
         // with is_new == true: (1) a concurrent apply tombstoned this exact, previously-absent key,
@@ -4004,6 +4028,11 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   // so installing it verbatim here (exactly as the pre-Task-13 code always did) is correct with no
   // further special-casing -- unlike Task 12's withdrawn rule, which minted a SEPARATE stamp here
   // that the compares above never actually saw.
+  //
+  // drakeydb: P4-5 -- a non-merge load (merge_lww_ false: this node's own startup/DEBUG RELOAD)
+  // reaches this call with no foreign-placeholder check at all -- only the merge_lww_ branch
+  // above has one. The same race is possible in principle on an active node running a non-merge
+  // load, but is not refused here.
   db_slice->SetMvcc(db_cntx.db_index, item->key, incoming);
 
   if (!override_existing_keys_ && !updater.is_new) {
@@ -4663,17 +4692,16 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
           const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
           // drakeydb: P4-5 -- the same foreign-placeholder refusal as
           // DbSlice::InstallAbsentKeyTombstone (db_slice.cc/.h has the full account of the
-          // CHECK(!it.is_done()) abort this closes): a non-merge load's own callback is dispatched
-          // onto this shard's queue exactly like the merge one is, so it can just as easily land
-          // while a client DEL's placeholder for this same key is still uncommitted. Unreachable
-          // in practice for THIS specific loader path today (D-7: a non-merge load never compares
-          // against a resident value it might delete, so a peer tombstone here never overwrites a
-          // LIVE key), but a placeholder is not a live key -- it is exactly the shape this
-          // callback CAN meet -- and the refusal is cheap, so it applies here too rather than
-          // trusting that no caller ever adds one. IsArmedByAnyFiber() && !OwnsArm(), not OwnsArm()
-          // alone, for the same reason InstallAbsentKeyTombstone's own comment gives: this
-          // callback never arms anything of its own, so OwnsArm() is always false here regardless,
-          // and only a genuinely foreign arm (IsArmedByAnyFiber() true) should ever refuse.
+          // CHECK(!it.is_done()) abort this closes). This callback is dispatched onto this
+          // shard's queue exactly like the merge one is, so it CAN meet a foreign placeholder the
+          // same way: a client DEL's {kTombstoneBit, 0} placeholder for this exact key, still
+          // uncommitted when this callback runs (e.g. this node's own tombstone section, reloaded
+          // during a DEBUG RELOAD that races ordinary client traffic on this shard). The refusal
+          // is cheap, so it applies here too rather than assuming this record shape never
+          // collides with one in practice. IsArmedByAnyFiber() && !OwnsArm(), not OwnsArm() alone,
+          // for the same reason InstallAbsentKeyTombstone's own comment gives: this callback never
+          // arms anything of its own, so OwnsArm() is always false here regardless, and only a
+          // genuinely foreign arm (IsArmedByAnyFiber() true) should ever refuse.
           if (existing.has_value() && existing->IsTombstone() && existing->Mvcc() == 0 &&
               MvccStamper::tlocal()->IsArmedByAnyFiber(db_index, key) &&
               !MvccStamper::tlocal()->OwnsArm(db_index, key)) {

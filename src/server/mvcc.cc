@@ -276,8 +276,10 @@ bool MvccStamper::OwnsArm(DbIndex db_index, std::string_view key) const {
 }
 
 // drakeydb: P4-5 -- see the declaration (mvcc.h) for the why. Same no-allocation/no-mutation
-// shape as OwnsArm above, minus the owner conjunct -- armed_.empty() is checked first so a shard
-// thread with nothing armed at all (the common case) never even reads FiberActive().
+// shape as OwnsArm above, minus the owner conjunct -- so, unlike OwnsArm, this never reads
+// FiberActive() at all, in every case, not only the empty one. armed_.empty() is checked first
+// so a shard thread with nothing armed at all (the common case) skips even the O(armed_.size())
+// scan below.
 bool MvccStamper::IsArmedByAnyFiber(DbIndex db_index, std::string_view key) const {
   if (armed_.empty())
     return false;

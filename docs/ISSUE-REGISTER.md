@@ -406,8 +406,8 @@ to interleave inside one shard thread's yield. Closing it properly needs arm ide
 token on each arm, so `Disarm` can only cancel its own), not a narrower scope.
 
 **How established:** static reading during P4-3 Task 13's review and re-confirmed in the final
-whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyDoesNot
-StealConcurrentArm` pins the half that IS closed.
+whole-branch review; not reproduced. `RdbMvccTest.MergeLwwTombstoneInstallForAbsentKeyRefusesTo
+OverwriteConcurrentPlaceholder` pins the half that IS closed.
 
 **Owner:** unassigned; needs per-arm ownership in `MvccStamper`. **From:** P4-3 Tasks 6/13, final
 review.

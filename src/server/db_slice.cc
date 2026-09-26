@@ -3364,19 +3364,19 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // runs, erasing the placeholder here would make the eventual SetExistingMvcc CHECK-fail ("MVCC
 // slot must be prepared before journal commit") the moment the delete's own commit resumes.
 // Guarded below by requiring Mvcc() != 0: MvccClock::Next never mints 0 for any real now_ms (see
-// mvcc.h), so this is true for every committed tombstone and false only for this placeholder,
-// which resolves into either a committed stamp (Commit()) or an erase (EndOfWriteEpoch's
-// rollback) once its own arm is processed -- skipping it here never leaks it; a later tick reaps
-// it once it is a real, committed tombstone with a real deadline. That resolution is not
-// automatic by the end of the epoch that created it: a peer-sourced install competing for the
-// same slot (DbSlice::InstallAbsentKeyTombstone, the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2)
-// install, rdb_load.cc) now refuses outright whenever it finds this exact placeholder shape owned
-// by a DIFFERENT fiber, rather than overwriting it with a real stamp before that fiber's own
-// Commit()/rollback ever runs -- without that refusal, Mvcc() would go non-zero here while the
-// arm was still pending, and this step would then reap a slot its own owner had not yet resolved.
-// The per-key check just below is the second, independent barrier against exactly that: it never
-// erases a slot any fiber still has an arm on, Mvcc()==0 or not, so a future producer that skips
-// the install-side refusal still cannot make this step race a pending Commit()/rollback.
+// mvcc.h), so this is true for every committed tombstone and false only for this placeholder. The
+// placeholder always resolves inside its owner's epoch, into either a committed stamp (Commit())
+// or an erase (EndOfWriteEpoch's rollback) -- that part is unconditional and always was. What is
+// NOT unconditional is that it keeps its Mvcc()==0 SHAPE intact until then: a peer-sourced install
+// competing for the same slot (DbSlice::InstallAbsentKeyTombstone, the non-merge
+// RDB_OPCODE_DF_TOMBSTONES(_V2) install, and RdbLoader::CreateObjectOnShard's own merge-load live
+// install, all rdb_load.cc) could overwrite it with a real-looking stamp first, letting this step
+// reap a slot its own owner had not yet resolved. Those three now refuse that overwrite outright
+// whenever they find this exact placeholder shape owned by a DIFFERENT fiber -- that refusal is
+// what keeps the Mvcc()==0 discriminator below meaningful in the first place. The per-key check
+// just below is defence in depth on top of it, not a substitute for it: it never erases a slot
+// any fiber still has an arm on, Mvcc()==0 or not, so a future producer that skips the
+// install-side refusal still cannot make this step race a pending Commit()/rollback.
 //
 // drakeydb: review fix (I1) -- Mvcc() != 0 is a property of the VALUES every current committed-
 // tombstone producer happens to mint (MvccClock::Next never returns 0 for any real now_ms), not
@@ -3497,13 +3497,17 @@ bool DbSlice::TombstoneGcStep() {
           // An arm surviving alongside a non-placeholder Mvcc() here means some caller installed
           // a real-looking stamp over a slot whose delete had not yet actually committed;
           // erasing it now would still make that delete's own eventual SetExistingMvcc abort on
-          // CHECK(!it.is_done()) once it resumes. Skip and revisit on a later lap instead --
+          // CHECK(!it.is_done()) once it resumes. Skip, exactly like the Mvcc()==0 check above --
+          // NOT `pending = true`: that arm resolving is not this call's own budget/quota running
+          // out, and this step gets no signal for when it eventually does, so marking pending here
+          // would make the on-idle wrapper (this function's declaration comment) map every single
+          // call into kOnIdleMaxLevel for as long as the arm stays pending, the exact zero-progress
+          // busy-spin `budget == 0` guards against above. The slot is revisited on whichever LATER
+          // lap this cursor naturally reaches it again, the same as the Mvcc()==0 case.
           // IsArmedByAnyFiber's own armed_.empty() fast path (mvcc.h/.cc) keeps this free when
           // nothing on this shard thread is armed at all, which is the overwhelming common case.
-          if (MvccStamper::tlocal()->IsArmedByAnyFiber(db_ind, key)) {
-            pending = true;
+          if (MvccStamper::tlocal()->IsArmedByAnyFiber(db_ind, key))
             return;
-          }
           EraseMvcc(db_ind, key);
         }
       });
