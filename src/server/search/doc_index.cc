@@ -711,6 +711,17 @@ void ShardDocIndex::RestoreGlobalVectorIndices(std::string_view index_name, cons
       ++deferred_updates;
     }
 
+    // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: this loop runs on the IndexBuilder's own
+    // short-lived fiber (index_builder.cc's VectorLoop), which never journals a COMMAND entry,
+    // ends a write epoch, or disarms this key itself -- RunWithoutMvccArm still finalizes memory
+    // accounting/notifications/indexes exactly as the AutoUpdater's default Run() would, but
+    // skips the MVCC arm PostUpdate would otherwise place. An arm this fiber placed and never
+    // terminated would sit in MvccStamper::tlocal()'s armed_ forever (an orphan, since the
+    // scoped Commit/EndOfWriteEpoch only ever process the CALLING fiber's own arms): arena_ would
+    // never empty for it, and a LATER, unrelated fiber reusing this exact FiberInterface address
+    // could adopt and mis-commit it with its own mint.
+    it->post_updater.RunWithoutMvccArm();
+
     // Yield periodically to avoid blocking the fiber
     if (++processed % 1000 == 0) {
       util::ThisFiber::Yield();
@@ -796,6 +807,12 @@ void ShardDocIndex::DrainPendingVectorUpdates(const OpArgs& op_args) {
           AddDocToGlobalVectorIndex(*doc_id, op_args.db_cntx, &pv);
         }
       }
+
+      // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: same reason as RestoreGlobalVectorIndices's
+      // own identical call, above -- this runs on the shard's queue fiber
+      // (DrainSerializationUpdates/ PerformPostLoad's own callers), with no COMMAND journal entry
+      // or write-epoch end of its own to ever terminate the arm PostUpdate would otherwise place.
+      it->post_updater.RunWithoutMvccArm();
     } else if (local_id) {
       RemoveFromAllHnswIndices(*local_id);
       key_index_.Remove(*local_id);

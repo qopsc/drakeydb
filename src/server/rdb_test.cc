@@ -2688,13 +2688,21 @@ class RdbMvccTest : public RdbTest {
   // this fixture gets it for free. Read BEFORE BaseFamilyTest::TearDown() tears the shard threads
   // down, the same ordering constraint that fixture's own TotalForeignArmsSeen() needs.
   void TearDown() override {
+    // Gates 0 ORGANIC encounters: no test in this fixture deliberately overlaps two fibers' own
+    // arms on one shard thread, so none of them should ever make Commit/EndOfWriteEpoch/
+    // LocalMintFloor/CommitOwnTombstone step over another fiber's still-pending arm.
+    // foreign_arms_seen is a benign operational metric (Stats::foreign_arms_seen, mvcc.h), not a
+    // correctness gate on its own -- a nonzero count here means two of THIS fixture's own fibers
+    // unexpectedly overlapped their arms, worth investigating, not that the scoping itself is
+    // broken.
     std::atomic<uint64_t> foreign_arms_seen{0};
     shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
       foreign_arms_seen += MvccStamper::tlocal()->stats().foreign_arms_seen;
     });
     EXPECT_EQ(foreign_arms_seen.load(), 0u)
-        << "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
-           "fiber's arm in this fixture's own tests -- see D-14, ISSUE-REGISTER.md";
+        << "0 organic encounters expected: no test in this fixture deliberately overlaps two "
+           "fibers' own arms, so Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone should "
+           "never meet another fiber's arm here -- see D-14, ISSUE-REGISTER.md";
     RdbTest::TearDown();
   }
 
@@ -7073,6 +7081,75 @@ TEST_F(RdbMvccTest, V2MetaRescuesAWholeKeyDeadlineFromTheD16BornExpiredFalseRefu
       << "exactly two born-expired refusals (the 225 control and the still-expired V2 record) -- "
          "the rescued V2 record must not count";
   EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: the search HNSW-restore paths
+// (ShardDocIndex::RestoreGlobalVectorIndices, DrainPendingVectorUpdates; search/doc_index.cc) arm
+// keys through FindMutable/AutoUpdater on fibers that never call Commit/EndOfWriteEpoch/Disarm of
+// their own: RestoreGlobalVectorIndices runs on the IndexBuilder's own short-lived fiber
+// (index_builder.cc), DrainPendingVectorUpdates on the shard's queue fiber. Under the D-14(b)
+// scoped sweep, an arm placed there and never terminated would sit in armed_ forever (an orphan).
+// RunWithoutMvccArm() at both sites is the fix: it skips the MVCC arm step entirely, so PostUpdate
+// never places one for either fiber to leak. A real `dfly load` drives both paths --
+// RestoreGlobalVectorIndices while the RDB loads, DrainPendingVectorUpdates right after, once
+// every shard finishes restoring (ShardDocIndex::PerformPostLoad) -- so this proves armed_ is
+// empty, on every shard, once both have run, and that neither run counted as a foreign-arm
+// encounter for any other fiber's own Commit/EndOfWriteEpoch/LocalMintFloor either.
+//
+// Falsifying: commenting out either RunWithoutMvccArm() call (search/doc_index.cc) and rebuilding
+// makes armed_count assert non-zero below, since that site's own FindMutable-armed key is then
+// left for AutoUpdater's default Run() to arm and never terminated.
+TEST_F(RdbMvccTest, HnswRestoreLeavesNoOrphanedArm) {
+  ASSERT_TRUE(IsActiveReplica());
+
+  EXPECT_EQ(Run({"FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "embedding",
+                 "VECTOR", "HNSW", "6", "TYPE", "FLOAT32", "DIM", "2", "DISTANCE_METRIC", "L2"}),
+            "OK");
+
+  constexpr int kNumDocs = 20;
+  for (int i = 1; i <= kNumDocs; ++i) {
+    float x = static_cast<float>(i * 2 - 1);
+    float y = static_cast<float>(i * 2);
+    Run({"HSET", StrCat("doc:", i), "embedding", StrCat(FloatToBytes(x), FloatToBytes(y))});
+  }
+
+  std::atomic<uint64_t> foreign_arms_before{0};
+  shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+    foreign_arms_before += MvccStamper::tlocal()->stats().foreign_arms_seen;
+  });
+
+  EXPECT_EQ(Run({"save", "df"}), "OK");
+  auto save_info = service_->server_family().GetLastSaveInfo();
+
+  // Reload drives RestoreGlobalVectorIndices (IndexBuilder fiber) and, once every shard's
+  // restore completes, DrainPendingVectorUpdates (shard queue fiber) -- both of this test's fix
+  // sites.
+  EXPECT_EQ(Run({"dfly", "load", save_info.file_name}), "OK");
+
+  auto is_indexing_done = [this] {
+    auto resp = Run({"FT.INFO", "idx"});
+    auto arr = resp.GetVec();
+    auto it = rng::find_if(arr, [](const auto& e) { return e == "indexing"; });
+    return it != arr.end() && (++it)->GetInt() == 0;
+  };
+  ASSERT_TRUE(
+      WaitUntilCondition([&] { return is_indexing_done(); }, std::chrono::milliseconds(10000)));
+
+  EXPECT_EQ(CheckedInt({"dbsize"}), kNumDocs);
+
+  std::atomic<uint64_t> armed_count{0};
+  std::atomic<uint64_t> foreign_arms_after{0};
+  shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+    armed_count += MvccStamper::tlocal()->ArmedCount();
+    foreign_arms_after += MvccStamper::tlocal()->stats().foreign_arms_seen;
+  });
+  EXPECT_EQ(armed_count.load(), 0u)
+      << "RestoreGlobalVectorIndices/DrainPendingVectorUpdates must leave no orphaned arm on the "
+         "IndexBuilder fiber or the shard queue fiber -- see RunWithoutMvccArm's own comment at "
+         "both call sites, search/doc_index.cc";
+  EXPECT_EQ(foreign_arms_after.load(), foreign_arms_before.load())
+      << "restoring an HNSW index must not itself count as a foreign-arm encounter for any "
+         "other fiber's own Commit/EndOfWriteEpoch/LocalMintFloor";
 }
 
 // drakeydb: P4-5 -- the V2 counterpart to LoadConsumesAndDiscardsTombstoneSectionWhenInactive
