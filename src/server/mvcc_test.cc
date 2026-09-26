@@ -14,9 +14,13 @@
 #include <vector>
 
 #include "base/gtest.h"
+#include "base/logging.h"  // DCHECK_EQ
 #include "common/backed_args.h"
 #include "server/multimaster_lww.h"
 #include "server/table.h"
+// drakeydb: P4-5 -- D-14(a): only for util::fb2::detail::FiberActive()/FiberInterface, to pin
+// what it returns on the plain gtest main thread this whole suite runs on (no fiber scheduler).
+#include "util/fibers/detail/fiber_interface.h"
 
 namespace dfly {
 
@@ -953,6 +957,75 @@ TEST(MvccStamperTest, CommitOwnTombstoneDelegatesToExpiryTombstoneForAtTheStampM
       << "the arm's own prior origin_hash (111) must be advanced by exactly one tick, never "
          "reused verbatim and never replaced by this stamper's self hash";
 }
+
+// ---------------------------------------------------------------------------
+// D-14(a), ISSUE-REGISTER.md: Armed::owner (mvcc.h) records util::fb2::detail::FiberActive() at
+// arm time, and Disarm/CommitOwnTombstone's search/Arm()'s own placeholder-inheritance scan/
+// LocalMintFloor all restrict themselves to arms owned by the CALLING fiber. Every TEST above and
+// below runs on the plain gtest main thread, with no fiber scheduler ever running -- before
+// relying on that leaving them unaffected, this pins what FiberActive() actually returns there. A
+// genuinely different, concurrently-pending fiber's arm needs a real fiber scheduler to exist at
+// all, which is what multi_master_test.cc's own *IsScopedToTheOwningFiber tests supply.
+// ---------------------------------------------------------------------------
+
+// It is never null: the first call on any thread lazily constructs a MainFiberImpl standing in
+// for that thread's own execution context (TL_FiberInitializer's constructor,
+// helio/util/fibers/detail/fiber_interface.cc) and caches it in a thread_local for the rest of
+// that thread's life -- there is no "no active fiber" state to special-case here. It is also
+// stable: nothing on the gtest main thread ever switches fibers (no scheduler runs there), so
+// every arm any TEST in this binary ever places -- across this whole suite, not just within one
+// TEST body -- shares the exact same owner value.
+TEST(MvccStamperTest, FiberActiveIsStableAndNonNullOnThePlainGtestMainThread) {
+  util::fb2::detail::FiberInterface* first = util::fb2::detail::FiberActive();
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(util::fb2::detail::FiberActive(), first) << "stable across repeated calls";
+
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "k", MvccStamp{});
+  EXPECT_TRUE(s->OwnsArm(0, "k"))
+      << "this test's own arm must be owned by the same FiberActive() value read above";
+}
+
+TEST(MvccStamperTest, OwnsArmReflectsThisFibersOwnArmsOnly) {
+  MvccStamper* s = FreshStamper();
+  EXPECT_FALSE(s->OwnsArm(0, "k")) << "nothing armed yet";
+
+  s->Arm(0, "k", MvccStamp{});
+  EXPECT_TRUE(s->OwnsArm(0, "k"));
+  EXPECT_FALSE(s->OwnsArm(0, "other")) << "a different key must not match";
+  EXPECT_FALSE(s->OwnsArm(1, "k"))
+      << "a different db_index must not match, matching Disarm's own db_index scoping";
+
+  s->Disarm(0, "k");
+  EXPECT_FALSE(s->OwnsArm(0, "k")) << "gone once disarmed";
+}
+
+// The regression case the derived-DEL DCHECK sites (db_slice.cc, set_family.cc, hset_family.cc)
+// rely on now that they call OwnedArmedCount() instead of ArmedCount(): with only one fiber ever
+// having armed anything on this thread, the two counts must agree.
+TEST(MvccStamperTest, OwnedArmedCountMatchesArmedCountOnASingleFiber) {
+  MvccStamper* s = FreshStamper();
+  EXPECT_EQ(s->OwnedArmedCount(), 0u);
+  s->Arm(0, "k1", MvccStamp{});
+  s->ArmTombstone(0, "k2", MvccStamp{});
+  EXPECT_EQ(s->OwnedArmedCount(), s->ArmedCount());
+  EXPECT_EQ(s->OwnedArmedCount(), 2u);
+}
+
+#ifndef NDEBUG
+// drakeydb: P4-5 -- D-14(a): pins the exact pattern pasted at each rdb_load.cc loader-callback
+// exit (FlushShardAsync's shard_set->Add lambda, HandleTombstones' install lambda): a key still
+// armed at that point trips the DCHECK, regardless of which fiber armed it -- the loader never
+// calls EndOfWriteEpoch itself, and EngineShard::queue_ has exactly one consumer fiber shared by
+// every tx hop and every such callback, so a leaked arm would sit there, still "owned" by that
+// same fiber identity, for whatever unrelated task the queue runs on it next.
+TEST(MvccStamperDeathTest, OwnedArmedCountTripsTheLoaderCallbackExitDcheckPattern) {
+  MvccStamper* s = FreshStamper();
+  s->Arm(0, "leaked", MvccStamp{});
+  EXPECT_DEBUG_DEATH(DCHECK_EQ(s->OwnedArmedCount(), 0u) << "loader callback exit",
+                     "loader callback exit");
+}
+#endif  // NDEBUG
 
 // ---------------------------------------------------------------------------
 // multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). These tests

@@ -13624,4 +13624,218 @@ TEST_F(ReaperJournalFamilyTest, MemberExpiryReaperUnclearedFlagPreservesTtlAcros
          "(no-TTL) type";
 }
 
+// ---------------------------------------------------------------------------
+// D-14(a), ISSUE-REGISTER.md: MvccStamper::tlocal()'s armed_ is a per-THREAD singleton, shared by
+// every fiber that ever runs on that thread. A lightweight fixture, unlike MvccStoreTest above --
+// MvccStamper::tlocal() needs no DbSlice/EngineShard at all, only a real fiber scheduler, which
+// mvcc_test.cc's plain TESTs never have (see
+// FiberActiveIsStableAndNonNullOnThePlainGtestMainThread, mvcc_test.cc). One proactor is enough:
+// every test below launches exactly two fibers on it, standing in for the two concrete fibers D-14
+// names sharing one shard thread's MvccStamper::tlocal() -- the RDB merge loader's own
+// shard_set->Add callback, which yields inside FindMutable (rdb_load.cc), and an inline transaction
+// yielding in journal throttling.
+// ---------------------------------------------------------------------------
+class MvccOwnershipFiberTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+#ifdef __linux__
+    if (absl::GetFlag(FLAGS_force_epoll)) {
+      pp_.reset(util::fb2::Pool::Epoll(1));
+    } else {
+      pp_.reset(util::fb2::Pool::IOUring(16, 1));
+    }
+#else
+    pp_.reset(util::fb2::Pool::Epoll(1));
+#endif
+    pp_->Run();
+  }
+  void TearDown() override {
+    pp_->Stop();
+    pp_.reset();
+  }
+  std::unique_ptr<util::ProactorPool> pp_;
+};
+
+// Disarm must act only on the CALLING fiber's own arms. Fiber A arms "k" and blocks (standing in
+// for the loader's own yield). While A is blocked, fiber B arms its OWN, separate arm for the
+// exact same key and calls Disarm(0, "k") -- exactly what an unconditional, or (db_index,
+// key)-only-scoped, Disarm would do to a concurrent fiber's in-flight arm. Only B's own arm may
+// be affected; A's must survive untouched.
+//
+// Falsifying: dropping the owner conjunct from Disarm's match condition (mvcc.cc) makes B's
+// Disarm(0, "k") erase A's arm too -- armed_after_b comes back 0, not 1, and a_survived_after_b
+// comes back false.
+TEST_F(MvccOwnershipFiberTest, DisarmIsScopedToTheOwningFiber) {
+  util::fb2::Done a_armed, resume_a;
+  bool a_survived_after_b = false;
+  bool b_owned_before_disarm = false;
+  bool b_owned_after_disarm = false;
+  size_t armed_after_b = 0;
+
+  const MvccStamp kAPrev{0x1111, 0xAAAAu};
+  const MvccStamp kBPrev{0x2222, 0xBBBBu};
+
+  util::fb2::Fiber fiber_a = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->ArmTombstone(0, "k", kAPrev);
+    a_armed.Notify();
+    resume_a.Wait();
+    a_survived_after_b = MvccStamper::tlocal()->OwnsArm(0, "k");
+    MvccStamper::tlocal()->Disarm(0, "k");  // cleanup on the same fiber that armed it
+  });
+
+  a_armed.Wait();
+
+  util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->ArmTombstone(0, "k", kBPrev);
+    b_owned_before_disarm = MvccStamper::tlocal()->OwnsArm(0, "k");
+    MvccStamper::tlocal()->Disarm(0, "k");
+    b_owned_after_disarm = MvccStamper::tlocal()->OwnsArm(0, "k");
+    armed_after_b = MvccStamper::tlocal()->ArmedCount();
+  });
+  fiber_b.Join();
+
+  resume_a.Notify();
+  fiber_a.Join();
+
+  EXPECT_TRUE(b_owned_before_disarm);
+  EXPECT_FALSE(b_owned_after_disarm) << "B's own arm must be gone after its own Disarm(0, \"k\")";
+  EXPECT_EQ(armed_after_b, 1u)
+      << "B's Disarm(0, \"k\") must remove only B's own arm, leaving A's still pending";
+  EXPECT_TRUE(a_survived_after_b)
+      << "A's own pending arm must survive a different fiber's Disarm(0, \"k\") call for the "
+         "same key";
+}
+
+// CommitOwnTombstone's search must also match only the CALLING fiber's own tombstone arm. Same
+// two-fiber shape as DisarmIsScopedToTheOwningFiber above: while A's own tombstone arm for "k"
+// sits pending, B arms its OWN tombstone arm for the exact same key and calls
+// CommitOwnTombstone(0, "k", ...) -- it must find and consume ONLY B's arm, never A's.
+//
+// Falsifying: dropping the owner conjunct from CommitOwnTombstone's match condition (mvcc.cc)
+// makes it consume A's arm instead of (or in addition to) B's -- committed_stamp below would come
+// back derived from kAPrev, and a_survived_after_b would come back false.
+TEST_F(MvccOwnershipFiberTest, CommitOwnTombstoneIsScopedToTheOwningFiber) {
+  util::fb2::Done a_armed, resume_a;
+  bool a_survived_after_b = false;
+  bool b_found_own_tombstone = false;
+  MvccStamp committed_stamp;
+
+  const MvccStamp kAPrev{0x1000, 0xA0A0u};
+  const MvccStamp kBPrev{0x2000, 0xB0B0u};
+
+  util::fb2::Fiber fiber_a = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->ArmTombstone(0, "k", kAPrev);
+    a_armed.Notify();
+    resume_a.Wait();
+    a_survived_after_b = MvccStamper::tlocal()->OwnsArm(0, "k");
+    MvccStamper::tlocal()->Disarm(0, "k");  // cleanup on the same fiber that armed it
+  });
+
+  a_armed.Wait();
+
+  util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->ArmTombstone(0, "k", kBPrev);
+    b_found_own_tombstone = MvccStamper::tlocal()->CommitOwnTombstone(
+        0, "k", [&](DbIndex, std::string_view, const MvccStamp& st, bool, const MvccStamp&) {
+          committed_stamp = st;
+        });
+  });
+  fiber_b.Join();
+
+  resume_a.Notify();
+  fiber_a.Join();
+
+  ASSERT_TRUE(b_found_own_tombstone);
+  EXPECT_EQ(committed_stamp, ExpiryTombstoneFor(kBPrev))
+      << "B's own CommitOwnTombstone must advance B's own prior stamp, never A's";
+  EXPECT_TRUE(a_survived_after_b)
+      << "A's own tombstone arm must survive a different fiber's CommitOwnTombstone(0, \"k\") "
+         "call for the same key";
+}
+
+// LocalMintFloor must only consider the CALLING fiber's own arms. Fiber A arms a key with a real,
+// modest prior stamp and blocks. While A is blocked, fiber B arms a DIFFERENT key with a prior
+// stamp near MvccClock::kStampMask -- if LocalMintFloor summed over every arm on the thread
+// regardless of owner, A's own floor would come back inflated to (near) kStampMask instead of
+// one tick above ITS OWN prior stamp.
+//
+// Falsifying: dropping the owner check from LocalMintFloor's loop (mvcc.cc) makes a_floor_after_b
+// come back MvccClock::kStampMask (B's contribution), not kAPriorMvcc + 1.
+TEST_F(MvccOwnershipFiberTest, LocalMintFloorIgnoresAForeignFibersArm) {
+  util::fb2::Done a_armed, resume_a, b_armed, resume_b;
+  uint64_t a_floor_after_b = 0;
+
+  constexpr uint64_t kAPriorMvcc = 500;
+  const MvccStamp kAPrev{kAPriorMvcc, 7};
+  const MvccStamp kHugeBPrev{MvccClock::kStampMask, 0xB0B0u};
+
+  util::fb2::Fiber fiber_a = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->Arm(0, "a-key", kAPrev);
+    a_armed.Notify();
+    resume_a.Wait();
+    a_floor_after_b = MvccStamper::tlocal()->LocalMintFloor();
+    MvccStamper::tlocal()->Disarm(0, "a-key");  // cleanup on the same fiber that armed it
+  });
+  a_armed.Wait();
+
+  util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->Arm(0, "b-key", kHugeBPrev);
+    b_armed.Notify();
+    resume_b.Wait();
+    MvccStamper::tlocal()->Disarm(0, "b-key");  // cleanup on the same fiber that armed it
+  });
+  b_armed.Wait();
+
+  resume_a.Notify();
+  fiber_a.Join();
+
+  EXPECT_EQ(a_floor_after_b, kAPriorMvcc + 1)
+      << "A's own LocalMintFloor() must reflect only A's own prior stamp, never a different "
+         "fiber's, even a far larger one still pending on the same thread";
+
+  resume_b.Notify();
+  fiber_b.Join();
+}
+
+// Arm()'s own placeholder-inheritance scan (mvcc.h) must also match only the CALLING fiber's own
+// pending tombstone arm. Fiber B arms a genuine tombstone for "k" with a real prior stamp and
+// blocks, pending. While B is blocked, fiber A -- which has no tombstone arm of its own for "k"
+// -- calls Arm(0, "k", {kTombstoneBit, 0}) (EnsureMvcc's own placeholder shape for its
+// tombstone-clearing branch, db_slice.cc). A's call must NOT inherit B's prior stamp: observed
+// indirectly through A's own LocalMintFloor(), which floors on Mvcc() alone and skips a
+// {0,0}-Mvcc() prev_stamp entirely (mvcc.cc) -- inheriting B's real prior stamp would instead
+// give A's own arm a non-zero Mvcc(), inflating A's floor.
+//
+// Falsifying: dropping the owner conjunct from Arm()'s inheritance scan (mvcc.cc) makes A's own
+// arm inherit B's prior stamp -- a_floor comes back kBPriorMvcc + 1 instead of 0.
+TEST_F(MvccOwnershipFiberTest, ArmPlaceholderInheritanceIsScopedToTheOwningFiber) {
+  util::fb2::Done b_armed, resume_b;
+  uint64_t a_floor = 0;
+
+  constexpr uint64_t kBPriorMvcc = 999;
+  const MvccStamp kBPrev{kBPriorMvcc, 55};
+
+  util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->ArmTombstone(0, "k", kBPrev);
+    b_armed.Notify();
+    resume_b.Wait();
+    MvccStamper::tlocal()->Disarm(0, "k");  // cleanup on the same fiber that armed it
+  });
+  b_armed.Wait();
+
+  util::fb2::Fiber fiber_a = pp_->at(0)->LaunchFiber([&] {
+    MvccStamper::tlocal()->Arm(0, "k", MvccStamp{MvccClock::kTombstoneBit, 0});
+    a_floor = MvccStamper::tlocal()->LocalMintFloor();
+    MvccStamper::tlocal()->Disarm(0, "k");  // cleanup A's own arm only
+  });
+  fiber_a.Join();
+
+  EXPECT_EQ(a_floor, 0u)
+      << "A's own placeholder Arm() must not inherit a different fiber's pending tombstone arm's "
+         "prior stamp -- it has none of its own to floor against here";
+
+  resume_b.Notify();
+  fiber_b.Join();
+}
+
 }  // namespace dfly
