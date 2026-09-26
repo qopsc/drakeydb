@@ -96,18 +96,26 @@ struct DbTableStats {
   // path never refuses its own key) and only counted, never refused. Purely diagnostic, like
   // mvcc_tombstones_dropped above.
   size_t mvcc_tombstones_born_expired = 0;
-  // drakeydb: P4-5 -- an install that found the slot already holding a DIFFERENT fiber's
-  // still-uncommitted {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous
-  // pre-commit write, db_slice.cc) and refused to overwrite it. Three producers, all guarding the
-  // identical race: DbSlice::InstallAbsentKeyTombstone (merge-load's no-live-key fallthrough AND
-  // every streaming caller -- SetCmd::Set, OpRestore, Renamer::DeserializeDest,
-  // RecordAbsentKeyRemoval), the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2) install, and
-  // RdbLoader::CreateObjectOnShard's own merge-load live-value install (the latter two both
-  // rdb_load.cc). Left alone, that overwrite would let TombstoneGcStep (db_slice.cc) later reap
-  // the slot before the placeholder's own owner ever commits, aborting that owner's
-  // SetExistingMvcc call on CHECK(!it.is_done()). Purely diagnostic, like
-  // mvcc_tombstones_dropped/mvcc_tombstones_born_expired above; the refused install is simply
-  // skipped -- the placeholder is left for its owner to resolve.
+  // drakeydb: P4-5 -- a TIMED-OUT wait for a DIFFERENT fiber's still-uncommitted
+  // {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous pre-commit write,
+  // db_slice.cc) to resolve, at which point the install refuses outright rather than overwrite
+  // it. Not counted on every encounter: the three loader sites that can meet this shape
+  // (RdbLoader::ApplyMergeTombstoneOnShard's no-live-key fallthrough, RdbLoader::
+  // CreateObjectOnShard's own merge-load live install, and HandleTombstones' own non-merge
+  // install lambda, all rdb_load.cc) first wait, polling for up to about a second, for the
+  // placeholder's owner to commit or roll back -- refusing on sight instead can silently drop a
+  // peer's write that should have won a later comparison, with no later delivery to recover it
+  // (a value that only ever reached this node via a snapshot, never a journal entry, is never
+  // resent). This counter increments only once that wait times out; DbSlice::
+  // InstallAbsentKeyTombstone's own identical check (its callers never wait) is the fallback for
+  // that timeout path and for any future caller that meets this shape without waiting first --
+  // an ordinary streaming caller (SetCmd::Set, OpRestore, Renamer::DeserializeDest,
+  // RecordAbsentKeyRemoval) never can, since each already holds the key's own lock. Left alone,
+  // the overwrite this refuses would let TombstoneGcStep (db_slice.cc) later reap the slot
+  // before the placeholder's own owner ever commits, aborting that owner's SetExistingMvcc call
+  // on CHECK(!it.is_done()). Purely diagnostic, like mvcc_tombstones_dropped/
+  // mvcc_tombstones_born_expired above; the refused install is simply skipped -- the placeholder
+  // is left for its owner to resolve on its own.
   size_t mvcc_foreign_placeholder_skips = 0;
 
   // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of a

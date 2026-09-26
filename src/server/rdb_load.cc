@@ -75,6 +75,13 @@ ABSL_FLAG(bool, rdb_ignore_expiry, false, "Ignore Key Expiry when loding from RD
 
 namespace dfly {
 
+// drakeydb: P4-5 -- see RdbLoader::WaitForForeignArmToClear's own declaration (rdb_load.h) for
+// the full account. Not constexpr, for the same reason kInitSegmentLog (table.cc) is not:
+// the "Timeout" unit test needs to observe the fallback refusal without actually waiting a full
+// second, and overriding a plain variable directly is this codebase's own established,
+// zero-production-cost way to do that -- production code never assigns to it.
+uint64_t kForeignArmWaitBoundMs = 1000;
+
 using namespace std;
 using base::IoBuf;
 using nonstd::make_unexpected;
@@ -3295,6 +3302,31 @@ void RdbLoaderBase::CopyStreamId(const StreamID& src, struct streamID* dest) {
   dest->seq = src.seq;
 }
 
+// drakeydb: P4-5 -- see the declaration (rdb_load.h) for the full account. A pure poll loop: no
+// allocation, no table mutation, just repeated IsArmedByAnyFiber()/OwnsArm() reads separated by
+// a short sleep. Bounds the wait by an ITERATION COUNT (kForeignArmWaitBoundMs / 1ms-per-poll),
+// deliberately never GetCurrentTimeMs(): that clock reads back a fixed, test-injected
+// TEST_current_time_ms (engine_shard_set.h) whenever one is set, which every one of this file's
+// own tests does (BaseFamilyTest's own now, never advanced by AdvanceTime() in a test that never
+// calls it) -- a deadline computed from it would never elapse, hanging this loop forever instead
+// of timing out. ThisFiber::SleepFor's own timer is real wall-clock time regardless, so counting
+// how many ~1ms sleeps have elapsed bounds real wall-clock time correctly even when the mocked
+// clock never moves.
+bool RdbLoader::WaitForForeignArmToClear(DbIndex db_index, string_view key) {
+  MvccStamper* const stamper = MvccStamper::tlocal();
+  auto still_foreign = [&] {
+    return stamper->IsArmedByAnyFiber(db_index, key) && !stamper->OwnsArm(db_index, key);
+  };
+  if (!still_foreign())
+    return true;
+  for (uint64_t waited_ms = 0; waited_ms < kForeignArmWaitBoundMs; ++waited_ms) {
+    ThisFiber::SleepFor(1ms);
+    if (!still_foreign())
+      return true;
+  }
+  return false;
+}
+
 // drakeydb: P4-3 final fix wave (F-1) -- extracted verbatim from HandleTombstones' merge branch
 // (below in this file), where it was Task 6's only caller, so that CreateObjectOnShard's
 // already-expired-incoming path can route through the EXACT same apply rather than growing a
@@ -3571,9 +3603,12 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // start and NOTHING here has yielded or called FindMutable -- so this call could not possibly
   // have armed anything itself for this key. Disarming anyway in that case does not target OUR OWN
   // arm (there is none): it can instead steal a DIFFERENT, concurrent fiber's still-pending,
-  // legitimate arm for the SAME key name (e.g. a client's own `DEL k`, mid-yield in that same
-  // window) -- that fiber's eventual Commit() then finds no arm left to stamp, and its own
-  // {kTombstoneBit, 0} placeholder is never overwritten with a real, minted stamp: an immortal,
+  // legitimate arm for the SAME key name (e.g. a peer-link DEL, or one already in flight when
+  // LOADING began, mid-yield in that same window -- an ordinary client's own DEL cannot reach
+  // this window at all: DEBUG RELOAD flushes and enters LOADING first, and GlobalState::LOADING
+  // admits only replicating peer-link traffic or a command explicitly marked CO::LOADING,
+  // main_service.cc) -- that fiber's eventual Commit() then finds no arm left to stamp, and its
+  // own {kTombstoneBit, 0} placeholder is never overwritten with a real, minted stamp: an immortal,
   // unreapable tombstone (TombstoneGcStep's reap predicate requires Mvcc() != 0, db_slice.cc), a
   // silently-lost delete. found_mutable being true, by contrast, means FindMutable DID run for
   // this exact key on this exact call, so Disarming then can only ever target an arm this call's
@@ -3627,6 +3662,36 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // comment, db_slice.h), the same install-time clamp SetCmd::Set's own InstallAbsentKeyTombstone
   // caller relies on. db_cntx.time_now_ms is `now_ms` verbatim -- this method's own caller-supplied
   // parameter, never a second, independently-read GetCurrentTimeMs().
+  //
+  // drakeydb: P4-5 -- refuse-on-sight can silently drop a peer's write that should have won:
+  // A deletes k@X, B applies it then a client writes k@P>X on B, C full-syncs from B and inherits
+  // P (in the snapshot, never re-delivered by the stream), and if A's own copy of X's DEL is STILL
+  // this loader's foreign placeholder when C's snapshot arrives, refusing outright would leave A
+  // at X forever with no way to ever learn about P. Wait for the placeholder's owner instead, then
+  // re-run the authoritative decision against whatever it actually resolved to.
+  {
+    const std::optional<MvccStamp> existing = db_slice->GetMvcc(db_index, key);
+    const bool foreign_placeholder = existing.has_value() && existing->IsTombstone() &&
+                                     existing->Mvcc() == 0 &&
+                                     MvccStamper::tlocal()->IsArmedByAnyFiber(db_index, key) &&
+                                     !MvccStamper::tlocal()->OwnsArm(db_index, key);
+    if (foreign_placeholder) {
+      if (!WaitForForeignArmToClear(db_index, key)) {
+        ++db_slice->MutableStats(db_index)->mvcc_foreign_placeholder_skips;
+        VLOG(1) << "timed out waiting for a foreign in-flight tombstone placeholder: db="
+                << db_index << " key=" << key;
+        return;
+      }
+      // The arm resolved -- re-run the authoritative compare against whatever it actually
+      // resolved to (the owner's own committed stamp, or nothing at all if it rolled back)
+      // before calling InstallAbsentKeyTombstone below, with no yield in between the two: a
+      // stale `stamp` that already lost this recheck must never reach that call regardless of
+      // what its own (unreachable here either way -- see WaitForForeignArmToClear's own
+      // declaration comment) internal refusal would have done with it.
+      if (!MergeAccepts(db_slice->GetMvcc(db_index, key), stamp))
+        return;
+    }
+  }
   db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta, db_cntx.time_now_ms);
 }
 
@@ -3904,28 +3969,127 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     return;
   }
 
-  if (merge_lww_ && !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
-    return;  // fast path only; the authoritative check runs again below
+  // drakeydb: P4-5 -- everything from the fast-path check below through the install itself
+  // (the `install_now` lambda) is wrapped in a retry loop: waiting for a foreign placeholder's
+  // owner to resolve (see WaitForForeignArmToClear's own declaration, rdb_load.h) yields, which
+  // means whatever AddOrFind found before the wait can no longer be trusted -- the loop re-runs
+  // the fast-path check, AddOrFind, and the authoritative compare completely fresh on each pass,
+  // exactly as if this call had just started over, rather than special-casing what the wait
+  // resolved to.
+  auto install_now = [&](DbSlice::ItAndUpdater& updater) {
+    // drakeydb: P4-3 Task 4, Hazard 1 fix -- mirrors AddOrUpdateInternal's post-find work exactly
+    // (db_slice.cc): the same three public primitives, called the same way, so a merge-accepted
+    // write -- or any write at all when merge_lww_ is false -- is byte-for-byte the same mutation
+    // AddOrUpdate would have performed.
+    db_slice->ReleaseOffloadedValue(db_cntx.db_index, item->key, &updater.it->second);
+    updater.it->second = std::move(pv);
+    if (item->expire_ms) {
+      db_slice->AddExpire(db_cntx.db_index, updater.it, item->expire_ms);
+    } else {
+      db_slice->RemoveExpire(db_cntx.db_index, updater.it);
+    }
 
-  // drakeydb: P4-3 Task 4, Hazard 1 fix -- AddOrFind, not AddOrUpdate: AddOrFindInternal's own
-  // find-or-insert, including PreUpdateBlocking (found branch) or CallChangeCallbacks (insert
-  // branch), is the LAST yield point before any mutation of this key (db_slice.cc). Verified by
-  // reading every statement between that point and the function's return in both branches:
-  // TouchTopKeysIfNeeded, TouchHllIfNeeded, AccountObjectMemory, and the various events_/stats
-  // counters are all plain, non-fiber-aware bookkeeping -- no further yield. Everything from here
-  // down to the value assignment below is therefore effectively atomic with respect to this key's
-  // mvcc stamp.
-  auto op_res = db_slice->AddOrFind(db_cntx, item->key, std::nullopt);
-  if (!op_res) {
-    LOG(ERROR) << "OOM failed to add key '" << item->key << "' in DB " << db_ind;
-    ec_ = RdbError(errc::out_of_memory);
-    stop_early_ = true;
-    return;
-  }
+    updater.it->first.SetSticky(item->is_sticky);
+    if (item->has_mc_flags) {
+      updater.it->second.SetFlag(true);
+      db_slice->SetMCFlag(db_cntx.db_index, updater.it->first, item->mc_flags);
+    }
 
-  DbSlice::ItAndUpdater& updater = *op_res;
+    // drakeydb: Phase 4, P4-1 Task 10 / P4-2 Task 2 -- an unversioned snapshot, or a key whose
+    // stamp was zero (unstamped/absent) at save time, carries no RDB_OPCODE_DF_MVCC record
+    // (item->has_mvcc is false); D-7 specifies {0,0} as its fallback there: it never fabricates
+    // authority the snapshot does not contain, and any stamped resident value beats it on merge.
+    // When the record IS present (item->has_mvcc true), item->mvcc holds the exact 16 bytes Task
+    // 1's saver wrote for this key, installed here verbatim -- never re-minted. That is P4-2's
+    // whole promise: loading is propagation-by-snapshot, and "a key's stamp advances iff that same
+    // stamp is propagated" holds for it exactly because the loader never invents a stamp, only
+    // ever replays one the save side already committed to the stream. Unconditional either way
+    // (unlike the mc_flags mirror above): every loaded key needs an entry for the mvcc table to
+    // stay dense, not just ones with a flag or a record.
+    //
+    // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
+    // std::string on this const Item*, no copy), not the PrimeKey overload used above for
+    // SetMCFlag. The PrimeKey overload's own GetSlice(&scratch) call (db_slice.cc) can allocate for
+    // a key over CompactObj::kInlineLen -- true for the encoding_, SMALL_TAG, and INT_TAG cases
+    // (CompactObj::GetSlice, compact_object.cc -- INT_TAG added in fix round 3, R7: reachable for a
+    // 17-20 char numeric key over kInlineLen == 16, missed in fix round 2's own correction of this
+    // comment), corrected in fix round 2 (R3) from this comment's original overstatement ("any
+    // key... unconditionally"): LARGE_STR_TAG and SDS_TTL_TAG return a view with no copy, so it is
+    // not every over-kInlineLen key, just some of them -- and on every node including non-active
+    // ones regardless of which case applies, since whatever allocation does happen is in the outer
+    // overload, before the inner overload's `if (!db.mvcc) return;` guard ever runs. The prior
+    // claim here ("costs one predictable branch") was true of the guard but not of the call as
+    // originally written, which paid for that outer round-trip -- allocating or not, depending on
+    // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
+    //
+    // `incoming` (computed above, before AddOrFind) is the same value this used to recompute inline
+    // (item->has_mvcc ? item->mvcc : MvccStamp{}) -- reused here rather than recomputed. Per Task
+    // 13 (above), `incoming` may instead hold a classic-PSYNC unstamped key's ctime-derived stamp;
+    // it was ALREADY the value both the fast-path check and the authoritative recheck compared
+    // against, so installing it verbatim here (exactly as the pre-Task-13 code always did) is
+    // correct with no further special-casing -- unlike Task 12's withdrawn rule, which minted a
+    // SEPARATE stamp here that the compares above never actually saw.
+    //
+    // drakeydb: P4-5 -- a non-merge load (merge_lww_ false: this node's own startup/DEBUG RELOAD)
+    // reaches this call with no foreign-placeholder check at all -- only the merge_lww_ branch
+    // above has one. The same race is possible in principle on an active node running a non-merge
+    // load, but is not refused here.
+    db_slice->SetMvcc(db_cntx.db_index, item->key, incoming);
 
-  if (merge_lww_) {
+    if (!override_existing_keys_ && !updater.is_new) {
+      LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
+                   << updater.it->second.ObjType();
+    }
+
+    // Loading is propagated by the snapshot, not a COMMAND journal entry. Finalize normal memory,
+    // expiry, watcher, and index bookkeeping without arming the thread-local journal epoch. The
+    // explicit SetMvcc call above -- the persisted stamp verbatim, or D-7's {0,0} fallback -- is
+    // the load's complete P4-2 MVCC effect.
+    updater.post_updater.RunWithoutMvccArm();
+
+    if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
+      // Finalize the AutoUpdater before stashing. The stash callback may complete
+      // (e.g. during the SleepFor yield below) and transform the PrimeValue to external,
+      // changing MallocUsed(). If the AutoUpdater ran after that, it would compute a
+      // bogus negative memory delta and crash in AccountObjectMemory.
+      auto it = updater.it;
+      StashPrimeValue(db_cntx.db_index, item->key, it->first, &it->second, ts, nullptr);
+
+      // Block, if tiered storage is active, but can't keep up
+      while (db_slice->shard_owner()->ShouldThrottleForTiering())
+        ThisFiber::SleepFor(100us);
+    }
+  };
+
+  for (;;) {
+    if (merge_lww_ && !MergeAccepts(db_slice->GetMvcc(db_cntx.db_index, item->key), incoming))
+      return;  // fast path only; the authoritative check runs again below
+
+    // drakeydb: P4-3 Task 4, Hazard 1 fix -- AddOrFind, not AddOrUpdate: AddOrFindInternal's own
+    // find-or-insert, including PreUpdateBlocking (found branch) or CallChangeCallbacks (insert
+    // branch), is the LAST yield point before any mutation of this key (db_slice.cc). Verified by
+    // reading every statement between that point and the function's return in both branches:
+    // TouchTopKeysIfNeeded, TouchHllIfNeeded, AccountObjectMemory, and the various events_/stats
+    // counters are all plain, non-fiber-aware bookkeeping -- no further yield. Everything from here
+    // down to the value assignment below is therefore effectively atomic with respect to this key's
+    // mvcc stamp, UNLESS the foreign-placeholder branch below waits and loops back to redo this
+    // call: that wait is the one deliberate exception, and is why the loop re-runs from the top
+    // rather than resuming mid-function.
+    auto op_res = db_slice->AddOrFind(db_cntx, item->key, std::nullopt);
+    if (!op_res) {
+      LOG(ERROR) << "OOM failed to add key '" << item->key << "' in DB " << db_ind;
+      ec_ = RdbError(errc::out_of_memory);
+      stop_early_ = true;
+      return;
+    }
+
+    DbSlice::ItAndUpdater& updater = *op_res;
+
+    if (!merge_lww_) {
+      install_now(updater);
+      return;
+    }
+
     // The authoritative compare -- see the comment above AddOrFind for why only this one, run
     // after AddOrFind's own last-possible yield, can be trusted. `incoming` here is the SAME
     // value the fast-path check above used -- including, per Task 13, a classic-PSYNC unstamped
@@ -3933,130 +4097,62 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     // covers, with no bypass for any of them.
     const std::optional<MvccStamp> stored = db_slice->GetMvcc(db_cntx.db_index, item->key);
     // drakeydb: P4-5 -- `stored` may be a DIFFERENT fiber's still-uncommitted {kTombstoneBit, 0}
-    // placeholder (PerformDeletionAtomic's synchronous pre-commit write, db_slice.cc) for an
-    // inline client DEL that yielded in AddLogRecord: AddOrFind's own insert branch above found
-    // no live prime entry (the DEL already erased it) and force-inserted a fresh one, and
-    // MergeAccepts(stored, incoming) trivially accepts (Mvcc()==0 is the strict minimum) since the
-    // placeholder is not the DEL's real stamp. Left unrefused, SetMvcc below would turn the slot
-    // live (mvcc_tombstones down by one), and the DEL's own later Commit() would then call
-    // SetExistingMvcc on that now-LIVE slot -- not missing, so no CHECK(!it.is_done()) there, but
-    // it re-tombstones a slot the loader just made live (mvcc_tombstones back up by one) while
-    // `prime` still holds the loader's value: the dense invariant (mvcc->size() - mvcc_tombstones
-    // == prime.size()) breaks, caught by TEST_VerifyMvccTable/OnCbFinishBlocking's own CHECKs in a
-    // debug build, silent parity corruption in a release one. Same predicate and same counter as
-    // the tombstone installs (IsArmedByAnyFiber() && !OwnsArm(), db_slice.cc/rdb_load.cc): a
-    // placeholder with no arm at all, or one this fiber itself owns, is not refused.
+    // placeholder (PerformDeletionAtomic's synchronous pre-commit write, db_slice.cc) for a
+    // peer-link DEL (or one already in flight when LOADING began -- an ordinary client's own DEL
+    // cannot reach this window at all, main_service.cc's LOADING-state gate) that yielded in
+    // AddLogRecord: AddOrFind's own insert branch above found no live prime entry (the DEL
+    // already erased it) and force-inserted a fresh one, and MergeAccepts(stored, incoming)
+    // trivially accepts (Mvcc()==0 is the strict minimum) since the placeholder is not the DEL's
+    // real stamp. Left unrefused, SetMvcc below would turn the slot live (mvcc_tombstones down by
+    // one), and the DEL's own later Commit() would then call SetExistingMvcc on that now-LIVE slot
+    // -- not missing, so no CHECK(!it.is_done()) there, but it re-tombstones a slot the loader
+    // just made live (mvcc_tombstones back up by one) while `prime` still holds the loader's
+    // value: the dense invariant (mvcc->size() - mvcc_tombstones == prime.size()) breaks, caught
+    // by TEST_VerifyMvccTable/OnCbFinishBlocking's own CHECKs in a debug build, silent parity
+    // corruption -- the slot stays live forever, and GC never reaps a tombstone that no longer
+    // exists -- in a release one. Same predicate and same counter as the tombstone installs
+    // (IsArmedByAnyFiber() && !OwnsArm(), db_slice.cc/rdb_load.cc): a placeholder with no arm at
+    // all, or one this fiber itself owns, is not refused.
     const bool foreign_placeholder =
         stored.has_value() && stored->IsTombstone() && stored->Mvcc() == 0 &&
         MvccStamper::tlocal()->IsArmedByAnyFiber(db_cntx.db_index, item->key) &&
         !MvccStamper::tlocal()->OwnsArm(db_cntx.db_index, item->key);
-    if (foreign_placeholder || !MergeAccepts(stored, incoming)) {
-      if (foreign_placeholder) {
-        ++db_slice->MutableStats(db_cntx.db_index)->mvcc_foreign_placeholder_skips;
-        VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db="
-                << db_cntx.db_index << " key=" << item->key;
-      }
-      if (updater.is_new) {
-        // drakeydb: fix round 1 (M2) -- a FRESH insert can be rejected two ways, both landing here
-        // with is_new == true: (1) a concurrent apply tombstoned this exact, previously-absent key,
-        // with a stamp beating ours, during AddOrFind's own yield above; or (2) a concurrent live
-        // SET created this same key during that yield's insert-branch CallChangeCallbacks call
-        // (db_slice.cc) -- AddOrFindInternal's insert branch never re-checks existence after that
-        // yield and force-inserts regardless. Either way, RollbackFreshInsert undoes the insert as
-        // if it had never happened, and cancels the AutoUpdater itself -- see its doc comment
-        // (db_slice.h/.cc).
-        db_slice->RollbackFreshInsert(db_cntx.db_index, updater);
-      } else {
-        // Nothing happened to a pre-existing entry: do not let ~AutoUpdater's implicit Run() fire
-        // PostUpdate's watch/tracking/mvcc-arm side effects for a write that never logically
-        // occurred.
-        updater.post_updater.Cancel();
-      }
-      return;  // stored side wins; the deserialized value is dropped (D-8 accepts that cost)
+
+    if (!foreign_placeholder && MergeAccepts(stored, incoming)) {
+      install_now(updater);
+      return;
     }
-  }
 
-  // drakeydb: P4-3 Task 4, Hazard 1 fix -- mirrors AddOrUpdateInternal's post-find work exactly
-  // (db_slice.cc): the same three public primitives, called the same way, so a merge-accepted
-  // write -- or any write at all when merge_lww_ is false -- is byte-for-byte the same mutation
-  // AddOrUpdate would have performed.
-  db_slice->ReleaseOffloadedValue(db_cntx.db_index, item->key, &updater.it->second);
-  updater.it->second = std::move(pv);
-  if (item->expire_ms) {
-    db_slice->AddExpire(db_cntx.db_index, updater.it, item->expire_ms);
-  } else {
-    db_slice->RemoveExpire(db_cntx.db_index, updater.it);
-  }
+    // drakeydb: fix round 1 (M2) -- a FRESH insert can be rejected/undone two ways, both landing
+    // here with is_new == true: (1) a concurrent apply tombstoned this exact, previously-absent
+    // key, with a stamp beating ours, during AddOrFind's own yield above; or (2) a concurrent
+    // live SET created this same key during that yield's insert-branch CallChangeCallbacks call
+    // (db_slice.cc) -- AddOrFindInternal's insert branch never re-checks existence after that
+    // yield and force-inserts regardless. Either way, RollbackFreshInsert undoes the insert as if
+    // it had never happened, and cancels the AutoUpdater itself -- see its doc comment
+    // (db_slice.h/.cc). Also correct for the foreign-placeholder branch below: that branch must
+    // hold no half-done state before it ever waits, and a fresh insert (or a found-but-untouched
+    // entry) is exactly the state to undo before doing so.
+    if (updater.is_new) {
+      db_slice->RollbackFreshInsert(db_cntx.db_index, updater);
+    } else {
+      // Nothing happened to a pre-existing entry: do not let ~AutoUpdater's implicit Run() fire
+      // PostUpdate's watch/tracking/mvcc-arm side effects for a write that never logically
+      // occurred.
+      updater.post_updater.Cancel();
+    }
 
-  updater.it->first.SetSticky(item->is_sticky);
-  if (item->has_mc_flags) {
-    updater.it->second.SetFlag(true);
-    db_slice->SetMCFlag(db_cntx.db_index, updater.it->first, item->mc_flags);
-  }
+    if (!foreign_placeholder)
+      return;  // stored side wins; the deserialized value is dropped (D-8 accepts that cost)
 
-  // drakeydb: Phase 4, P4-1 Task 10 / P4-2 Task 2 -- an unversioned snapshot, or a key whose
-  // stamp was zero (unstamped/absent) at save time, carries no RDB_OPCODE_DF_MVCC record
-  // (item->has_mvcc is false); D-7 specifies {0,0} as its fallback there: it never fabricates
-  // authority the snapshot does not contain, and any stamped resident value beats it on merge.
-  // When the record IS present (item->has_mvcc true), item->mvcc holds the exact 16 bytes Task
-  // 1's saver wrote for this key, installed here verbatim -- never re-minted. That is P4-2's
-  // whole promise: loading is propagation-by-snapshot, and "a key's stamp advances iff that same
-  // stamp is propagated" holds for it exactly because the loader never invents a stamp, only
-  // ever replays one the save side already committed to the stream. Unconditional either way
-  // (unlike the mc_flags mirror above): every loaded key needs an entry for the mvcc table to
-  // stay dense, not just ones with a flag or a record.
-  //
-  // drakeydb: fix round 1 (F5) -- the string_view overload, with item->key (already a stable
-  // std::string on this const Item*, no copy), not the PrimeKey overload used above for
-  // SetMCFlag. The PrimeKey overload's own GetSlice(&scratch) call (db_slice.cc) can allocate for
-  // a key over CompactObj::kInlineLen -- true for the encoding_, SMALL_TAG, and INT_TAG cases
-  // (CompactObj::GetSlice, compact_object.cc -- INT_TAG added in fix round 3, R7: reachable for a
-  // 17-20 char numeric key over kInlineLen == 16, missed in fix round 2's own correction of this
-  // comment), corrected in fix round 2 (R3) from this comment's original overstatement ("any
-  // key... unconditionally"): LARGE_STR_TAG and SDS_TTL_TAG return a view with no copy, so it is
-  // not every over-kInlineLen key, just some of them -- and on every node including non-active
-  // ones regardless of which case applies, since whatever allocation does happen is in the outer
-  // overload, before the inner overload's `if (!db.mvcc) return;` guard ever runs. The prior
-  // claim here ("costs one predictable branch") was true of the guard but not of the call as
-  // originally written, which paid for that outer round-trip -- allocating or not, depending on
-  // tag -- regardless of mvcc_enabled(). See task-10-report.md fix round 1.
-  //
-  // `incoming` (computed above, before AddOrFind) is the same value this used to recompute inline
-  // (item->has_mvcc ? item->mvcc : MvccStamp{}) -- reused here rather than recomputed. Per Task 13
-  // (above), `incoming` may instead hold a classic-PSYNC unstamped key's ctime-derived stamp; it
-  // was ALREADY the value both the fast-path check and the authoritative recheck compared against,
-  // so installing it verbatim here (exactly as the pre-Task-13 code always did) is correct with no
-  // further special-casing -- unlike Task 12's withdrawn rule, which minted a SEPARATE stamp here
-  // that the compares above never actually saw.
-  //
-  // drakeydb: P4-5 -- a non-merge load (merge_lww_ false: this node's own startup/DEBUG RELOAD)
-  // reaches this call with no foreign-placeholder check at all -- only the merge_lww_ branch
-  // above has one. The same race is possible in principle on an active node running a non-merge
-  // load, but is not refused here.
-  db_slice->SetMvcc(db_cntx.db_index, item->key, incoming);
-
-  if (!override_existing_keys_ && !updater.is_new) {
-    LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
-                 << updater.it->second.ObjType();
-  }
-
-  // Loading is propagated by the snapshot, not a COMMAND journal entry. Finalize normal memory,
-  // expiry, watcher, and index bookkeeping without arming the thread-local journal epoch. The
-  // explicit SetMvcc call above -- the persisted stamp verbatim, or D-7's {0,0} fallback -- is
-  // the load's complete P4-2 MVCC effect.
-  updater.post_updater.RunWithoutMvccArm();
-
-  if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
-    // Finalize the AutoUpdater before stashing. The stash callback may complete
-    // (e.g. during the SleepFor yield below) and transform the PrimeValue to external,
-    // changing MallocUsed(). If the AutoUpdater ran after that, it would compute a
-    // bogus negative memory delta and crash in AccountObjectMemory.
-    auto it = updater.it;
-    StashPrimeValue(db_cntx.db_index, item->key, it->first, &it->second, ts, nullptr);
-
-    // Block, if tiered storage is active, but can't keep up
-    while (db_slice->shard_owner()->ShouldThrottleForTiering())
-      ThisFiber::SleepFor(100us);
+    if (!WaitForForeignArmToClear(db_cntx.db_index, item->key)) {
+      ++db_slice->MutableStats(db_cntx.db_index)->mvcc_foreign_placeholder_skips;
+      VLOG(1) << "timed out waiting for a foreign in-flight tombstone placeholder before a live "
+                 "install: db="
+              << db_cntx.db_index << " key=" << item->key;
+      return;
+    }
+    // The arm resolved -- loop back to the top and redo everything from the fast-path check.
   }
 }
 
@@ -4689,26 +4785,35 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
                     << " key=" << absl::CHexEscape(key);
             return;
           }
-          const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
-          // drakeydb: P4-5 -- the same foreign-placeholder refusal as
-          // DbSlice::InstallAbsentKeyTombstone (db_slice.cc/.h has the full account of the
-          // CHECK(!it.is_done()) abort this closes). This callback is dispatched onto this
-          // shard's queue exactly like the merge one is, so it CAN meet a foreign placeholder the
-          // same way: a client DEL's {kTombstoneBit, 0} placeholder for this exact key, still
-          // uncommitted when this callback runs (e.g. this node's own tombstone section, reloaded
-          // during a DEBUG RELOAD that races ordinary client traffic on this shard). The refusal
-          // is cheap, so it applies here too rather than assuming this record shape never
-          // collides with one in practice. IsArmedByAnyFiber() && !OwnsArm(), not OwnsArm() alone,
-          // for the same reason InstallAbsentKeyTombstone's own comment gives: this callback never
-          // arms anything of its own, so OwnsArm() is always false here regardless, and only a
-          // genuinely foreign arm (IsArmedByAnyFiber() true) should ever refuse.
+          std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
+          // drakeydb: P4-5 -- the same foreign-placeholder wait-and-retry as
+          // ApplyMergeTombstoneOnShard's no-live-key fallthrough (db_slice.cc/.h has the full
+          // account for InstallAbsentKeyTombstone, the sibling install this one mirrors). This
+          // callback is dispatched onto this shard's queue exactly like the merge one is, so it
+          // can meet the identical foreign placeholder: a peer-link DEL's {kTombstoneBit, 0}
+          // placeholder for this exact key, still uncommitted when this callback runs (an ordinary
+          // client's own DEL cannot reach this window -- main_service.cc's LOADING-state gate).
+          // Unlike the merge sites, there is no MergeAccepts compare to re-run once the arm
+          // resolves: this is a non-merge load, D-7's unconditional install/overwrite rule applies
+          // regardless of what stamp the owner's write actually carried, so the wait here exists
+          // purely so the owner's real commit (or rollback) lands before `existing` is read again,
+          // never to change WHETHER this install proceeds. IsArmedByAnyFiber() && !OwnsArm(), not
+          // OwnsArm() alone, for the same reason InstallAbsentKeyTombstone's own comment gives:
+          // this callback never arms anything of its own, so OwnsArm() is always false here
+          // regardless, and only a genuinely foreign arm (IsArmedByAnyFiber() true) should ever
+          // wait or refuse.
           if (existing.has_value() && existing->IsTombstone() && existing->Mvcc() == 0 &&
               MvccStamper::tlocal()->IsArmedByAnyFiber(db_index, key) &&
               !MvccStamper::tlocal()->OwnsArm(db_index, key)) {
-            ++cur_table->stats.mvcc_foreign_placeholder_skips;
-            VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db="
-                    << db_index << " key=" << absl::CHexEscape(key);
-            return;
+            if (!RdbLoader::WaitForForeignArmToClear(db_index, key)) {
+              ++cur_table->stats.mvcc_foreign_placeholder_skips;
+              VLOG(1) << "timed out waiting for a foreign in-flight tombstone placeholder: db="
+                      << db_index << " key=" << absl::CHexEscape(key);
+              return;
+            }
+            // The arm resolved -- re-read the slot with no yield in between this read and the
+            // install below, exactly like ApplyMergeTombstoneOnShard's own recheck.
+            existing = db_slice.GetMvcc(db_index, key);
           }
           const bool would_grow = !existing.has_value() || !existing->IsTombstone();
           if (!would_grow ||

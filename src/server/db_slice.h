@@ -533,7 +533,13 @@ class DbSlice {
   // DbTableStats::mvcc_foreign_placeholder_skips instead, when the slot already holds a
   // DIFFERENT fiber's still-uncommitted {kTombstoneBit, 0} placeholder (MvccStamper::
   // IsArmedByAnyFiber true, OwnsArm false) -- see the .cc for the CHECK(!it.is_done()) abort this
-  // closes. The placeholder is left untouched either way; nothing here rolls it back.
+  // closes. The placeholder is left untouched either way; nothing here rolls it back. This
+  // method itself never waits for that placeholder to resolve first (its own callers -- SetCmd::
+  // Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval -- run inside a transaction
+  // callback already holding this key's own lock, so none of them can ever meet a DIFFERENT
+  // fiber's arm on it in the first place); RdbLoader::ApplyMergeTombstoneOnShard does the
+  // waiting, in its own caller, before it ever reaches this call (rdb_load.cc's own
+  // WaitForForeignArmToClear).
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
   // drakeydb: P4-5 -- names, once, the rule every call site below shares: a tombstone (`stamp`

@@ -1846,15 +1846,19 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
   // drakeydb: P4-5 -- `existing` may be a DIFFERENT fiber's still-uncommitted
   // {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous pre-commit write,
-  // db_slice.cc) rather than a genuine tombstone: a client DEL writes that placeholder plus its
-  // own arm, then yields (journal::RecordEntry's AddLogRecord, throttled against a slow peer)
-  // before its own Commit() ever overwrites it. `would_grow` below treats any existing tombstone
-  // alike regardless of who owns it, which would let this call install a peer's real stamp over
-  // that placeholder -- once Mvcc() is non-zero, TombstoneGcStep (db_slice.cc) can reap the slot
-  // entirely before the placeholder's own owner ever commits, and that owner's later
-  // SetExistingMvcc then aborts on CHECK(!it.is_done()). Refuse instead, the same way a losing
-  // MergeAccepts compare would: leave the placeholder exactly as its owner left it, for that
-  // owner's own eventual Commit()/rollback to resolve.
+  // db_slice.cc) rather than a genuine tombstone: a peer-link DEL (or one already in flight when
+  // LOADING began) writes that placeholder plus its own arm, then yields (journal::RecordEntry's
+  // AddLogRecord, throttled against a slow peer) before its own Commit() ever overwrites it.
+  // `would_grow` below treats any existing tombstone alike regardless of who owns it, which would
+  // let this call install a peer's real stamp over that placeholder -- once Mvcc() is non-zero,
+  // TombstoneGcStep (db_slice.cc) can reap the slot entirely before the placeholder's own owner
+  // ever commits, and that owner's later SetExistingMvcc then aborts on CHECK(!it.is_done()).
+  // Refuse instead, the same way a losing MergeAccepts compare would: leave the placeholder
+  // exactly as its owner left it, for that owner's own eventual Commit()/rollback to resolve.
+  // Unreachable via this method's own current callers today (see the declaration, db_slice.h):
+  // the loader itself waits for this exact placeholder to resolve, in its own caller, strictly
+  // before ever reaching this call, and every OTHER caller already holds this key's lock, which
+  // excludes a DIFFERENT fiber's arm on it entirely. Kept as the defensive fallback regardless.
   //
   // IsArmedByAnyFiber(db_ind, key) && !OwnsArm(db_ind, key) -- "someone still has an arm on this
   // key, and it is not me" -- not OwnsArm() alone: a caller reached here right after Disarming
@@ -3368,15 +3372,22 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // placeholder always resolves inside its owner's epoch, into either a committed stamp (Commit())
 // or an erase (EndOfWriteEpoch's rollback) -- that part is unconditional and always was. What is
 // NOT unconditional is that it keeps its Mvcc()==0 SHAPE intact until then: a peer-sourced install
-// competing for the same slot (DbSlice::InstallAbsentKeyTombstone, the non-merge
+// competing for the same slot -- InstallAbsentKeyTombstone (this file), the non-merge
 // RDB_OPCODE_DF_TOMBSTONES(_V2) install, and RdbLoader::CreateObjectOnShard's own merge-load live
-// install, all rdb_load.cc) could overwrite it with a real-looking stamp first, letting this step
-// reap a slot its own owner had not yet resolved. Those three now refuse that overwrite outright
-// whenever they find this exact placeholder shape owned by a DIFFERENT fiber -- that refusal is
-// what keeps the Mvcc()==0 discriminator below meaningful in the first place. The per-key check
-// just below is defence in depth on top of it, not a substitute for it: it never erases a slot
-// any fiber still has an arm on, Mvcc()==0 or not, so a future producer that skips the
-// install-side refusal still cannot make this step race a pending Commit()/rollback.
+// install (the latter two both rdb_load.cc) -- could overwrite it with a real-looking stamp
+// first, letting this step reap a slot its own owner had not yet resolved. (The live install's
+// own version of this harm looks slightly different: the slot turns LIVE rather than staying a
+// tombstone, so this step's own Mvcc()!=0 check does not even apply to it -- it is the dense
+// invariant itself, mvcc->size() - mvcc_tombstones == prime.size(), that breaks instead, and GC
+// never gets a chance to reap anything because the slot no longer looks like a tombstone at
+// all.) All three now wait, bounded, for the placeholder's owner to resolve before ever
+// installing over it, and refuse outright only once that wait times out -- see
+// RdbLoader::WaitForForeignArmToClear's own declaration (rdb_load.h) for the full account. That
+// wait-then-refuse is what keeps the Mvcc()==0 discriminator below meaningful in the first
+// place. The per-key check just below is defence in depth on top of it, not a substitute for it:
+// it never erases a slot any fiber still has an arm on, Mvcc()==0 or not, so a future producer
+// that skips the install-side wait/refusal still cannot make this step race a pending
+// Commit()/rollback.
 //
 // drakeydb: review fix (I1) -- Mvcc() != 0 is a property of the VALUES every current committed-
 // tombstone producer happens to mint (MvccClock::Next never returns 0 for any real now_ms), not

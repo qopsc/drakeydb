@@ -592,6 +592,42 @@ class RdbLoader : protected RdbLoaderBase {
                                          const MvccStamp& stamp, bool resident_live, uint64_t meta,
                                          uint64_t now_ms);
 
+  // drakeydb: P4-5 -- the bounded wait-and-retry every one of this loader's three peer-sourced
+  // install sites (ApplyMergeTombstoneOnShard's no-live-key fallthrough, CreateObjectOnShard's
+  // own live install, and HandleTombstones' own non-merge install lambda) runs before falling
+  // back to an outright refusal: a client DEL leaves a {kTombstoneBit, 0} placeholder plus its
+  // own arm, then yields (journal::RecordEntry's AddLogRecord, throttled against a slow peer
+  // link); refusing outright the instant this loader meets that placeholder can silently drop a
+  // peer's write that should have won (a later full sync never redelivers it, since it already
+  // landed in THIS peer's own snapshot, not its journal stream). Waiting instead gives the
+  // placeholder's own owner a bounded chance to resolve it first, so the loader's own decision
+  // gets to compare against the owner's REAL committed stamp (or an empty slot, if the owner
+  // rolled back) instead of racing its {0,0} shape.
+  //
+  // Polls every ~1ms (see the .cc) up to kForeignArmWaitBoundMs (~1s, a file-scope variable in
+  // rdb_load.cc, not constexpr, so a test can shorten it) and returns true the moment no fiber
+  // holds an arm on (db_index, key) any more -- including immediately, with no poll at all, if
+  // nothing was ever armed, or if the arm is this very fiber's own (MvccStamper::OwnsArm):
+  // waiting on your own arm would always time out, since nothing else runs on this fiber to
+  // resolve it while it sleeps. Returns false once the bound elapses with the arm still foreign.
+  // The owner here is always an in-flight journaling write paused in its own journal
+  // throttle (JournalStreamer::ThrottleIfNeeded), which every streamer already bounds by
+  // --replication_timeout -- ~1s comfortably covers one throttle cycle without this loader's own
+  // fiber stalling that shard's remaining load work for materially longer than the write it is
+  // waiting on would have blocked for anyway.
+  //
+  // Never called from DbSlice::InstallAbsentKeyTombstone itself: that method's OTHER callers
+  // (SetCmd::Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval) all run inside a
+  // transaction callback already holding this key's lock, so none of them can ever observe a
+  // DIFFERENT fiber's own in-flight arm on the SAME key in the first place -- there is nothing
+  // for them to wait for. InstallAbsentKeyTombstone's own db_slice.cc-side refusal is therefore
+  // unreachable via any of its current callers: this loader checks and waits BEFORE ever calling
+  // it (with no yield in between the post-wait recheck and that call, so nothing can change in
+  // between), and on a timeout this loader refuses and returns WITHOUT calling it at all. It
+  // stays in place as a defensive fallback for a future caller that forgets this same dance, not
+  // because any call site today can still reach it.
+  static bool WaitForForeignArmToClear(DbIndex db_index, std::string_view key);
+
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is
   // requested.
   std::error_code FinalizeCurrentChunkIfNeeded();

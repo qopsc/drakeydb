@@ -533,17 +533,21 @@ class MvccStamper {
   bool OwnsArm(DbIndex db_index, std::string_view key) const;
 
   // drakeydb: P4-5 -- owner-agnostic counterpart to OwnsArm above -- true iff ANY fiber, not
-  // just the calling one, currently holds a plain or tombstone arm for (db_index, key).
-  // Two kinds of caller, both in rdb_load.cc/db_slice.cc: the install-time refusal
-  // (`IsArmedByAnyFiber(...) && !OwnsArm(...)` -- a foreign arm, never this fiber's own --
-  // guards InstallAbsentKeyTombstone, the non-merge V2 install, and RdbLoader::
-  // CreateObjectOnShard's own merge-load live install) and TombstoneGcStep's own defence-in-depth
-  // check (db_slice.cc, unconditional -- ANY arm, including this fiber's own, blocks the erase
-  // there). The install-time refusal removes the one known way a slot can go from "correctly
-  // still armed" to "looks like an ordinary aged tombstone" without its arm ever resolving, but
-  // TombstoneGcStep's own check does not assume that refusal is the only such path a future
-  // producer could add -- it is a second, independent barrier against erasing a slot whose
-  // delete has not actually committed yet, regardless of how it got into that state.
+  // just the calling one, currently holds a plain or tombstone arm for (db_index, key). Three
+  // kinds of caller:
+  //   * RdbLoader::WaitForForeignArmToClear (rdb_load.cc, `IsArmedByAnyFiber(...) &&
+  //     !OwnsArm(...)` -- a foreign arm, never this fiber's own) polls this at its three
+  //     peer-sourced install sites (ApplyMergeTombstoneOnShard's no-live-key fallthrough,
+  //     CreateObjectOnShard's own live install, and HandleTombstones' own non-merge install
+  //     lambda) to wait, bounded, for that arm's owner to resolve before ever installing over it.
+  //   * Those same three sites' own install-time refusal (InstallAbsentKeyTombstone, this same
+  //     conjunct) is the fallback once that wait times out, or if a caller ever reaches the
+  //     install without waiting first.
+  //   * TombstoneGcStep's own defence-in-depth check (db_slice.cc, unconditional -- ANY arm,
+  //     including this fiber's own, blocks the erase there) does not assume either of the above
+  //     is the only path that could leave a slot "correctly still armed" but "looking like an
+  //     ordinary aged tombstone" -- it is a second, independent barrier against erasing a slot
+  //     whose delete has not actually committed yet, regardless of how it got into that state.
   // armed_.empty() is checked first so the common case (nothing armed on this shard thread at
   // all) costs one size() read, not a scan.
   bool IsArmedByAnyFiber(DbIndex db_index, std::string_view key) const;
