@@ -14,6 +14,17 @@
 
 #include "server/common.h"  // DbIndex
 
+// drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: forward-declared only, never included here, since
+// Armed (below) needs merely a pointer to this type, never its full definition -- the same
+// forward-declare-a-pointer-only discipline synchronization.h already uses for EngineShard*.
+namespace util {
+namespace fb2 {
+namespace detail {
+class FiberInterface;
+}  // namespace detail
+}  // namespace fb2
+}  // namespace util
+
 namespace dfly {
 
 // drakeydb: Phase 4. A per-shard logical clock in KeyDB's layout (ms << 20 | counter,
@@ -476,9 +487,19 @@ class MvccStamper {
   // every test in mvcc_test.cc that does not otherwise care about the floor (passing `MvccStamp{}`
   // there by name, not by omission).
   void ArmTombstone(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp);
-  // Erases EVERY arm matching (db_index, key), not just the first -- see the .cc for why a
-  // single-match version corrupted the mvcc side table.
+  // Erases EVERY arm matching (db_index, key) AND owned by the CALLING fiber, not just the first
+  // -- see the .cc for why a single-match version corrupted the mvcc side table, and why the
+  // owner conjunct (D-14(a), ISSUE-REGISTER.md) is required too.
   void Disarm(DbIndex db_index, std::string_view key);
+
+  // drakeydb: P4-5 -- D-14(a): true iff the CALLING fiber (util::fb2::detail::FiberActive(), the
+  // same identity ThreadLocalMutex already uses -- synchronization.h/.cc) holds any arm -- plain
+  // or tombstone -- for (db_index, key) right now. Lets a caller about to overwrite an
+  // uncommitted {kTombstoneBit, 0} placeholder tell its OWN pending delete (armed earlier in this
+  // same callback, safe to overwrite) apart from a DIFFERENT, concurrent fiber's still-in-flight
+  // one on the same shard thread (unsafe: that fiber's own eventual Commit()/CommitOwnTombstone
+  // call would then find no arm left to stamp).
+  bool OwnsArm(DbIndex db_index, std::string_view key) const;
 
   // The caller always supplies a non-zero stamp: the author's freshly minted
   // max(HopStamp(now_ms), LocalMintFloor()) (D3's floor against every key this entry is about to
@@ -579,9 +600,25 @@ class MvccStamper {
   // stamp instead of its real author stamp. No caller today ever arms a sibling before reaching
   // that point; this lets each one confirm that with a DCHECK rather than relying on it staying
   // true by accident as the callers around CommitOwnTombstone change.
+  //
+  // drakeydb: P4-5 -- D-14(a): the RAW total, every owner included -- deliberately left unscoped,
+  // unlike OwnedArmedCount() just below. Every existing caller of THIS method runs immediately
+  // after its own CommitOwnTombstone call, in a callback that (today) never arms a sibling key at
+  // all, so the two counts happen to agree there regardless; kept distinct from
+  // OwnedArmedCount() so a future caller that genuinely wants "every arm on this thread,
+  // regardless of who placed it" (e.g. measuring how often a foreign arm is actually seen) still
+  // has a primitive to read that with.
   size_t ArmedCount() const {
     return armed_.size();
   }
+
+  // drakeydb: P4-5 -- D-14(a): like ArmedCount() above, but counts only arms owned by the
+  // CALLING fiber -- util::fb2::detail::FiberActive() at call time. Replaces ArmedCount() at
+  // every derived-DEL DCHECK site (db_slice.cc, set_family.cc, hset_family.cc): each of those
+  // wants "did MY OWN callback leave a sibling key armed", not "is armed_ empty for every fiber
+  // that happens to share this shard thread" -- a different, concurrently-pending fiber's own
+  // in-flight arm must not trip a DCHECK that is checking THIS callback's own bookkeeping.
+  size_t OwnedArmedCount() const;
 
   const Stats& stats() const {
     return stats_;
@@ -601,7 +638,7 @@ class MvccStamper {
     // into the stamp it hands this arm's CommitFn call, and only this arm's.
     //
     // No default member initializer, deliberately (P4-4 Task A5): both Arm() and
-    // ArmTombstone() (mvcc.cc) already fully specify all 5 fields of every Armed{} they
+    // ArmTombstone() (mvcc.cc) already fully specify all 6 fields of every Armed{} they
     // construct, so nothing needs one -- and giving it one would SUPPRESS
     // -Wmissing-field-initializers (-Wextra, -Werror in CI) for a FUTURE aggregate-init that
     // forgot a field, silently defaulting `tombstone` to false and `prev_stamp` (below) to
@@ -616,6 +653,18 @@ class MvccStamper {
     // the journal.cc lambda reads it for BOTH arm kinds, never a live table lookup.
     // No default member initializer either, for the same reason `tombstone` above has none.
     MvccStamp prev_stamp;
+    // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: the fiber that placed this arm --
+    // util::fb2::detail::FiberActive() at Arm()/ArmTombstone() time, the same identity
+    // ThreadLocalMutex already uses (synchronization.h/.cc) to tell fibers on one shard thread
+    // apart. Yield-stable by construction (unlike an ambient RAII scope id, which the loader's
+    // own yield inside FindMutable, rdb_load.cc, would misattribute across): Disarm,
+    // CommitOwnTombstone's search, Arm()'s own placeholder-inheritance scan, and LocalMintFloor
+    // (mvcc.cc) all restrict themselves to arms whose owner matches the CALLING fiber, so one
+    // fiber's in-flight arm on a shared shard thread can never be mistaken for another's.
+    // Commit() and EndOfWriteEpoch() are deliberately left UNSCOPED still -- measuring how often
+    // either would actually see a foreign arm comes first (D-14, ISSUE-REGISTER.md).
+    // No default member initializer either, for the same reason `tombstone` above has none.
+    util::fb2::detail::FiberInterface* owner;
   };
 
   std::string_view ArmedKey(const Armed& a) const {

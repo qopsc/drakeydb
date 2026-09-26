@@ -6,9 +6,14 @@
 #include <absl/cleanup/cleanup.h>
 #include <xxhash.h>
 
-#include <algorithm>  // std::max
+#include <algorithm>  // std::max, std::count_if
 
 #include "base/logging.h"  // DCHECK
+// drakeydb: P4-5 -- D-14(a): only for util::fb2::detail::FiberActive()/FiberInterface, which
+// mvcc.h forward-declares (a pointer-only need there) but this file calls and compares by value.
+// synchronization.cc reaches the same declaration transitively, through server/synchronization.h
+// -> util/fibers/fibers.h -> this header; mvcc.h has no such fibers.h include to ride along with.
+#include "util/fibers/detail/fiber_interface.h"
 
 namespace dfly {
 
@@ -93,9 +98,18 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 // `prev_stamp.Mvcc() == 0` excludes both a genuinely fresh {0,0} slot and an uncommitted
 // placeholder (Mvcc() masks bit 63, so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too)
 // -- neither carries a real prior stamp to floor a local mint against.
+//
+// drakeydb: P4-5 -- D-14(a): scoped to the CALLING fiber's own arms only (Armed::owner, mvcc.h).
+// Without this, a DIFFERENT fiber's still-pending arm on the same shard thread -- the RDB merge
+// loader's own callback yielding inside FindMutable (rdb_load.cc), or a concurrent inline
+// transaction yielding in journal throttling -- could inflate THIS fiber's own local mint floor
+// with a prior stamp that has nothing to do with the entry this fiber is about to commit.
 uint64_t MvccStamper::LocalMintFloor() const {
   uint64_t floor = 0;
+  const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
+    if (a.owner != self)
+      continue;
     const uint64_t prev_mvcc = a.prev_stamp.Mvcc();
     if (prev_mvcc == 0)
       continue;
@@ -119,10 +133,20 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key, const MvccStamp& p
   // placeholder check first, so the common case (a real prior stamp, or none) never pays this
   // O(armed_.size()) scan; done BEFORE arena_.append() below, so every earlier arm's ArmedKey()
   // is still valid to compare against (arena_ has not been touched yet by this call).
+  //
+  // drakeydb: P4-5 -- D-14(a): the scan is also scoped to `self` (the CALLING fiber, captured
+  // once below and reused as this new Armed's own owner too). A same-callback delete-then-
+  // recreate always arms and re-arms on the SAME fiber, so this changes nothing for that case;
+  // it only stops this call from inheriting a DIFFERENT, concurrent fiber's own pending
+  // tombstone arm for the same key name -- e.g. this fiber's own EnsureMvcc clearing a
+  // tombstone placeholder that a DIFFERENT fiber's still-in-flight delete just installed, which
+  // must be handed the placeholder verbatim (Mvcc() == 0: no real prior stamp of THIS fiber's
+  // own to floor against), never that other fiber's actual prior value.
+  util::fb2::detail::FiberInterface* const self = util::fb2::detail::FiberActive();
   MvccStamp effective_prev = prev_stamp;
   if (prev_stamp.IsTombstone() && prev_stamp.Mvcc() == 0) {
     for (const Armed& a : armed_) {
-      if (a.tombstone && a.db_index == db_index && ArmedKey(a) == key) {
+      if (a.owner == self && a.tombstone && a.db_index == db_index && ArmedKey(a) == key) {
         effective_prev = a.prev_stamp;
         break;
       }
@@ -130,8 +154,8 @@ void MvccStamper::Arm(DbIndex db_index, std::string_view key, const MvccStamp& p
   }
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
-  armed_.push_back(
-      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/false, effective_prev});
+  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/false,
+                         effective_prev, self});
 }
 
 // drakeydb: P4-3 Task 2 -- see the declaration (mvcc.h) for the contract. Identical to Arm()
@@ -146,8 +170,9 @@ void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
                                  "corrupting that iteration";
   const uint32_t off = static_cast<uint32_t>(arena_.size());
   arena_.append(key);
-  armed_.push_back(
-      Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true, prev_stamp});
+  // drakeydb: P4-5 -- D-14(a): owner = the calling fiber, matching Arm() above.
+  armed_.push_back(Armed{db_index, off, static_cast<uint32_t>(key.size()), /*tombstone=*/true,
+                         prev_stamp, util::fb2::detail::FiberActive()});
 }
 
 // drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
@@ -165,25 +190,55 @@ void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
 // process; see multi_master_test.cc's HdelEmptyingHashDoesNotResurrectAStamp and its two
 // FieldExpire siblings for the regression coverage.
 //
-// Disarm's only caller is PerformDeletionAtomic, invoked once the key is gone for good, so there
-// is no scenario where leaving a second arm behind for it is correct -- erasing every match (not
-// de-duplicating in Arm) is the fix. This changes nothing about Arm()'s bookkeeping for the
-// (harmless) case of a still-live key armed more than once in one callback -- Commit() already
-// tolerates that by calling SetMvcc with the same stamp value once per arm -- and only removes
-// arms for keys that no longer exist, so stats_.unstamped_writes (only ever incremented by
-// EndOfWriteEpoch(), never by Disarm()) is unaffected either way. Already an O(n) scan in the
-// worst case (no match), so continuing past the first match instead of returning early costs
-// nothing extra asymptotically.
+// PerformDeletionAtomic (db_slice.cc) calls this once the key is gone for good, so for THAT
+// caller there is no scenario where leaving a second arm behind for it is correct -- erasing
+// every match (not de-duplicating in Arm) is the fix. This changes nothing about Arm()'s
+// bookkeeping for the (harmless) case of a still-live key armed more than once in one callback --
+// Commit() already tolerates that by calling SetMvcc with the same stamp value once per arm --
+// and only removes arms for keys that no longer exist, so stats_.unstamped_writes (only ever
+// incremented by EndOfWriteEpoch(), never by Disarm()) is unaffected either way. Already an O(n)
+// scan in the worst case (no match), so continuing past the first match instead of returning
+// early costs nothing extra asymptotically.
+//
+// drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: rdb_load.cc's own merge-tombstone apply calls
+// this too (a SECOND, later class of caller, not just PerformDeletionAtomic), from a callback
+// dispatched onto a shard's queue -- the same queue every ordinary transaction hop shares -- and
+// that callback can itself yield (inside FindMutable) before reaching this call. The `a.owner ==
+// self` conjunct below is what makes "every match" mean "every match this fiber itself placed":
+// without it, this call would erase a DIFFERENT, concurrently-pending fiber's own in-flight arm
+// for the same key too -- e.g. a client's own DEL, mid-yield in the same window -- orphaning that
+// fiber's own eventual Commit() (a real, minted stamp would then never overwrite the
+// {kTombstoneBit, 0} placeholder that fiber's own delete left behind: an immortal, unreapable
+// tombstone, i.e. a silently-lost delete).
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
                                  "armed_, which erase() would corrupt";
+  const auto* const self = util::fb2::detail::FiberActive();
   for (auto it = armed_.begin(); it != armed_.end();) {
-    if (it->db_index == db_index && ArmedKey(*it) == key) {
+    if (it->owner == self && it->db_index == db_index && ArmedKey(*it) == key) {
       it = armed_.erase(it);
     } else {
       ++it;
     }
   }
+}
+
+// drakeydb: P4-5 -- D-14(a): see the declaration (mvcc.h) for the why. A pure read, matching
+// LocalMintFloor's own no-allocation/no-mutation shape above.
+bool MvccStamper::OwnsArm(DbIndex db_index, std::string_view key) const {
+  const auto* const self = util::fb2::detail::FiberActive();
+  for (const Armed& a : armed_) {
+    if (a.owner == self && a.db_index == db_index && ArmedKey(a) == key)
+      return true;
+  }
+  return false;
+}
+
+// drakeydb: P4-5 -- D-14(a): see the declaration (mvcc.h) for the why.
+size_t MvccStamper::OwnedArmedCount() const {
+  const auto* const self = util::fb2::detail::FiberActive();
+  return std::count_if(armed_.begin(), armed_.end(),
+                       [self](const Armed& a) { return a.owner == self; });
 }
 
 void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn) {
@@ -232,13 +287,22 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
 // from whatever ambient (possibly a replicated peer's, possibly old) mvcc/origin a later journal
 // entry's own commit logic would otherwise apply to every key still armed then -- this key's arm
 // is gone by that point regardless, since it is processed and erased right here.
+//
+// drakeydb: P4-5 -- D-14(a): the search below is scoped to the CALLING fiber's own tombstone
+// arm too. Every one of this method's four callers already runs on the fiber that itself
+// ArmTombstone'd the key just above (RecordExpiryBlocking/DeleteReapedContainer/
+// DeleteSetIfEmpty/DeleteIfEmpty all arm-then-immediately-commit within one callback, never
+// across a yield), so this changes nothing for any of them -- it only stops a DIFFERENT,
+// concurrently-pending fiber's own tombstone arm for the same key from being matched (and
+// wrongly committed under THIS fiber's own decision) instead.
 bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, const CommitFn& fn) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "
                                  "call erases from armed_ mid-iteration, which would corrupt an "
                                  "outer Commit()/EndOfWriteEpoch() call's own in-progress "
                                  "iteration over the same container";
+  const auto* const self = util::fb2::detail::FiberActive();
   for (auto it = armed_.begin(); it != armed_.end(); ++it) {
-    if (it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
+    if (it->owner == self && it->db_index == db_index && it->tombstone && ArmedKey(*it) == key) {
       // drakeydb: P4-4 -- `ExpiryTombstoneFor` (mvcc.h) applied to `it->prev_stamp` (this exact
       // arm's own captured pre-delete stamp): one origin_hash tick above the value this tombstone
       // replaces, tombstone bit set -- never that value's own stamp reused verbatim, and never a

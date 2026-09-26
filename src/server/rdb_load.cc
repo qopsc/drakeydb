@@ -3249,6 +3249,13 @@ void RdbLoader::FlushShardAsync(ShardId sid) {
     db_slice.IncrLoadInProgress();
     this->LoadItemsBuffer(ib);
     db_slice.DecrLoadInProgress();
+    // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: this callback is dispatched onto the
+    // target shard's queue -- the same queue every ordinary transaction hop shares -- and
+    // LoadItemsBuffer's own CreateObjectOnShard calls can arm keys (merge-mode installs) but
+    // this callback never calls EndOfWriteEpoch itself. An arm left behind here would still be
+    // "owned" by this exact fiber identity for whatever unrelated task the queue runs on it
+    // next, so nothing may still be armed at this exit -- regardless of who armed it.
+    DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u) << "loader callback exit";
   };
 
   bool preempted = shard_set->Add(sid, std::move(cb));
@@ -4452,6 +4459,18 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
     const ShardId sid = Shard(key, shard_set->size());
     auto install =
         [db_index, key, stamp, meta, merge_lww = merge_lww_, opcode_name] {
+          // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: this callback is dispatched onto the
+          // target shard's queue (or, on the owning shard's own thread, called inline) -- either
+          // way the same queue every ordinary transaction hop shares -- and the merge branch
+          // below (ApplyMergeTombstoneOnShard) can arm and Disarm keys, but this callback never
+          // calls EndOfWriteEpoch itself. Several branches below return early, so this is an
+          // absl::Cleanup (runs on every exit, not just falling off the end) rather than a single
+          // DCHECK pasted after the last statement: an arm left behind on ANY path would still be
+          // "owned" by this exact fiber identity for whatever unrelated task the queue runs on it
+          // next.
+          absl::Cleanup no_leaked_arms = [] {
+            DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u) << "loader callback exit";
+          };
           DbSlice& db_slice = GetCurrentDbSlice();
           // drakeydb: this section is emitted from the per-shard PROLOGUE (snapshot.cc), before
           // this shard's own key stream would otherwise trigger RDB_OPCODE_SELECTDB's per-shard
