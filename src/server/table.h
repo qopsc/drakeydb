@@ -106,11 +106,17 @@ struct DbTableStats {
   // placeholder's owner to commit or roll back -- refusing on sight instead can silently drop a
   // peer's write that should have won a later comparison, with no later delivery to recover it
   // (a value that only ever reached this node via a snapshot, never a journal entry, is never
-  // resent). This counter increments only once that wait times out; DbSlice::
-  // InstallAbsentKeyTombstone's own identical check (its callers never wait) is the fallback for
-  // that timeout path and for any future caller that meets this shape without waiting first --
-  // an ordinary streaming caller (SetCmd::Set, OpRestore, Renamer::DeserializeDest,
-  // RecordAbsentKeyRemoval) never can, since each already holds the key's own lock. Left alone,
+  // resent). This counter increments only once that wait times out; on that path the loader
+  // itself refuses and returns WITHOUT ever calling DbSlice::InstallAbsentKeyTombstone (an
+  // earlier version of this comment wrongly called that method's own
+  // identical check "the fallback for that timeout path", which it is not). What
+  // InstallAbsentKeyTombstone's own check IS a real fallback for is a caller that meets this same
+  // shape without waiting first at all: an ordinary streaming caller (SetCmd::Set, OpRestore,
+  // Renamer::DeserializeDest, RecordAbsentKeyRemoval) holds the key's own lock against every
+  // OTHER locked transaction, but not against the loader's own lock-free FindMutable ->
+  // ExpireIfNeeded -> Del path (rdb_load.cc), whose Del() can arm a tombstone and yield inside
+  // RecordExpiryBlocking (db_slice.cc) with no key lock held at all -- a streaming caller
+  // genuinely can meet that arm. Left alone,
   // the overwrite this refuses would let TombstoneGcStep (db_slice.cc) later reap the slot
   // before the placeholder's own owner ever commits, aborting that owner's SetExistingMvcc call
   // on CHECK(!it.is_done()). Purely diagnostic, like mvcc_tombstones_dropped/

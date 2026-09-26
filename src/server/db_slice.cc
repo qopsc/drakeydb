@@ -1855,10 +1855,15 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   // ever commits, and that owner's later SetExistingMvcc then aborts on CHECK(!it.is_done()).
   // Refuse instead, the same way a losing MergeAccepts compare would: leave the placeholder
   // exactly as its owner left it, for that owner's own eventual Commit()/rollback to resolve.
-  // Unreachable via this method's own current callers today (see the declaration, db_slice.h):
-  // the loader itself waits for this exact placeholder to resolve, in its own caller, strictly
-  // before ever reaching this call, and every OTHER caller already holds this key's lock, which
-  // excludes a DIFFERENT fiber's arm on it entirely. Kept as the defensive fallback regardless.
+  // Unreachable via the loader's own current calls (see the declaration, db_slice.h): the loader
+  // itself waits for this exact placeholder to resolve, in its own caller, strictly before ever
+  // reaching this call. Reachable via a DIFFERENT caller, though: this
+  // key's lock, held by whichever transaction callback reaches this method, excludes every OTHER
+  // LOCKED transaction on the same key, but not the loader's own lock-free FindMutable ->
+  // ExpireIfNeeded -> Del path (rdb_load.cc), whose Del() can arm a tombstone and then yield inside
+  // RecordExpiryBlocking (this file) while journaling that lazy expiry, with no key lock of its
+  // own held at all. A genuinely foreign arm left behind that way is exactly the shape this check
+  // exists to catch, so this is a real defensive fallback, not merely a hypothetical one.
   //
   // IsArmedByAnyFiber(db_ind, key) && !OwnsArm(db_ind, key) -- "someone still has an arm on this
   // key, and it is not me" -- not OwnsArm() alone: a caller reached here right after Disarming
@@ -3378,10 +3383,16 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // first, letting this step reap a slot its own owner had not yet resolved. (The live install's
 // own version of this harm looks slightly different: the slot turns LIVE rather than staying a
 // tombstone, so this step's own Mvcc()!=0 check does not even apply to it -- it is the dense
-// invariant itself, mvcc->size() - mvcc_tombstones == prime.size(), that breaks instead, and GC
-// never gets a chance to reap anything because the slot no longer looks like a tombstone at
-// all.) All three now wait, bounded, for the placeholder's owner to resolve before ever
-// installing over it, and refuse outright only once that wait times out -- see
+// invariant itself, mvcc->size() - mvcc_tombstones == prime.size(), that breaks instead. GC does
+// not skip it because the slot "no longer looks like a tombstone": this step's own
+// prime.Find(key) check just below is what skips it, exactly as it would for any other live
+// key, because prime genuinely still holds a resident value for that key now. The owner's own
+// eventual SetExistingMvcc call (this file) DOES re-tombstone the mvcc-side stamp once it
+// commits -- was_tombstone flips back to true there, and mvcc_tombstones is incremented again --
+// but that only puts the mvcc side back in tombstone shape; it does nothing to the live value the
+// competing install already wrote into prime, so the dense invariant mismatch this creates is not
+// transient at all.) All three now wait, bounded, for the placeholder's owner to resolve before
+// ever installing over it, and refuse outright only once that wait times out -- see
 // RdbLoader::WaitForForeignArmToClear's own declaration (rdb_load.h) for the full account. That
 // wait-then-refuse is what keeps the Mvcc()==0 discriminator below meaningful in the first
 // place. The per-key check just below is defence in depth on top of it, not a substitute for it:

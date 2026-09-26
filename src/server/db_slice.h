@@ -534,12 +534,18 @@ class DbSlice {
   // DIFFERENT fiber's still-uncommitted {kTombstoneBit, 0} placeholder (MvccStamper::
   // IsArmedByAnyFiber true, OwnsArm false) -- see the .cc for the CHECK(!it.is_done()) abort this
   // closes. The placeholder is left untouched either way; nothing here rolls it back. This
-  // method itself never waits for that placeholder to resolve first (its own callers -- SetCmd::
+  // method itself never waits for that placeholder to resolve first. Its own callers -- SetCmd::
   // Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval -- run inside a transaction
-  // callback already holding this key's own lock, so none of them can ever meet a DIFFERENT
-  // fiber's arm on it in the first place); RdbLoader::ApplyMergeTombstoneOnShard does the
-  // waiting, in its own caller, before it ever reaches this call (rdb_load.cc's own
-  // WaitForForeignArmToClear).
+  // callback holding this key's own lock, which excludes every OTHER locked transaction on the
+  // same key, but NOT every possible foreign arm. The loader's own
+  // FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc) takes no key lock at all, and that
+  // Del() can arm a tombstone and then yield inside RecordExpiryBlocking (this file) while
+  // journaling the lazy expiry -- a lock-free pending arm a streaming caller genuinely could meet
+  // here. Every one of the loader's OWN three peer-sourced install sites does the waiting itself,
+  // in its own caller, strictly before ever reaching this call (rdb_load.cc's own
+  // WaitForForeignArmToClear) -- so no CURRENT call from the loader ever reaches this refusal --
+  // but a streaming caller meeting the loader's own lazy-expiry arm has no such wait and refuses
+  // right here, which is exactly the real (not merely hypothetical) case this guards.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
   // drakeydb: P4-5 -- names, once, the rule every call site below shares: a tombstone (`stamp`

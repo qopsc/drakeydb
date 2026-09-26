@@ -540,9 +540,12 @@ class MvccStamper {
   //     peer-sourced install sites (ApplyMergeTombstoneOnShard's no-live-key fallthrough,
   //     CreateObjectOnShard's own live install, and HandleTombstones' own non-merge install
   //     lambda) to wait, bounded, for that arm's owner to resolve before ever installing over it.
-  //   * Those same three sites' own install-time refusal (InstallAbsentKeyTombstone, this same
-  //     conjunct) is the fallback once that wait times out, or if a caller ever reaches the
-  //     install without waiting first.
+  //   * InstallAbsentKeyTombstone's own identical conjunct (db_slice.h/.cc) is NOT the fallback
+  //     for that wait's own timeout: on a timeout the loader itself refuses and returns WITHOUT
+  //     ever calling InstallAbsentKeyTombstone. It is the fallback for
+  //     a DIFFERENT caller that reaches the install without waiting first at all -- reachable, not
+  //     hypothetical: the loader's own lock-free FindMutable -> ExpireIfNeeded -> Del path
+  //     (rdb_load.cc) can leave exactly this shape of arm pending for a streaming caller to meet.
   //   * TombstoneGcStep's own defence-in-depth check (db_slice.cc, unconditional -- ANY arm,
   //     including this fiber's own, blocks the erase there) does not assume either of the above
   //     is the only path that could leave a slot "correctly still armed" but "looking like an
