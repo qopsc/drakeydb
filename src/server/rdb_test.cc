@@ -2683,6 +2683,21 @@ class RdbMvccTest : public RdbTest {
     absl::SetFlag(&FLAGS_num_shards, 1);
   }
 
+  // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: the same permanent canary
+  // MvccStoreTest::TearDown (multi_master_test.cc) asserts -- every loader-driven mvcc test in
+  // this fixture gets it for free. Read BEFORE BaseFamilyTest::TearDown() tears the shard threads
+  // down, the same ordering constraint that fixture's own TotalForeignArmsSeen() needs.
+  void TearDown() override {
+    std::atomic<uint64_t> foreign_arms_seen{0};
+    shard_set->pool()->AwaitBrief([&](unsigned, auto*) {
+      foreign_arms_seen += MvccStamper::tlocal()->stats().foreign_arms_seen;
+    });
+    EXPECT_EQ(foreign_arms_seen.load(), 0u)
+        << "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
+           "fiber's arm in this fixture's own tests -- see D-14, ISSUE-REGISTER.md";
+    RdbTest::TearDown();
+  }
+
   absl::FlagSaver saver_;
 };
 
