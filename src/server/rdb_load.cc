@@ -3252,9 +3252,10 @@ void RdbLoader::FlushShardAsync(ShardId sid) {
     // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: this callback is dispatched onto the
     // target shard's queue -- the same queue every ordinary transaction hop shares -- and
     // LoadItemsBuffer's own CreateObjectOnShard calls can arm keys (merge-mode installs) but
-    // this callback never calls EndOfWriteEpoch itself. An arm left behind here would still be
-    // "owned" by this exact fiber identity for whatever unrelated task the queue runs on it
-    // next, so nothing may still be armed at this exit -- regardless of who armed it.
+    // this callback never calls EndOfWriteEpoch itself. OwnedArmedCount() (not the raw
+    // ArmedCount()) is exactly right here: an arm this callback itself left behind would still
+    // be "owned" by this exact fiber identity for whatever unrelated task the queue runs on it
+    // next, so nothing this fiber armed may still be pending at this exit.
     DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u) << "loader callback exit";
   };
 
@@ -4201,6 +4202,13 @@ io::Result<bool> RdbLoader::ReadAndDispatchObject(int object_type, std::string& 
     const DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
     DbSlice& db_slice = db_cntx.GetDbSlice(sid);
     CreateObjectOnShard(db_cntx, item, &db_slice);
+    // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: the same guard as FlushShardAsync's own
+    // shard_set->Add callback (above in this file), for the same reason -- CreateObjectOnShard
+    // can arm keys (merge-mode installs), this call runs directly on whatever fiber is dispatching
+    // this record (the loader's own parsing fiber when it is already on the target shard's
+    // thread, never via shard_set->Add here), and nothing downstream of this call ever calls
+    // EndOfWriteEpoch for it.
+    DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u) << "loader callback exit";
   } else {
     auto& out_buf = shard_buf_[sid];
     out_buf.emplace_back(item);

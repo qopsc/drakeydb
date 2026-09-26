@@ -2879,7 +2879,7 @@ void DbSlice::DeleteReapedContainer(const Context& cntx, string_view key, Iterat
           }
         });
     if (found_tombstone) {
-      DCHECK_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
+      DCHECK_EQ(MvccStamper::tlocal()->ArmedCount(), 0u)
           << "a sibling key was still armed when this derived DEL's own RecordEntry call was "
              "about to run its generic per-arm sweep -- that sweep would floor the sibling "
              "against this tombstone's own stamp instead of its real author stamp";
@@ -3562,7 +3562,7 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, DbTable* table, bool
   // constraint is needed here between this side-table write, the key stream, and a concurrent
   // journal blob from another peer link on this same shard thread.
   if (mvcc_enabled_ && ns_ == &namespaces->GetDefaultNamespace()) {
-    MvccStamper::tlocal()->Disarm(table->index, del_it.key());
+    MvccStamper::tlocal()->DisarmAnyOwner(table->index, del_it.key());
     // drakeydb: P4-3 Task 11 -- kExpired joins kExplicit here, closing the STOP finding documented
     // above this function: ExpireIfNeeded and DeleteReapedContainer now both journal AFTER
     // Del()/PerformDeletionAtomic, so the ArmTombstone() call below is always consumed by THIS

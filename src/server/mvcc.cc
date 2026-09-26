@@ -99,17 +99,18 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 // placeholder (Mvcc() masks bit 63, so PerformDeletionAtomic's {kTombstoneBit, 0} lands here too)
 // -- neither carries a real prior stamp to floor a local mint against.
 //
-// drakeydb: P4-5 -- D-14(a): scoped to the CALLING fiber's own arms only (Armed::owner, mvcc.h).
-// Without this, a DIFFERENT fiber's still-pending arm on the same shard thread -- the RDB merge
-// loader's own callback yielding inside FindMutable (rdb_load.cc), or a concurrent inline
-// transaction yielding in journal throttling -- could inflate THIS fiber's own local mint floor
-// with a prior stamp that has nothing to do with the entry this fiber is about to commit.
+// drakeydb: P4-5 -- D-14(a): deliberately NOT scoped to the calling fiber's own arms
+// (Armed::owner, mvcc.h), unlike Disarm/CommitOwnTombstone/Arm()'s own inheritance scan -- paired
+// with Commit() (mvcc.cc, below), which stamps EVERY currently-armed key with this entry's mint,
+// regardless of which fiber placed it. If this floor considered only this fiber's own arms, a
+// DIFFERENT fiber's still-pending key -- one Commit() is about to sweep up right alongside this
+// entry's own -- could get committed BELOW its own real prior stamp, rewinding it. Scoping this
+// one without also scoping Commit() itself would trade a floor bug for a rewind bug; both stay
+// unscoped together until a measurement of how often Commit() actually sees a foreign arm
+// decides whether scoping either is worth it (D-14, ISSUE-REGISTER.md).
 uint64_t MvccStamper::LocalMintFloor() const {
   uint64_t floor = 0;
-  const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
-    if (a.owner != self)
-      continue;
     const uint64_t prev_mvcc = a.prev_stamp.Mvcc();
     if (prev_mvcc == 0)
       continue;
@@ -175,11 +176,11 @@ void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
                          prev_stamp, util::fb2::detail::FiberActive()});
 }
 
-// drakeydb: Phase 4, review wave 2 (F1, CRITICAL) -- erases EVERY arm matching (db_index, key),
-// not just the first. A key can be armed more than once before it is deleted: e.g. HDEL emptying
-// a hash arms it via ExecuteW's own it_res->post_updater.Run() (hset_family.cc), then DeleteHw
-// takes a SECOND, independent FindMutable/AutoUpdater on the same still-present key and arms it
-// again via its own post_updater.Run() before calling Del -- OpFieldExpire's
+// drakeydb: Phase 4 -- erases EVERY arm matching (db_index, key), not just the first. A key can
+// be armed more than once before it is deleted: e.g. HDEL emptying a hash arms it via ExecuteW's
+// own it_res->post_updater.Run() (hset_family.cc), then DeleteHw takes a SECOND, independent
+// FindMutable/AutoUpdater on the same still-present key and arms it again via its own
+// post_updater.Run() before calling Del -- OpFieldExpire's
 // auto_updater.Run()-then-Delete{Set}IfEmpty->DelMutable shape (generic_family.cc) is the same
 // pattern on both the HASH and SET branches. The original single-match version (erase the first
 // hit, `return`) left one arm behind for a key PerformDeletionAtomic had just erased from `prime`
@@ -188,34 +189,57 @@ void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
 // mvcc->size()/prime->size() parity (the DCHECK in DbSlice::OnCbFinishBlocking) --
 // reproduced verbatim on `HSET h f v` then `HDEL h f` under --active_replica, which aborts the
 // process; see multi_master_test.cc's HdelEmptyingHashDoesNotResurrectAStamp and its two
-// FieldExpire siblings for the regression coverage.
+// FieldExpire siblings for the regression coverage. This "erase every match" property is shared
+// by DisarmAnyOwner below -- PerformDeletionAtomic's (db_slice.cc) own caller -- and this method,
+// which additionally scopes those matches to the calling fiber's own.
 //
-// PerformDeletionAtomic (db_slice.cc) calls this once the key is gone for good, so for THAT
-// caller there is no scenario where leaving a second arm behind for it is correct -- erasing
-// every match (not de-duplicating in Arm) is the fix. This changes nothing about Arm()'s
-// bookkeeping for the (harmless) case of a still-live key armed more than once in one callback --
-// Commit() already tolerates that by calling SetMvcc with the same stamp value once per arm --
-// and only removes arms for keys that no longer exist, so stats_.unstamped_writes (only ever
-// incremented by EndOfWriteEpoch(), never by Disarm()) is unaffected either way. Already an O(n)
-// scan in the worst case (no match), so continuing past the first match instead of returning
-// early costs nothing extra asymptotically.
-//
-// drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: rdb_load.cc's own merge-tombstone apply calls
-// this too (a SECOND, later class of caller, not just PerformDeletionAtomic), from a callback
-// dispatched onto a shard's queue -- the same queue every ordinary transaction hop shares -- and
-// that callback can itself yield (inside FindMutable) before reaching this call. The `a.owner ==
-// self` conjunct below is what makes "every match" mean "every match this fiber itself placed":
-// without it, this call would erase a DIFFERENT, concurrently-pending fiber's own in-flight arm
-// for the same key too -- e.g. a client's own DEL, mid-yield in the same window -- orphaning that
-// fiber's own eventual Commit() (a real, minted stamp would then never overwrite the
-// {kTombstoneBit, 0} placeholder that fiber's own delete left behind: an immortal, unreapable
-// tombstone, i.e. a silently-lost delete).
+// drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: scoped to the CALLING fiber (Armed::owner,
+// mvcc.h), because rdb_load.cc's own merge-tombstone apply is this method's only caller, from a
+// callback dispatched onto a shard's queue -- the same queue every ordinary transaction hop
+// shares -- that can itself yield (inside FindMutable) before reaching this call, without ever
+// physically deleting the key it disarms (a merge-tombstone install only ever overwrites the
+// mvcc side-table entry, never `prime`). Without the owner conjunct, this call would erase a
+// DIFFERENT, concurrently-pending fiber's own in-flight arm for the same key too -- e.g. a
+// client's own DEL, mid-yield in the same window -- orphaning that fiber's own eventual Commit()
+// (a real, minted stamp would then never overwrite the {kTombstoneBit, 0} placeholder that
+// fiber's own delete left behind: an immortal, unreapable tombstone, i.e. a silently-lost
+// delete). PerformDeletionAtomic (db_slice.cc) does NOT call this method -- see DisarmAnyOwner
+// below for why it needs the opposite scoping.
 void MvccStamper::Disarm(DbIndex db_index, std::string_view key) {
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
                                  "armed_, which erase() would corrupt";
   const auto* const self = util::fb2::detail::FiberActive();
   for (auto it = armed_.begin(); it != armed_.end();) {
     if (it->owner == self && it->db_index == db_index && ArmedKey(*it) == key) {
+      it = armed_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// drakeydb: P4-5 -- D-14(a): PerformDeletionAtomic's (db_slice.cc) own caller, and the reason
+// Disarm above cannot simply be made owner-agnostic across the board instead of adding a second
+// method: a key that has just been physically deleted (erased from `prime`) must keep no arm
+// from ANY fiber, not just this one's. The sequence this closes: an inline client write on fiber
+// C arms key k and yields (e.g. in AddLogRecord's own journal-throttling wait); a DIFFERENT
+// fiber physically deletes k on this same shard thread while C is still waiting -- ending in
+// EraseMvcc (db_slice.cc), whether because of the per-(db, shard) tombstone cap, the born-expired
+// refusal, tombstones being disabled, or an unstamped lazy expiry. If that delete's own disarm
+// call were scoped to ITS OWN fiber (as Disarm above is), C's now-stale arm for k would survive
+// it; C's own eventual Commit() then hands that stale arm to SetExistingMvcc (db_slice.cc), which
+// CHECKs that k's mvcc slot still exists -- it does not, because EraseMvcc just removed it --
+// aborting the process even in a release build. Scoping this call to ANY owner instead means the
+// physical deletion always wins: C's stale arm is swept away along with everything else for k,
+// and C's write is lost silently (this method's own long-standing behavior, before D-14(a) ever
+// existed) rather than crashing the process. When the delete instead earns a tombstone
+// (SetTombstone + ArmTombstone, both below in db_slice.cc), this call runs BEFORE the re-arm, so
+// it never erases the tombstone arm it is about to place.
+void MvccStamper::DisarmAnyOwner(DbIndex db_index, std::string_view key) {
+  DCHECK_EQ(commit_depth_, 0) << "a CommitFn disarmed a key -- Commit() is mid-iteration over "
+                                 "armed_, which erase() would corrupt";
+  for (auto it = armed_.begin(); it != armed_.end();) {
+    if (it->db_index == db_index && ArmedKey(*it) == key) {
       it = armed_.erase(it);
     } else {
       ++it;
@@ -295,7 +319,15 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
 // across a yield), so this changes nothing for any of them -- it only stops a DIFFERENT,
 // concurrently-pending fiber's own tombstone arm for the same key from being matched (and
 // wrongly committed under THIS fiber's own decision) instead.
+//
+// drakeydb: P4-5 -- D-14(a): the empty check below, mirroring Commit()'s own, is not just a
+// micro-optimization here -- this method is reached on a non-active node too, whenever it has a
+// journal at all (RecordExpiryBlocking runs from ordinary local expiry and eviction regardless
+// of active-replica mode), so a non-active node with nothing ever armed must not pay even a
+// single FiberActive() read on that path.
 bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, const CommitFn& fn) {
+  if (armed_.empty())
+    return false;
   DCHECK_EQ(commit_depth_, 0) << "a CommitFn called CommitOwnTombstone() re-entrantly -- this "
                                  "call erases from armed_ mid-iteration, which would corrupt an "
                                  "outer Commit()/EndOfWriteEpoch() call's own in-progress "

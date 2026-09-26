@@ -488,9 +488,18 @@ class MvccStamper {
   // there by name, not by omission).
   void ArmTombstone(DbIndex db_index, std::string_view key, const MvccStamp& prev_stamp);
   // Erases EVERY arm matching (db_index, key) AND owned by the CALLING fiber, not just the first
-  // -- see the .cc for why a single-match version corrupted the mvcc side table, and why the
-  // owner conjunct (D-14(a), ISSUE-REGISTER.md) is required too.
+  // -- see the .cc for why a single-match version corrupted the mvcc side table. Scoped to the
+  // owner (D-14(a), ISSUE-REGISTER.md): used only by rdb_load.cc's own merge-tombstone apply,
+  // never by PerformDeletionAtomic (db_slice.cc) -- see DisarmAnyOwner below for that caller,
+  // and the .cc for why the two must not be the same method.
   void Disarm(DbIndex db_index, std::string_view key);
+  // drakeydb: P4-5 -- D-14(a): like Disarm above, but NOT scoped to the owner -- erases EVERY
+  // arm matching (db_index, key) regardless of which fiber placed it.
+  // PerformDeletionAtomic's (db_slice.cc) ONLY caller: a key that has been physically deleted
+  // (erased from `prime`) must keep no arm from ANY fiber, or that fiber's own later Commit()
+  // finds the mvcc slot gone and CHECK-aborts (SetExistingMvcc, db_slice.cc) -- see the .cc for
+  // the full sequence.
+  void DisarmAnyOwner(DbIndex db_index, std::string_view key);
 
   // drakeydb: P4-5 -- D-14(a): true iff the CALLING fiber (util::fb2::detail::FiberActive(), the
   // same identity ThreadLocalMutex already uses -- synchronization.h/.cc) holds any arm -- plain
@@ -601,23 +610,21 @@ class MvccStamper {
   // that point; this lets each one confirm that with a DCHECK rather than relying on it staying
   // true by accident as the callers around CommitOwnTombstone change.
   //
-  // drakeydb: P4-5 -- D-14(a): the RAW total, every owner included -- deliberately left unscoped,
-  // unlike OwnedArmedCount() just below. Every existing caller of THIS method runs immediately
-  // after its own CommitOwnTombstone call, in a callback that (today) never arms a sibling key at
-  // all, so the two counts happen to agree there regardless; kept distinct from
-  // OwnedArmedCount() so a future caller that genuinely wants "every arm on this thread,
-  // regardless of who placed it" (e.g. measuring how often a foreign arm is actually seen) still
-  // has a primitive to read that with.
+  // drakeydb: P4-5 -- D-14(a): the RAW total, every owner included. Stays the one every
+  // derived-DEL DCHECK site (db_slice.cc, set_family.cc, hset_family.cc) uses: each of those
+  // runs immediately before journal::RecordEntry's own generic per-arm Commit() sweep, which is
+  // itself owner-agnostic (paired with the unscoped LocalMintFloor, mvcc.cc) -- that sweep would
+  // floor ANY still-armed key regardless of which fiber placed it, so the DCHECK must count
+  // every arm too, not just this fiber's own.
   size_t ArmedCount() const {
     return armed_.size();
   }
 
   // drakeydb: P4-5 -- D-14(a): like ArmedCount() above, but counts only arms owned by the
-  // CALLING fiber -- util::fb2::detail::FiberActive() at call time. Replaces ArmedCount() at
-  // every derived-DEL DCHECK site (db_slice.cc, set_family.cc, hset_family.cc): each of those
-  // wants "did MY OWN callback leave a sibling key armed", not "is armed_ empty for every fiber
-  // that happens to share this shard thread" -- a different, concurrently-pending fiber's own
-  // in-flight arm must not trip a DCHECK that is checking THIS callback's own bookkeeping.
+  // CALLING fiber -- util::fb2::detail::FiberActive() at call time. Used by the ABA guard at
+  // every rdb_load.cc loader-callback exit (that callback's own bookkeeping specifically, not
+  // "is armed_ empty for every fiber sharing this shard thread") and by OwnsArm-adjacent callers
+  // -- NOT by the derived-DEL DCHECK sites, which need the raw ArmedCount() above instead.
   size_t OwnedArmedCount() const;
 
   const Stats& stats() const {
