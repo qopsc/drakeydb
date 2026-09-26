@@ -2062,12 +2062,23 @@ TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmAtTheTombstoneCap)
 // drakeydb: P4-5 -- D-14(a): same shape as the erase variant above, but Q's own delete earns a
 // tombstone instead (default cap and ttl) -- PerformDeletionAtomic's earns_tombstone branch
 // (db_slice.cc) re-arms "k" as its OWN tombstone arm right after disarming, so this pins that
-// DisarmAnyOwner does not disturb that immediately-following re-arm: only C's foreign arm is
-// gone, Q's own tombstone arm for the same key survives untouched.
+// DisarmAnyOwner does not disturb that immediately-following re-arm.
+//
+// D-14(b): every real caller of PerformDeletionAtomic's earns-tombstone branch either commits
+// the resulting arm itself, in the same callback, before returning (a journaled command's own
+// journal::RecordEntry -> Commit, with running_tx_ held across any AddLogRecord yield in
+// between, so no other transaction's Commit can reach this shard's armed_ meanwhile), or Disarms
+// it itself, immediately, with nothing in between (RdbLoader::ApplyMergeTombstoneOnShard,
+// rdb_load.cc, right after installing the peer's own stamp via SetTombstone). Q here mirrors
+// that second shape exactly, rather than -- as an earlier version of this test did -- returning
+// while still holding the pending arm for an unrelated fiber's later Commit to sweep up: that
+// shape is not reachable from any real caller, only from this test's own earlier choreography.
 //
 // Falsifying: reverting PerformDeletionAtomic's own call (db_slice.cc) from DisarmAnyOwner back
 // to the owner-scoped Disarm makes armed_right_after_delete come back 2 (C's foreign arm
-// survives alongside Q's own), not 1.
+// survives alongside Q's own), not 1; c_committed_anything comes back true (C's own surviving
+// arm gets committed, overwriting Q's own SetTombstone stamp below with C's meaningless mint);
+// and the final GetMvcc/mismatches checks then diverge from the peer stamp Q installed.
 TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEarned) {
   const ShardId sid = Shard("k", shard_set->size());
   util::ProactorBase* shard_proactor = nullptr;
@@ -2075,6 +2086,7 @@ TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEa
   ASSERT_NE(shard_proactor, nullptr);
 
   util::fb2::Done c_armed, resume_c, c_done;
+  bool c_committed_anything = false;
 
   util::fb2::Fiber fiber_c = shard_proactor->LaunchFiber([&] {
     Namespace& ns = namespaces->GetDefaultNamespace();
@@ -2087,16 +2099,25 @@ TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEa
     res->post_updater.Run();
     c_armed.Notify();
     resume_c.Wait();
+    // C's own eventual journal commit -- must not crash even though "k" no longer exists, and,
+    // with Q now mirroring the loader's own Disarm-then-SetTombstone sequence below, must find
+    // nothing left armed to commit at all.
     MvccStamper::tlocal()->Commit(
         /*mvcc=*/424242, /*origin_idx=*/0,
         [&](DbIndex db, std::string_view key, const MvccStamp& stamp, bool, const MvccStamp&) {
+          c_committed_anything = true;
           db_slice.SetExistingMvcc(db, key, stamp);
         });
     c_done.Notify();
   });
   c_armed.Wait();
 
+  // An arbitrary, recognizable stamp standing in for a peer's own authority -- the value
+  // RdbLoader::ApplyMergeTombstoneOnShard's `stamp` parameter carries in production.
+  const MvccStamp kPeerTombstone{MvccClock::kTombstoneBit | 0x500000ULL, 0x7777u};
+
   size_t armed_right_after_delete = 0;
+  size_t armed_after_loader_disarm = 0;
   shard_set->Await(sid, [&] {
     Namespace& ns = namespaces->GetDefaultNamespace();
     DbSlice& db_slice = ns.GetCurrentDbSlice();
@@ -2106,19 +2127,41 @@ TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEa
     it_res.post_updater.Run();
     db_slice.Del(db_cntx, it_res.it, nullptr, /*async=*/false, DbSlice::DeleteReason::kExplicit);
     armed_right_after_delete = MvccStamper::tlocal()->ArmedCount();
+
+    // Mirrors RdbLoader::ApplyMergeTombstoneOnShard's own sequence (rdb_load.cc) verbatim: Disarm
+    // the pending tombstone arm Del()'s own earns-tombstone branch just left -- own-fiber-scoped,
+    // so this removes Q's own arm only, never C's (already gone via DisarmAnyOwner above) -- then
+    // install the FINAL, peer-authored stamp directly via SetTombstone. Nothing yields between
+    // Del() and here, so nothing else can observe the pending arm in between.
+    MvccStamper::tlocal()->Disarm(0, "k");
+    armed_after_loader_disarm = MvccStamper::tlocal()->ArmedCount();
+    db_slice.SetTombstone(0, "k", kPeerTombstone, kTombMetaNone);
   });
   EXPECT_EQ(armed_right_after_delete, 1u)
-      << "only Q's own tombstone arm may remain -- C's foreign arm must be gone";
+      << "only Q's own tombstone arm may remain right after Del() -- C's foreign arm must be gone";
+  EXPECT_EQ(armed_after_loader_disarm, 0u)
+      << "mirroring the loader's own Disarm call must remove Q's own tombstone arm too -- nothing "
+         "may be left armed across the callback boundary";
 
   resume_c.Notify();
   c_done.Wait();
   fiber_c.Join();
 
+  EXPECT_FALSE(c_committed_anything)
+      << "C's own Commit() must find nothing armed: C's foreign arm (DisarmAnyOwner) and Q's own "
+         "tombstone arm (mirroring the loader's Disarm) are both gone by the time it runs";
+
   size_t mismatches = 0;
+  std::optional<MvccStamp> got;
   shard_set->Await(sid, [&] {
-    mismatches = namespaces->GetDefaultNamespace().GetCurrentDbSlice().TEST_VerifyMvccTable(0);
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
   });
   EXPECT_EQ(mismatches, 0u) << "the dense mvcc<->prime invariant must hold";
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kPeerTombstone)
+      << "the loader-style SetTombstone's own peer stamp must survive untouched by C's Commit()";
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u);
 }
 

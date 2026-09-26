@@ -106,8 +106,9 @@ uint64_t MvccStamper::HopStamp(uint64_t now_ms) {
 // DIFFERENT fiber's still-pending key -- one Commit() is about to sweep up right alongside this
 // entry's own -- could get committed BELOW its own real prior stamp, rewinding it. Scoping this
 // one without also scoping Commit() itself would trade a floor bug for a rewind bug; both stay
-// unscoped together until a measurement of how often Commit() actually sees a foreign arm
-// decides whether scoping either is worth it (D-14, ISSUE-REGISTER.md).
+// unscoped together, since a foreign arm is never actually pending when either runs (see
+// Commit()'s own comment, below, for why) -- foreign_arms_seen (Stats, mvcc.h) plus its warning
+// canary measures that directly rather than leaving it an assumption (D-14, ISSUE-REGISTER.md).
 uint64_t MvccStamper::LocalMintFloor() const {
   uint64_t floor = 0;
   // drakeydb: P4-5 -- D-14(b): measures, without changing anything else about this owner-agnostic
@@ -274,6 +275,15 @@ size_t MvccStamper::OwnedArmedCount() const {
                        [self](const Armed& a) { return a.owner == self; });
 }
 
+// drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: stays owner-agnostic, sweeping every arm in
+// armed_ regardless of which fiber placed it. Safe because no real caller ever leaves a foreign
+// arm pending for this sweep to reach: a journaled command commits its own arm in the same
+// callback that armed it (journal::RecordEntry's Commit, with running_tx_ held across any
+// AddLogRecord yield in between, so no other transaction's Commit can run on this shard
+// meanwhile), and the loader Disarms its own arm immediately after installing its own tombstone,
+// with nothing in between (rdb_load.cc's three scoped Disarm sites). foreign_arms_seen (Stats,
+// mvcc.h) plus its warning canary, below, is the guard that would catch it if that ever stopped
+// holding.
 void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn) {
   if (armed_.empty())
     return;
@@ -309,9 +319,9 @@ void MvccStamper::Commit(uint64_t mvcc, uint32_t origin_idx, const CommitFn& fn)
   };
   // drakeydb: P4-5 -- D-14(b): measures, without changing anything else about this owner-agnostic
   // sweep, how often it actually stamps an arm placed by a different fiber than the one running
-  // this Commit() call -- see Stats::foreign_arms_seen (mvcc.h) and the Armed::owner comment
-  // (mvcc.h) for the full why this stays a measurement, not a scope, until the count says
-  // otherwise.
+  // this Commit() call -- see this function's own header comment above for why that is never
+  // expected to happen, and Stats::foreign_arms_seen (mvcc.h) for the guard that would catch it
+  // if it ever did.
   const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
     if (a.owner != self) {
@@ -417,6 +427,12 @@ bool MvccStamper::CommitOwnTombstone(DbIndex db_index, std::string_view key, con
   return false;
 }
 
+// drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: stays owner-agnostic, discarding every arm in
+// armed_ regardless of which fiber placed it -- same reasoning as Commit()'s own header comment,
+// above: no real caller ever leaves a foreign arm pending for this to reach (a journaled
+// command's own Commit consumes its own arm first; the loader Disarms its own arm immediately
+// after installing its own tombstone). foreign_arms_seen (Stats, mvcc.h) plus its warning
+// canary, below, is the guard that would catch it if that ever stopped holding.
 void MvccStamper::EndOfWriteEpoch(const EraseFn& erase_fn) {
   // The fourth mutator of armed_/arena_ (with Arm/Disarm/Commit, all DCHECK'd above): guards
   // against a CommitFn that calls back into EndOfWriteEpoch() while Commit() is mid-iteration,
