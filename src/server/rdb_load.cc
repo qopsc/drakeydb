@@ -3495,9 +3495,15 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       // orphaned unstamped write (server_family.cc's mvcc_unstamped_writes canary) and roll the
       // placeholder back via RollbackUncommittedTombstone, erasing the very slot the SetTombstone
       // call below is about to (re)write out from under it. Disarm it here, immediately, so no
-      // future epoch end ever sees it: Disarm erases every arm matching (db_index, key) (mvcc.h),
-      // and nothing between Del() and this call yields, so there is no window for a real Commit()
-      // to race this Disarm.
+      // future epoch end ever sees it: Disarm (mvcc.h) erases every arm THIS FIBER owns matching
+      // (db_index, key) -- not every arm regardless of owner, that is DisarmAnyOwner's job -- and
+      // that scoping is exactly what is needed here: the Del() call just above already ran
+      // DisarmAnyOwner (PerformDeletionAtomic, db_slice.cc) synchronously, with no yield in
+      // between, so any OTHER fiber's own prior arm for this key is already gone by the time this
+      // line runs. The only arm left standing is the ArmTombstone that SAME Del() call just placed
+      // a moment ago, on this SAME fiber -- exactly what this Disarm call is meant to remove, and
+      // nothing between Del() and here yields, so there is no window for a real Commit() to race
+      // it.
       MvccStamper::tlocal()->Disarm(db_index, key);
       // drakeydb: P4-5 -- clamp here, at install (mvcc.h's own ClampPeerTombMetaDeadline comment):
       // SetTombstone, unlike InstallAbsentKeyTombstone below, does not clamp internally. This
@@ -3571,9 +3577,11 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
   // unreapable tombstone (TombstoneGcStep's reap predicate requires Mvcc() != 0, db_slice.cc), a
   // silently-lost delete. found_mutable being true, by contrast, means FindMutable DID run for
   // this exact key on this exact call, so Disarming then can only ever target an arm this call's
-  // own FindMutable could have created. (D-14, ISSUE-REGISTER.md, tracks the residual: the steal
-  // window is still open for HandleTombstones' un-serialized shard_set->Add dispatch against a
-  // concurrent same-key client DEL on the target shard when found_mutable IS true.)
+  // own FindMutable could have created -- and, now that Disarm (mvcc.h) is itself scoped to the
+  // CALLING fiber's own arms (Armed::owner), that holds even when a DIFFERENT, concurrent fiber's
+  // own arm for the SAME key is also pending at this exact moment: this call's Disarm simply never
+  // matches a foreign owner, closing the D-14 (ISSUE-REGISTER.md) steal for the found_mutable-true
+  // case too, the same way scoping to found_mutable itself closes the found_mutable-false one.
   if (found_mutable) {
     MvccStamper::tlocal()->Disarm(db_index, key);
   }
@@ -4653,6 +4661,27 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
             return;
           }
           const std::optional<MvccStamp> existing = db_slice.GetMvcc(db_index, key);
+          // drakeydb: P4-5 -- the same foreign-placeholder refusal as
+          // DbSlice::InstallAbsentKeyTombstone (db_slice.cc/.h has the full account of the
+          // CHECK(!it.is_done()) abort this closes): a non-merge load's own callback is dispatched
+          // onto this shard's queue exactly like the merge one is, so it can just as easily land
+          // while a client DEL's placeholder for this same key is still uncommitted. Unreachable
+          // in practice for THIS specific loader path today (D-7: a non-merge load never compares
+          // against a resident value it might delete, so a peer tombstone here never overwrites a
+          // LIVE key), but a placeholder is not a live key -- it is exactly the shape this
+          // callback CAN meet -- and the refusal is cheap, so it applies here too rather than
+          // trusting that no caller ever adds one. IsArmedByAnyFiber() && !OwnsArm(), not OwnsArm()
+          // alone, for the same reason InstallAbsentKeyTombstone's own comment gives: this
+          // callback never arms anything of its own, so OwnsArm() is always false here regardless,
+          // and only a genuinely foreign arm (IsArmedByAnyFiber() true) should ever refuse.
+          if (existing.has_value() && existing->IsTombstone() && existing->Mvcc() == 0 &&
+              MvccStamper::tlocal()->IsArmedByAnyFiber(db_index, key) &&
+              !MvccStamper::tlocal()->OwnsArm(db_index, key)) {
+            ++cur_table->stats.mvcc_foreign_placeholder_skips;
+            VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db="
+                    << db_index << " key=" << absl::CHexEscape(key);
+            return;
+          }
           const bool would_grow = !existing.has_value() || !existing->IsTombstone();
           if (!would_grow ||
               cur_table->stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {

@@ -755,7 +755,8 @@ void DebugCmd::Run(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
         "    tombstone meta word, 0 when none, with bit 63 set marking an anchor-only meta), or",
         "    'state:absent shard:<n>'.",
         "    With no key, prints per-shard aggregates (entries/tombstones/tombstones_dropped/",
-        "    tombstones_born_expired/bytes/clock_last/clock_ahead_ms/unstamped_writes). VERIFY",
+        "    tombstones_born_expired/foreign_placeholder_skips/bytes/clock_last/clock_ahead_ms/",
+        "    unstamped_writes). VERIFY",
         "    runs the from-scratch dense-invariant check on every shard and every db, returning",
         "    'mismatches:<n>'.",
         "    Supported only in the default namespace; errors name --active_replica when the",
@@ -1291,8 +1292,8 @@ void DebugCmd::Inspect(string_view key, facade::CmdArgParser parser, CommandCont
 //   DEBUG MVCC <key>    -- shard-hops to <key>'s shard (Inspect()'s precedent, above) and prints
 //                           its stamp, including gc_at_ms for a tombstone.
 //   DEBUG MVCC          -- per-shard aggregates (side-table entries/tombstones/tombstones_dropped/
-//                           tombstones_born_expired/bytes, this shard's clock/unstamped-write
-//                           counters).
+//                           tombstones_born_expired/foreign_placeholder_skips/bytes, this shard's
+//                           clock/unstamped-write counters).
 //   DEBUG MVCC VERIFY   -- runs the from-scratch dense-invariant check (DbSlice::
 //                           TEST_VerifyMvccTable) on every db of every shard.
 //
@@ -1362,6 +1363,8 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       size_t tombstones_dropped = 0;
       // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h).
       size_t tombstones_born_expired = 0;
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_foreign_placeholder_skips (table.h).
+      size_t foreign_placeholder_skips = 0;
       size_t bytes = 0;
       uint64_t clock_last = 0;
       uint64_t clock_ahead_ms = 0;
@@ -1388,6 +1391,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
       info.tombstones = total.mvcc_tombstones;
       info.tombstones_dropped = total.mvcc_tombstones_dropped;
       info.tombstones_born_expired = total.mvcc_tombstones_born_expired;
+      info.foreign_placeholder_skips = total.mvcc_foreign_placeholder_skips;
       // drakeydb: Task 11 fix round 1 (F3, Minor) -- DbSlice::mvcc_table_memory() (db_slice.h)
       // already sums DbTable::mvcc_table_memory() over every db directly; re-deriving the same
       // number via total.mvcc_table_bytes above would just repeat that summation a second time
@@ -1410,6 +1414,7 @@ void DebugCmd::Mvcc(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
                 "_tombstones:", info.tombstones, " shard", i,
                 "_tombstones_dropped:", info.tombstones_dropped, " shard", i,
                 "_tombstones_born_expired:", info.tombstones_born_expired, " shard", i,
+                "_foreign_placeholder_skips:", info.foreign_placeholder_skips, " shard", i,
                 "_bytes:", info.bytes, " shard", i, "_clock_last:", info.clock_last, " shard", i,
                 "_clock_ahead_ms:", info.clock_ahead_ms, " shard", i,
                 "_unstamped_writes:", info.unstamped_writes, " shard", i,

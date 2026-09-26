@@ -209,9 +209,13 @@ void MvccStamper::ArmTombstone(DbIndex db_index, std::string_view key,
 // drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: scoped to the CALLING fiber (Armed::owner,
 // mvcc.h), because rdb_load.cc's own merge-tombstone apply is this method's only caller, from a
 // callback dispatched onto a shard's queue -- the same queue every ordinary transaction hop
-// shares -- that can itself yield (inside FindMutable) before reaching this call, without ever
-// physically deleting the key it disarms (a merge-tombstone install only ever overwrites the
-// mvcc side-table entry, never `prime`). Without the owner conjunct, this call would erase a
+// shares -- that can itself yield (inside FindMutable) before reaching this call. Two of this
+// method's three call sites never physically delete the key they disarm (a merge-tombstone
+// install there only ever overwrites the mvcc side-table entry, never `prime`); the third,
+// immediately after that same call's own Del()/PerformDeletionAtomic (db_slice.cc), DOES -- but
+// that Del() call already ran DisarmAnyOwner synchronously, with no yield in between, so by the
+// time this call runs there is nothing left to disarm except the ArmTombstone that same Del()
+// call just placed, on this SAME fiber. Without the owner conjunct, this call would erase a
 // DIFFERENT, concurrently-pending fiber's own in-flight arm for the same key too -- e.g. a
 // client's own DEL, mid-yield in the same window -- orphaning that fiber's own eventual Commit()
 // (a real, minted stamp would then never overwrite the {kTombstoneBit, 0} placeholder that
@@ -266,6 +270,19 @@ bool MvccStamper::OwnsArm(DbIndex db_index, std::string_view key) const {
   const auto* const self = util::fb2::detail::FiberActive();
   for (const Armed& a : armed_) {
     if (a.owner == self && a.db_index == db_index && ArmedKey(a) == key)
+      return true;
+  }
+  return false;
+}
+
+// drakeydb: P4-5 -- see the declaration (mvcc.h) for the why. Same no-allocation/no-mutation
+// shape as OwnsArm above, minus the owner conjunct -- armed_.empty() is checked first so a shard
+// thread with nothing armed at all (the common case) never even reads FiberActive().
+bool MvccStamper::IsArmedByAnyFiber(DbIndex db_index, std::string_view key) const {
+  if (armed_.empty())
+    return false;
+  for (const Armed& a : armed_) {
+    if (a.db_index == db_index && ArmedKey(a) == key)
       return true;
   }
   return false;

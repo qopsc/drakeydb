@@ -528,6 +528,12 @@ class DbSlice {
   // useful one at the cap. This is the one shared choke point for every peer-sourced absent-key
   // install (merge-load, and the streaming elapsed-on-arrival callers below), so the refusal is
   // never re-derived per call site.
+  //
+  // drakeydb: P4-5 -- also refuses outright, counting it in
+  // DbTableStats::mvcc_foreign_placeholder_skips instead, when the slot already holds a
+  // DIFFERENT fiber's still-uncommitted {kTombstoneBit, 0} placeholder (MvccStamper::
+  // IsArmedByAnyFiber true, OwnsArm false) -- see the .cc for the CHECK(!it.is_done()) abort this
+  // closes. The placeholder is left untouched either way; nothing here rolls it back.
   void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
                                  uint64_t meta, uint64_t now_ms);
   // drakeydb: P4-5 -- names, once, the rule every call site below shares: a tombstone (`stamp`

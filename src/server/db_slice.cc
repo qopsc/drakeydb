@@ -1844,6 +1844,35 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   if (!db.mvcc)
     return;
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
+  // drakeydb: P4-5 -- `existing` may be a DIFFERENT fiber's still-uncommitted
+  // {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous pre-commit write,
+  // db_slice.cc) rather than a genuine tombstone: a client DEL writes that placeholder plus its
+  // own arm, then yields (journal::RecordEntry's AddLogRecord, throttled against a slow peer)
+  // before its own Commit() ever overwrites it. `would_grow` below treats any existing tombstone
+  // alike regardless of who owns it, which would let this call install a peer's real stamp over
+  // that placeholder -- once Mvcc() is non-zero, TombstoneGcStep (db_slice.cc) can reap the slot
+  // entirely before the placeholder's own owner ever commits, and that owner's later
+  // SetExistingMvcc then aborts on CHECK(!it.is_done()). Refuse instead, the same way a losing
+  // MergeAccepts compare would: leave the placeholder exactly as its owner left it, for that
+  // owner's own eventual Commit()/rollback to resolve.
+  //
+  // IsArmedByAnyFiber(db_ind, key) && !OwnsArm(db_ind, key) -- "someone still has an arm on this
+  // key, and it is not me" -- not OwnsArm() alone: a caller reached here right after Disarming
+  // its OWN placeholder synchronously (ApplyMergeTombstoneOnShard's found_mutable branch,
+  // rdb_load.cc, for a key FindMutable's own lazy expiry just armed and this same call already
+  // disarmed) has OwnsArm()==false too, but IsArmedByAnyFiber() is ALSO false there -- nothing at
+  // all is armed any more, so there is no owner left to protect. Only when a DIFFERENT fiber's
+  // arm is still standing (IsArmedByAnyFiber() true, OwnsArm() false) does this refuse; this
+  // fiber's own still-pending placeholder (OwnsArm() true, e.g. a delete-then-recreate within one
+  // callback) is always safe to advance past either way.
+  if (existing.has_value() && existing->IsTombstone() && existing->Mvcc() == 0 &&
+      MvccStamper::tlocal()->IsArmedByAnyFiber(db_ind, key) &&
+      !MvccStamper::tlocal()->OwnsArm(db_ind, key)) {
+    ++db.stats.mvcc_foreign_placeholder_skips;
+    VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db=" << db_ind
+            << " key=" << key;
+    return;
+  }
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
   // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
   // corrupt or hostile peer meta must never make this tombstone immortal by claiming a deadline
@@ -3335,10 +3364,19 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // runs, erasing the placeholder here would make the eventual SetExistingMvcc CHECK-fail ("MVCC
 // slot must be prepared before journal commit") the moment the delete's own commit resumes.
 // Guarded below by requiring Mvcc() != 0: MvccClock::Next never mints 0 for any real now_ms (see
-// mvcc.h), so this is true for every committed tombstone and false only for this placeholder --
-// which always resolves, by the end of the epoch that created it, into either a committed stamp
-// (Commit()) or an erase (EndOfWriteEpoch's rollback), so skipping it here never leaks it; a
-// later tick reaps it once it is a real, committed tombstone with a real deadline.
+// mvcc.h), so this is true for every committed tombstone and false only for this placeholder,
+// which resolves into either a committed stamp (Commit()) or an erase (EndOfWriteEpoch's
+// rollback) once its own arm is processed -- skipping it here never leaks it; a later tick reaps
+// it once it is a real, committed tombstone with a real deadline. That resolution is not
+// automatic by the end of the epoch that created it: a peer-sourced install competing for the
+// same slot (DbSlice::InstallAbsentKeyTombstone, the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2)
+// install, rdb_load.cc) now refuses outright whenever it finds this exact placeholder shape owned
+// by a DIFFERENT fiber, rather than overwriting it with a real stamp before that fiber's own
+// Commit()/rollback ever runs -- without that refusal, Mvcc() would go non-zero here while the
+// arm was still pending, and this step would then reap a slot its own owner had not yet resolved.
+// The per-key check just below is the second, independent barrier against exactly that: it never
+// erases a slot any fiber still has an arm on, Mvcc()==0 or not, so a future producer that skips
+// the install-side refusal still cannot make this step race a pending Commit()/rollback.
 //
 // drakeydb: review fix (I1) -- Mvcc() != 0 is a property of the VALUES every current committed-
 // tombstone producer happens to mint (MvccClock::Next never returns 0 for any real now_ms), not
@@ -3451,8 +3489,23 @@ bool DbSlice::TombstoneGcStep() {
         // the comment on this function's declaration above for why IsTombstone() alone is not
         // trusted here.
         string_view key = it->first.GetSlice(&scratch);
-        if (db->prime.Find(key).is_done())
+        if (db->prime.Find(key).is_done()) {
+          // drakeydb: P4-5 -- defence in depth (this function's own declaration comment, above,
+          // has the full account): never erase a slot ANY fiber -- not just this shard thread's
+          // current caller -- still has a plain or tombstone arm on, even though Mvcc() != 0
+          // already excludes PerformDeletionAtomic's own {kTombstoneBit, 0} placeholder shape.
+          // An arm surviving alongside a non-placeholder Mvcc() here means some caller installed
+          // a real-looking stamp over a slot whose delete had not yet actually committed;
+          // erasing it now would still make that delete's own eventual SetExistingMvcc abort on
+          // CHECK(!it.is_done()) once it resumes. Skip and revisit on a later lap instead --
+          // IsArmedByAnyFiber's own armed_.empty() fast path (mvcc.h/.cc) keeps this free when
+          // nothing on this shard thread is armed at all, which is the overwhelming common case.
+          if (MvccStamper::tlocal()->IsArmedByAnyFiber(db_ind, key)) {
+            pending = true;
+            return;
+          }
           EraseMvcc(db_ind, key);
+        }
       });
       --budget;
     } while (cursor && budget > 0 && quota_remains());

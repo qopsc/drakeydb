@@ -2906,6 +2906,8 @@ string ServerFamily::FormatInfoMetrics(
       append("mvcc_tombstones_dropped", total.mvcc_tombstones_dropped);
       // drakeydb: P4-5 -- see DbTableStats::mvcc_tombstones_born_expired (table.h).
       append("mvcc_tombstones_born_expired", total.mvcc_tombstones_born_expired);
+      // drakeydb: P4-5 -- see DbTableStats::mvcc_foreign_placeholder_skips (table.h).
+      append("mvcc_foreign_placeholder_skips", total.mvcc_foreign_placeholder_skips);
     }
     append("small_string_bytes", m.small_string_bytes);
     append("pipeline_cache_bytes", m.facade_stats.conn_stats.pipeline_cmd_cache_bytes);

@@ -96,6 +96,16 @@ struct DbTableStats {
   // path never refuses its own key) and only counted, never refused. Purely diagnostic, like
   // mvcc_tombstones_dropped above.
   size_t mvcc_tombstones_born_expired = 0;
+  // drakeydb: P4-5 -- an absent-key tombstone install (merge-load's no-live-key fallthrough via
+  // DbSlice::InstallAbsentKeyTombstone, or the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2) install,
+  // both rdb_load.cc) that found the slot already holding a DIFFERENT fiber's still-uncommitted
+  // {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous pre-commit write,
+  // db_slice.cc) and refused to overwrite it. Left alone, that overwrite would let
+  // TombstoneGcStep (db_slice.cc) later reap the slot before the placeholder's own owner ever
+  // commits, aborting that owner's SetExistingMvcc call on CHECK(!it.is_done()). Purely
+  // diagnostic, like mvcc_tombstones_dropped/mvcc_tombstones_born_expired above; the refused
+  // install is simply skipped -- the placeholder is left for its owner to resolve.
+  size_t mvcc_foreign_placeholder_skips = 0;
 
   // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of a
   // key's content. DashTable::mem_usage() (dash.h) only counts the table's bucket/segment

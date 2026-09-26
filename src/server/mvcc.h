@@ -532,6 +532,18 @@ class MvccStamper {
   // call would then find no arm left to stamp).
   bool OwnsArm(DbIndex db_index, std::string_view key) const;
 
+  // drakeydb: P4-5 -- owner-agnostic counterpart to OwnsArm above -- true iff ANY fiber, not
+  // just the calling one, currently holds a plain or tombstone arm for (db_index, key).
+  // TombstoneGcStep's own defence-in-depth check (db_slice.cc) is the only caller: the install
+  // sites' own refusal (OwnsArm; InstallAbsentKeyTombstone/the non-merge V2 install, rdb_load.cc)
+  // removes the one known way a slot can go from "correctly still armed" to "looks like an
+  // ordinary aged tombstone" without its arm ever resolving, but this check does not assume that
+  // refusal is the only such path a future producer could add -- it is a second, independent
+  // barrier against erasing a slot whose delete has not actually committed yet, regardless of how
+  // it got into that state. armed_.empty() is checked first so the common case (nothing armed on
+  // this shard thread at all) costs one size() read, not a scan.
+  bool IsArmedByAnyFiber(DbIndex db_index, std::string_view key) const;
+
   // The caller always supplies a non-zero stamp: the author's freshly minted
   // max(HopStamp(now_ms), LocalMintFloor()) (D3's floor against every key this entry is about to
   // commit, journal.cc), or an applied write's verbatim author stamp -- both under the same
@@ -709,6 +721,17 @@ class MvccStamper {
     // why they are scoped rather than sweeping every arm regardless of owner. foreign_arms_seen
     // (Stats, above) plus its diagnostic VLOG(1) (mvcc.cc) is a benign encounter counter, not a
     // correctness gate: it counts how often that interleaving actually happens.
+    //
+    // Two readers/writers are deliberately owner-AGNOSTIC instead, the opposite of every name
+    // above: DisarmAnyOwner (mvcc.cc), PerformDeletionAtomic's (db_slice.cc) own caller, erases
+    // every arm matching (db_index, key) regardless of owner, because a key that has just been
+    // physically deleted (erased from `prime`) must keep no arm from ANY fiber -- a scoped Disarm
+    // there would leave a DIFFERENT fiber's own now-stale arm pointing at a slot that no longer
+    // exists, aborting that fiber's own eventual Commit() on CHECK(!it.is_done()) (SetExistingMvcc,
+    // db_slice.cc). IsArmedByAnyFiber (below) is the read-only counterpart TombstoneGcStep
+    // (db_slice.cc) uses for the same reason in reverse: it must never erase a tombstone slot ANY
+    // fiber still has an arm on, not just the calling one's, or that fiber's own eventual commit
+    // hits the identical abort once the slot it expects is simply gone.
     // No default member initializer either, for the same reason `tombstone` above has none.
     util::fb2::detail::FiberInterface* owner;
   };
