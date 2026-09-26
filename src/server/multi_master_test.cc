@@ -838,9 +838,18 @@ class MvccStoreTest : public BaseFamilyTest {
     // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: the permanent canary every test in this
     // fixture gets for free -- read BEFORE BaseFamilyTest::TearDown() tears the shard threads
     // down, same ordering constraint TotalUnstampedWrites()/TotalLwwDropped() below already need.
+    // Gates 0 ORGANIC encounters: no test in this fixture deliberately overlaps two fibers' own
+    // arms on one shard thread the way the dedicated foreign-arm tests
+    // (MvccOwnershipFiberTest, CommitSkipsAndCountsAForeignArm and siblings) do, so none of this
+    // fixture's own tests should ever make Commit/EndOfWriteEpoch/LocalMintFloor/
+    // CommitOwnTombstone step over another fiber's still-pending arm. foreign_arms_seen is a
+    // benign operational metric (Stats::foreign_arms_seen, mvcc.h), not a correctness gate on its
+    // own -- a nonzero count here means two of THIS fixture's own fibers unexpectedly overlapped
+    // their arms, worth investigating, not that the scoping itself is broken.
     EXPECT_EQ(TotalForeignArmsSeen(), 0u)
-        << "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
-           "fiber's arm in this fixture's own tests -- see D-14, ISSUE-REGISTER.md";
+        << "0 organic encounters expected: no test in this fixture deliberately overlaps two "
+           "fibers' own arms, so Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone should "
+           "never meet another fiber's arm here -- see D-14, ISSUE-REGISTER.md";
     BaseFamilyTest::TearDown();
     absl::SetFlag(&FLAGS_active_replica, false);
   }
@@ -2176,9 +2185,19 @@ TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEa
 // (standing in for AddLogRecord's own yield); POPULATE arms two keys of its own and commits them
 // on the same shard thread while SET is still paused.
 //
-// Falsifying: un-scoping Commit()'s loop (mvcc.cc, dropping the `a.owner != self` check) makes
-// set_committed_stamp come back POPULATE's own mint instead of SET's own -- the exact
-// stored/wire stamp mismatch this reproduces.
+// Also drives POPULATE's other two scoped operations (D-14(b)) against the same paused SET arm:
+// LocalMintFloor() (which the loader's own lazy expiry, and any Commit()-preceding mint, both
+// call) and EndOfWriteEpoch() (POPULATE's own final step) must be exactly as blind to SET's
+// still-pending "set-key" arm as Commit() above -- neither may inspect it, floor against it, or
+// roll it back.
+//
+// Falsifying (verified empirically, neutralizing Commit()'s `if (a.owner != self)` check in
+// mvcc.cc to `if (false && a.owner != self)`): POPULATE's own Commit() then calls fn for SET's
+// still-pending "set-key" arm too -- populate_committed comes back size 3, not 2 (the actual
+// failure). set_committed_stamp is NOT affected: the erase step (absl::Cleanup's own remove_if
+// inside Commit(), mvcc.cc) always matches only `owner == self`, independent of this loop's own
+// skip check, so "set-key"'s arm is never removed by POPULATE's call, and SET's own later
+// Commit() still finds and correctly re-stamps it with SET's own mint afterward.
 //
 // drakeydb: P4-5 -- ActiveReplicaFamilyTest, not MvccStoreTest: this test deliberately and
 // correctly produces a nonzero foreign_arms_seen (POPULATE's own Commit() skipping SET's own
@@ -2194,9 +2213,13 @@ TEST_F(ActiveReplicaFamilyTest, CommitScopingKeepsDebugPopulateFromStampingAPaus
   util::fb2::Done set_armed, resume_set, set_done;
   bool set_committed = false;
   MvccStamp set_committed_stamp;
+  uint64_t populate_local_mint_floor = 0;
+  std::vector<std::string> populate_epoch_end_rolled_back;
+  size_t armed_after_populate_epoch_end = 0;
 
   constexpr uint64_t kSetMvcc = 0x9000;
   constexpr uint64_t kPopulateMvcc = 0x2000;  // older than kSetMvcc -- an unrelated batch's mint
+  const MvccStamp kPopulatePrev{0x1500, 0xAB};
 
   util::fb2::Fiber fiber_set = shard_proactor->LaunchFiber([&] {
     Namespace& ns = namespaces->GetDefaultNamespace();
@@ -2205,6 +2228,16 @@ TEST_F(ActiveReplicaFamilyTest, CommitScopingKeepsDebugPopulateFromStampingAPaus
     PrimeValue v;
     v.SetString("set-value");
     auto res = db_slice.AddOrUpdate(db_cntx, "set-key", std::move(v), 0);
+    // Guarantees both signals fire on EVERY exit from this lambda, including an early return
+    // from the ASSERT below: a fatal assertion failure here must fail this test cleanly, never
+    // leave the main thread (set_armed.Wait() right after launching this fiber) or the populate
+    // step (set_done.Wait() at the very end) blocked forever with no failure ever surfacing.
+    // util::fb2::Done::Notify() is idempotent (synchronization.h) -- calling it again on the
+    // happy path below, after it already fired here, is harmless.
+    absl::Cleanup notify_on_every_exit = [&] {
+      set_armed.Notify();
+      set_done.Notify();
+    };
     ASSERT_TRUE(res);
     res->post_updater.Run();
     set_armed.Notify();
@@ -2240,6 +2273,15 @@ TEST_F(ActiveReplicaFamilyTest, CommitScopingKeepsDebugPopulateFromStampingAPaus
           populate_committed.emplace_back(std::string(key), stamp);
           db_slice.SetExistingMvcc(db, key, stamp);
         });
+
+    // POPULATE's own Commit() above already consumed (and erased) every one of its own arms --
+    // arm one more of its own, with a real prior stamp, so LocalMintFloor() below has something
+    // of its own to floor against while SET's own foreign arm is still pending.
+    MvccStamper::tlocal()->Arm(0, "populate-key-2", kPopulatePrev);
+    populate_local_mint_floor = MvccStamper::tlocal()->LocalMintFloor();
+    MvccStamper::tlocal()->EndOfWriteEpoch(
+        [&](DbIndex, std::string_view key) { populate_epoch_end_rolled_back.emplace_back(key); });
+    armed_after_populate_epoch_end = MvccStamper::tlocal()->ArmedCount();
   });
   // EXPECT, not ASSERT: fiber_set is still blocked on resume_set.Wait() below and must be
   // resumed and joined regardless of this check's outcome, or its own destructor aborts the
@@ -2251,6 +2293,16 @@ TEST_F(ActiveReplicaFamilyTest, CommitScopingKeepsDebugPopulateFromStampingAPaus
                                               "stamp: "
                                            << key;
   }
+  EXPECT_EQ(populate_local_mint_floor, kPopulatePrev.Mvcc() + 1)
+      << "POPULATE's own LocalMintFloor() must floor against its own arm's prior stamp only -- "
+         "SET's still-pending foreign arm must be skipped, not inspected";
+  EXPECT_TRUE(populate_epoch_end_rolled_back.empty())
+      << "POPULATE's own \"populate-key-2\" is a plain Arm(), never a tombstone, so its own "
+         "EndOfWriteEpoch() must call erase_fn for none of its own arms -- and must never touch "
+         "SET's still-pending arm either way";
+  EXPECT_EQ(armed_after_populate_epoch_end, 1u)
+      << "SET's own arm must still be pending after POPULATE's own LocalMintFloor()/"
+         "EndOfWriteEpoch() -- neither one rolled it back";
 
   resume_set.Notify();
   set_done.Wait();
@@ -14189,9 +14241,13 @@ TEST_F(MvccOwnershipFiberTest, ArmPlaceholderInheritanceIsScopedToTheOwningFiber
 // B's own arm, counting A's own as a benign, skipped encounter and leaving it exactly as it was;
 // A's own later Commit() call must then commit it correctly, with A's own mint, never B's.
 //
-// Falsifying: un-scoping Commit()'s loop (mvcc.cc, dropping the `a.owner != self` check) makes
-// B's Commit() call fn for A's own key too -- a_key_touched_by_b comes back true, and A's own
-// later Commit() finds nothing left to commit (a_committed comes back false).
+// Falsifying (verified empirically, neutralizing Commit()'s `if (a.owner != self)` check in
+// mvcc.cc to `if (false && a.owner != self)`): B's Commit() then calls fn for A's own key too --
+// a_key_touched_by_b comes back true, and foreign_arms_seen_delta comes back 0, not 1 (the
+// `++stats_.foreign_arms_seen` lives inside the same neutralized block). A's own later Commit()
+// is NOT affected: the erase step (absl::Cleanup's own remove_if inside Commit(), mvcc.cc)
+// always matches only `owner == self`, independent of this loop's own skip check, so A's arm is
+// never removed by B's call -- a_committed still comes back true, with A's own mint.
 TEST_F(MvccOwnershipFiberTest, CommitSkipsAndCountsAForeignArm) {
   util::fb2::Done a_armed, resume_a;
   bool a_committed = false, b_committed = false, a_key_touched_by_b = false;
@@ -14265,9 +14321,15 @@ TEST_F(MvccOwnershipFiberTest, CommitSkipsAndCountsAForeignArm) {
 // as a benign, skipped encounter and leaving it exactly as it was; A's own later
 // EndOfWriteEpoch() call must then roll it back correctly itself.
 //
-// Falsifying: un-scoping EndOfWriteEpoch's loop (mvcc.cc, dropping the `a.owner != self` check)
-// makes B's call roll back A's own placeholder too -- b_rolled_back comes back {"a-key",
-// "b-key"} instead of just {"b-key"}, and A's own later call finds nothing left to roll back.
+// Falsifying (verified empirically, neutralizing EndOfWriteEpoch's `if (a.owner != self)` check
+// in mvcc.cc to `if (false && a.owner != self)`): B's call then rolls back A's own placeholder
+// too -- b_rolled_back comes back {"a-key", "b-key"} (size 2), not just {"b-key"}, and
+// foreign_arms_seen_delta comes back 0, not 1 (the `++stats_.foreign_arms_seen` lives inside the
+// same neutralized block). A's own later call is NOT affected: the erase step (absl::Cleanup's
+// own remove_if inside EndOfWriteEpoch(), mvcc.cc) always matches only `owner == self`,
+// independent of this loop's own skip check, so A's own placeholder is never removed by B's
+// call -- a_rolled_back still comes back {"a-key"}, rolled back correctly by A's own later call
+// (which sees it a second time, having already been wrongly reported by B's own call too).
 TEST_F(MvccOwnershipFiberTest, EndOfWriteEpochSkipsAndCountsAForeignArm) {
   util::fb2::Done a_armed, resume_a;
   std::vector<std::string> a_rolled_back, b_rolled_back;
@@ -14331,15 +14393,21 @@ TEST_F(MvccOwnershipFiberTest, EndOfWriteEpochSkipsAndCountsAForeignArm) {
 // arena_ back to empty (Commit()/EndOfWriteEpoch(), mvcc.cc) does exactly that the moment a LATER
 // append writes fresh bytes starting at the same offsets. Fiber A arms a long key (200 bytes,
 // forcing a real heap allocation in arena_, not SSO) and blocks. While A is blocked, fiber B
-// commits its own short key TWICE, in two separate rounds -- if arena_ were cleared wholesale
-// after B's first Commit() (the pre-fix behavior) rather than only once armed_ is fully empty
-// across every fiber, B's second round's own key bytes would land at offset 0, overwriting the
-// first bytes of A's still-pending 200-byte key. A's own key must read back byte-for-byte intact
-// when A finally commits.
+// commits its own short key TWICE, in two separate rounds, then ends its own write epoch as a
+// THIRD round -- if arena_ were cleared wholesale after any one of these three calls (the
+// pre-fix behavior) rather than only once armed_ is fully empty across every fiber, that round's
+// own key bytes would land at offset 0, overwriting the first bytes of A's still-pending
+// 200-byte key. A's own key must read back byte-for-byte intact when A finally commits.
 //
-// Falsifying: reverting Commit()'s own arena_ clear (mvcc.cc) from `if (armed_.empty())
+// Falsifying A: reverting Commit()'s own arena_ clear (mvcc.cc) from `if (armed_.empty())
 // arena_.clear();` back to an unconditional `arena_.clear();` makes a_committed_key come back
 // corrupted -- B's second round's key text overwriting the front of A's own 200 'x' characters.
+//
+// Falsifying B: the identical revert to EndOfWriteEpoch's own arena_ clear (mvcc.cc) instead --
+// left alone, this test's own name would be a lie (it never actually ended a write epoch) and
+// this second unconditional clear would go uncovered; with B's third round below actually
+// calling EndOfWriteEpoch(), that revert makes a_committed_key come back corrupted the same way,
+// this time by B's third round's own key text.
 TEST_F(MvccOwnershipFiberTest, ArenaStorageSurvivesAnotherFibersCommitAndEpochEnd) {
   util::fb2::Done a_armed, resume_a;
   bool a_committed = false;
@@ -14376,6 +14444,14 @@ TEST_F(MvccOwnershipFiberTest, ArenaStorageSurvivesAnotherFibersCommitAndEpochEn
     MvccStamper::tlocal()->Commit(
         /*mvcc=*/0x7000, /*origin_idx=*/0,
         [&](DbIndex, std::string_view, const MvccStamp&, bool, const MvccStamp&) {});
+    // A third round, via EndOfWriteEpoch() specifically -- it carries the identical
+    // `if (armed_.empty()) arena_.clear();` guard as Commit() above (mvcc.cc); an unconditional
+    // clear there would be exactly as unsafe for A's still-pending kLongKey. The erase_fn below
+    // is never actually invoked (this key is a plain Arm(), not an ArmTombstone(), and
+    // EndOfWriteEpoch only calls erase_fn for tombstone arms) -- only the Cleanup's own
+    // arena_-clear guard, which runs regardless of tombstone status, is under test here.
+    MvccStamper::tlocal()->Arm(0, "yet-another-unrelated-key", MvccStamp{});
+    MvccStamper::tlocal()->EndOfWriteEpoch([](DbIndex, std::string_view) {});
   });
   fiber_b.Join();
 
@@ -14387,6 +14463,45 @@ TEST_F(MvccOwnershipFiberTest, ArenaStorageSurvivesAnotherFibersCommitAndEpochEn
       << "A's own long key must survive two rounds of B's own Commit() intact -- arena_ must not "
          "be cleared while A's own arm is still pending in it, or a later append can overwrite "
          "A's own stored key bytes";
+}
+
+// drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: diagnostic-only, not a permanent CI gate --
+// whether the allocator actually reuses fiber A's address for fiber B on a given run is a helio
+// implementation detail this file has no control over. Fiber A arms a key directly (the same
+// shape any orphan-creating path takes -- e.g. the search HNSW restore path before its own fix)
+// and exits without terminating it -- simulating the residual mvcc.h's own Armed::owner comment
+// documents: FiberInterface exposes no per-fiber unique id/generation/creation-counter this file
+// could store instead of the bare pointer (checked: name() is caller-set, not guaranteed unique,
+// and often unset; preempt_cnt()/stack_bottom() are not creation-order identifiers either), so a
+// same-address fiber B cannot be told apart from A's already-exited identity.
+TEST_F(MvccOwnershipFiberTest, ReusedFiberAddressResidualIsKnownAndVisible) {
+  util::fb2::Fiber fiber_a =
+      pp_->at(0)->LaunchFiber([&] { MvccStamper::tlocal()->Arm(0, "residual-key", MvccStamp{}); });
+  fiber_a.Join();
+
+  bool address_reused = false;
+  bool adopted = false;
+
+  util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
+    address_reused = MvccStamper::tlocal()->OwnsArm(0, "residual-key");
+    if (address_reused) {
+      MvccStamper::tlocal()->Commit(
+          /*mvcc=*/0x1234, /*origin_idx=*/0,
+          [&](DbIndex, std::string_view key, const MvccStamp&, bool, const MvccStamp&) {
+            if (key == "residual-key")
+              adopted = true;
+          });
+    }
+  });
+  fiber_b.Join();
+
+  if (!address_reused) {
+    GTEST_SKIP() << "this run's fiber allocator did not reuse fiber A's address for fiber B -- "
+                    "the residual this test documents did not reproduce on this run";
+  }
+  EXPECT_TRUE(adopted) << "address reuse was observed (OwnsArm read back true for a key only "
+                          "fiber A ever armed) -- the documented residual predicts B's own "
+                          "scoped Commit() adopts and commits A's orphaned arm as its own";
 }
 
 }  // namespace dfly
