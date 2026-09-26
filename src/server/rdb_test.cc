@@ -79,6 +79,12 @@ uint64_t EncodeModuleId(std::string_view name, int ver) {
 
 namespace dfly {
 
+// drakeydb: P4-5 -- see its own definition (rdb_load.cc) for why this is not constexpr. Declared
+// extern here the same way test_utils.cc declares kInitSegmentLog (table.cc): a plain variable
+// this file's own tests can shorten directly, restoring it afterward, rather than actually
+// waiting out the real ~1s production bound.
+extern uint64_t kForeignArmWaitBoundMs;
+
 static const auto kMatchNil = ArgType(RespExpr::NIL);
 
 class RdbTest : public BaseFamilyTest {
@@ -6390,24 +6396,28 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
   EXPECT_EQ(mismatches, 0u) << "dense invariant must hold when nothing was installed";
 }
 
-// drakeydb: P4-5 -- a client DEL leaves a {kTombstoneBit, 0} placeholder plus its own arm, then
-// yields inside journal::RecordEntry's AddLogRecord (throttled against a slow peer link). An
-// earlier version of ApplyMergeTombstoneOnShard's no-live-key fallthrough (via DbSlice::
-// InstallAbsentKeyTombstone, db_slice.cc) computed `would_grow` from that placeholder's own
-// IsTombstone()==true alone and installed the peer's real stamp straight over it, with no check
-// for who -- if anyone -- still held an arm on the slot. Once Mvcc() went non-zero that way,
-// TombstoneGcStep (db_slice.cc) could reap the slot before the placeholder's own owner ever
-// committed, aborting that owner's later SetExistingMvcc call on CHECK(!it.is_done()).
-// InstallAbsentKeyTombstone now refuses that overwrite outright whenever the slot's existing
-// {kTombstoneBit, 0} shape is armed by a DIFFERENT fiber: IsArmedByAnyFiber(db_ind, key) true AND
-// OwnsArm(db_ind, key) false. A placeholder with no arm at all (already resolved, or never
-// armed) is NOT refused, and neither is this fiber's own still-armed one. Constructed directly
-// here rather than via real fiber timing: arms a tombstone for "ghost" and writes the matching
-// placeholder PerformDeletionAtomic would have left for a concurrent, not-yet-committed DEL, THEN
-// loads a peer tombstone for that same (still logically absent-live) key through the merge
-// fallthrough.
-TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
+// drakeydb: P4-5 -- a peer-link DEL (or one already in flight when LOADING began) leaves a
+// {kTombstoneBit, 0} placeholder plus its own arm, then yields inside journal::RecordEntry's
+// AddLogRecord (throttled against a slow peer link). Refusing the instant this loader meets that
+// placeholder can silently drop a peer's write that should have won a later comparison (it may
+// have reached this node only via a snapshot, never re-delivered by any journal): the loader
+// waits instead, bounded, for the placeholder's own owner to resolve it, then re-runs the
+// authoritative decision from scratch. Only once that wait TIMES OUT does InstallAbsentKeyTombstone
+// refuse the overwrite outright, exactly as it always has: IsArmedByAnyFiber(db_ind, key) true AND
+// OwnsArm(db_ind, key) false. This test shortens the wait bound so the owner never resolving
+// within it is affordable in a unit-test suite; the "win"/"lose" tests below exercise the owner
+// actually resolving inside the (still-shortened) bound instead. Constructed directly here rather
+// than via real fiber timing: arms a tombstone for "ghost" and writes the matching placeholder
+// PerformDeletionAtomic would have left for a concurrent, not-yet-committed DEL, THEN loads a peer
+// tombstone for that same (still logically absent-live) key through the merge fallthrough.
+TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyRefusesAfterTimeout) {
   ASSERT_TRUE(IsActiveReplica());
+  // drakeydb: P4-5 -- kForeignArmWaitBoundMs (rdb_load.cc) defaults to ~1s; this test's own
+  // "owner" fiber never resolves the arm at all, so shortening the bound is what keeps this test
+  // fast rather than actually waiting out the production default.
+  const uint64_t saved_bound_ms = kForeignArmWaitBoundMs;
+  kForeignArmWaitBoundMs = 20;
+  absl::Cleanup restore_bound = [saved_bound_ms] { kForeignArmWaitBoundMs = saved_bound_ms; };
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   // drakeydb: P4-5 -- ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired
   // (mvcc.h) floors on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this
@@ -6497,19 +6507,24 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyRefusesToOverwriteConcur
 }
 
 // drakeydb: P4-5 -- CreateObjectOnShard's own live-value install can meet the identical foreign
-// placeholder: an inline client DEL leaves {kTombstoneBit, 0} plus its own arm, then yields in
+// placeholder: a peer-link DEL leaves {kTombstoneBit, 0} plus its own arm, then yields in
 // AddLogRecord. AddOrFind finds no live prime entry (the DEL already erased it) and inserts a
-// fresh one; MergeAccepts({bit,0}, incoming) trivially accepts (Mvcc()==0 is the strict minimum),
-// so an earlier version of this authoritative reject let SetMvcc turn the slot live -- mvcc_
-// tombstones down by one -- while `prime` now holds the peer's value. The DEL's own later
-// Commit() then calls SetExistingMvcc(X|bit) on that now-live slot, putting mvcc_tombstones back
-// up by one while prime still holds the loader's value: the dense invariant
-// (mvcc->size() - mvcc_tombstones == prime.size()) breaks, caught here via TEST_VerifyMvccTable
-// rather than the CHECK abort a real command's OnCbFinishBlocking would hit. Same setup as the
-// tombstone-install test above, but the loader carries a LIVE record for "ghost" instead of a
-// tombstone one.
-TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
+// fresh one; MergeAccepts({bit,0}, incoming) trivially accepts (Mvcc()==0 is the strict minimum).
+// An earlier version of this authoritative reject let SetMvcc turn the slot live on the spot --
+// mvcc_tombstones down by one -- while `prime` now held the peer's value; the DEL's own later
+// Commit() would then call SetExistingMvcc(X|bit) on that now-live slot, putting mvcc_tombstones
+// back up by one while prime still held the loader's value: the dense invariant
+// (mvcc->size() - mvcc_tombstones == prime.size()) breaks, and the slot stays live forever since
+// GC only ever reaps a tombstone. This test shortens the wait bound (see the sibling tombstone
+// test's own comment) so the owner never resolving within it stays affordable; the "win"/"lose"
+// tests below exercise the owner actually resolving inside the (still-shortened) bound instead.
+// Same setup as the tombstone-install test above, but the loader carries a LIVE record for
+// "ghost" instead of a tombstone one.
+TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyRefusesAfterTimeout) {
   ASSERT_TRUE(IsActiveReplica());
+  const uint64_t saved_bound_ms = kForeignArmWaitBoundMs;
+  kForeignArmWaitBoundMs = 20;
+  absl::Cleanup restore_bound = [saved_bound_ms] { kForeignArmWaitBoundMs = saved_bound_ms; };
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
   const MvccStamp kIncomingStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000,
                                  kPeerHash};
@@ -6604,12 +6619,17 @@ TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyRefusesToOverwriteConcurrentP
 }
 
 // drakeydb: P4-5 -- coverage for the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2) install's own
-// foreign-placeholder refusal (HandleTombstones' `install` lambda, rdb_load.cc), never exercised
-// by the merge-load tests above: LoadRdbData never calls SetMergeLww, so this callback takes the
-// plain skip-and-warn/unconditional-install branch instead of ApplyMergeTombstoneOnShard, and
-// this is the ONLY place that branch's own IsArmedByAnyFiber() && !OwnsArm() check runs at all.
-TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
+// foreign-placeholder wait-and-retry (HandleTombstones' `install` lambda, rdb_load.cc), never
+// exercised by the merge-load tests above: LoadRdbData never calls SetMergeLww, so this callback
+// takes the plain skip-and-warn/unconditional-install branch instead of ApplyMergeTombstoneOnShard,
+// and this is the ONLY place that branch's own IsArmedByAnyFiber() && !OwnsArm() check runs at
+// all. This test's own "owner" fiber never resolves the arm, exercising the timeout-then-refuse
+// path; the sibling "wins" test below exercises the owner resolving inside the (shortened) bound.
+TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyRefusesAfterTimeout) {
   ASSERT_TRUE(IsActiveReplica());
+  const uint64_t saved_bound_ms = kForeignArmWaitBoundMs;
+  kForeignArmWaitBoundMs = 20;
+  absl::Cleanup restore_bound = [saved_bound_ms] { kForeignArmWaitBoundMs = saved_bound_ms; };
   // ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired (mvcc.h) floors
   // on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this install refuse
   // itself as born expired before ever reaching the assertions below.
@@ -6656,6 +6676,300 @@ TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyRefusesToOverwriteConcur
   EXPECT_EQ(skips_after, skips_before + 1)
       << "the refusal must be counted in mvcc_foreign_placeholder_skips";
   EXPECT_TRUE(after_present) << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- shared driver for the win/lose-after-wait tests below. Arms a
+// {kTombstoneBit, 0} placeholder for `key`, then sleeps `resolve_after` (short: these tests
+// exercise the owner resolving WITHIN the wait bound, not the bound itself), then either commits
+// `resolve_mvcc` as its own real tombstone stamp (self-origin, index 0) or, if `resolve_mvcc` is
+// nullopt, rolls back -- Disarm then EraseMvcc, mirroring EndOfWriteEpoch's own rollback shape --
+// leaving the key genuinely absent. All three steps run on ONE fiber (LaunchFiber, on pp_->at(0)
+// -- the SAME shard-0 proactor thread the loader itself runs on, matching how this fixture's
+// num_threads_/FLAGS_num_shards are both pinned to 1 in its own constructor): Commit() is
+// owner-scoped, so splitting the arm and the eventual commit across two different fibers would
+// make Commit() find nothing of its own to do. Returns once armed (before either resolution
+// path runs) so the caller can safely start the loader; the returned Fiber must still be
+// Join()'d once the loader call has returned.
+util::fb2::Fiber ArmPlaceholderThenResolve(util::ProactorPool* pp, std::string_view key,
+                                           absl::Duration resolve_after,
+                                           std::optional<uint64_t> resolve_mvcc) {
+  util::fb2::Done armed;
+  util::fb2::Fiber fiber = pp->at(0)->LaunchFiber([key, resolve_after, resolve_mvcc, &armed] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, key, MvccStamp{});
+    armed.Notify();
+    ThisFiber::SleepFor(absl::ToChronoMilliseconds(resolve_after));
+    if (resolve_mvcc.has_value()) {
+      MvccStamper::tlocal()->Commit(
+          *resolve_mvcc, /*origin_idx=*/0,
+          [&db_slice](DbIndex db, std::string_view k, const MvccStamp& st, bool /*tombstone*/,
+                      const MvccStamp& /*prev_stamp*/) { db_slice.SetExistingMvcc(db, k, st); });
+    } else {
+      MvccStamper::tlocal()->Disarm(0, key);
+      db_slice.EraseMvcc(0, key);
+    }
+  });
+  armed.Wait();
+  return fiber;
+}
+
+// drakeydb: P4-5 -- the core case the wait-and-retry exists for: the placeholder's owner
+// resolves WITHIN the wait bound with an OLDER stamp than the loader's own incoming tombstone,
+// so the loader's record must win once it re-runs the authoritative compare -- refusing on
+// sight instead would have silently dropped it with no way to ever redeliver it (a value that
+// reached this node only via a snapshot section, never a journal entry).
+//
+// Falsifying: removing the wait (restoring the immediate refusal) makes *got below come back the
+// untouched placeholder instead of kIncomingTombstone, and skips_after come back unincremented
+// (the OLD refusal-pinning assertions, still true of the reverted code).
+TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyWinsAfterWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  // P: the loader's own incoming stamp, strictly NEWER than the owner's X below.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(now_ms << MvccClock::kCounterBits) + 0x9000, kPeerHash}.AsTombstone();
+  // X: the owner's own real commit, strictly OLDER than P -- realistic ("now"), not a near-epoch
+  // literal, for the same TombstoneBornExpired reason every sibling test's own comment gives.
+  const uint64_t kOwnMvcc = (now_ms << MvccClock::kCounterBits) + 0x1000;
+
+  util::fb2::Fiber owner =
+      ArmPlaceholderThenResolve(pp_.get(), "ghost", absl::Milliseconds(20), kOwnMvcc);
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  owner.Join();
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingTombstone)
+      << "the loader's own newer tombstone must win once the owner's older commit resolved";
+  EXPECT_EQ(mismatches, 0u);
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- the mirror image: the owner resolves within the bound with a NEWER stamp
+// than the loader's own incoming tombstone, so the re-run authoritative compare must reject the
+// loader's record -- winning the wait must not also mean winning the compare, the same
+// do-not-special-case-the-outcome discipline every install site's own wait follows.
+TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyLosesAfterWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  // P: the loader's own incoming stamp, strictly OLDER than the owner's X below this time.
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{(now_ms << MvccClock::kCounterBits) + 0x1000, kPeerHash}.AsTombstone();
+  const uint64_t kOwnMvcc = (now_ms << MvccClock::kCounterBits) + 0x9000;
+
+  size_t skips_before = 0;
+  shard_set->Await(0, [&] {
+    skips_before = namespaces->GetDefaultNamespace()
+                       .GetCurrentDbSlice()
+                       .MutableStats(0)
+                       ->mvcc_foreign_placeholder_skips;
+  });
+
+  util::fb2::Fiber owner =
+      ArmPlaceholderThenResolve(pp_.get(), "ghost", absl::Milliseconds(20), kOwnMvcc);
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  owner.Join();
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  size_t skips_after = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->Mvcc(), kOwnMvcc)
+      << "the owner's own newer commit must survive -- the loader's stale record must lose the "
+         "re-run compare, not be force-installed just because the wait resolved";
+  EXPECT_EQ(mismatches, 0u);
+  EXPECT_EQ(skips_after, skips_before)
+      << "must lose via the re-run MergeAccepts compare, not via a timed-out refusal -- the skip "
+         "counter must NOT move";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- the live-install version of WinsAfterWait above: CreateObjectOnShard's own
+// authoritative compare must also re-run after the wait, never special-casing what it resolved
+// to.
+TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyWinsAfterWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  const MvccStamp kIncomingStamp{(now_ms << MvccClock::kCounterBits) + 0x9000, kPeerHash};
+  const uint64_t kOwnMvcc = (now_ms << MvccClock::kCounterBits) + 0x1000;
+
+  util::fb2::Fiber owner =
+      ArmPlaceholderThenResolve(pp_.get(), "ghost", absl::Milliseconds(20), kOwnMvcc);
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "ghost");
+  AppendString(&body, "peer_value");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  owner.Join();
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"get", "ghost"}), "peer_value")
+      << "the loader's own newer value must win once the owner's older commit resolved";
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->Mvcc(), kIncomingStamp.Mvcc());
+  EXPECT_FALSE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- the live-install mirror of LosesAfterWait above.
+TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyLosesAfterWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const uint64_t now_ms = GetCurrentTimeMs();
+  const MvccStamp kIncomingStamp{(now_ms << MvccClock::kCounterBits) + 0x1000, kPeerHash};
+  const uint64_t kOwnMvcc = (now_ms << MvccClock::kCounterBits) + 0x9000;
+
+  size_t skips_before = 0;
+  shard_set->Await(0, [&] {
+    skips_before = namespaces->GetDefaultNamespace()
+                       .GetCurrentDbSlice()
+                       .MutableStats(0)
+                       ->mvcc_foreign_placeholder_skips;
+  });
+
+  util::fb2::Fiber owner =
+      ArmPlaceholderThenResolve(pp_.get(), "ghost", absl::Milliseconds(20), kOwnMvcc);
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "ghost");
+  AppendString(&body, "peer_value");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  owner.Join();
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_THAT(Run({"get", "ghost"}), kMatchNil)
+      << "the owner's own tombstone must win -- the loader's stale live value must never install";
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  size_t skips_after = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+  });
+  EXPECT_EQ(skips_after, skips_before)
+      << "must lose via the re-run MergeAccepts compare, not via a timed-out refusal -- the skip "
+         "counter must NOT move";
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(got->Mvcc(), kOwnMvcc);
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(mismatches, 0u);
+}
+
+// drakeydb: P4-5 -- the non-merge install's own version: D-7's unconditional install/overwrite
+// rule means there is no "lose" case to test here (see this file's own
+// NonMergeTombstoneInstallForAbsentKeyRefusesAfterTimeout for why), so this doubles as coverage
+// for BOTH "win" (the owner commits) and "rollback" (the owner rolls back) -- either way, the
+// re-read `existing` after the wait is nullopt-or-a-real-tombstone, never the placeholder, and
+// the install proceeds exactly the same either way.
+TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyInstallsAfterWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  const MvccStamp kIncoming{
+      MvccClock::kTombstoneBit | ((GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000),
+      0xAAAA};
+
+  util::fb2::Fiber owner =
+      ArmPlaceholderThenResolve(pp_.get(), "ghost", absl::Milliseconds(20), std::nullopt);
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncoming}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  owner.Join();
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncoming)
+      << "the install must proceed once the owner's rollback cleared the placeholder";
+  EXPECT_EQ(mismatches, 0u);
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
 }
 
 // drakeydb: P4-3 Task 13 review fix (I4, Important) -- the per-(database, shard) tombstone cap

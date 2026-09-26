@@ -2482,10 +2482,12 @@ TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
     db_slice.SetTombstone(0, key, kPeerStamp);
   });
 
-  // A handful of calls, not a while-loop-to-convergence: this slot's own arm never resolves
-  // during this test, so a correctly-behaving TombstoneGcStep keeps reporting it pending forever
-  // -- looping until it returns false would never terminate. `gc_pending`'s LAST value is what
-  // the "no busy-spin on an arm-skipped slot" assertion below checks.
+  // A handful of calls, not a while-loop-to-convergence: a correctly-behaving TombstoneGcStep
+  // does NOT report this arm-skipped slot as pending (that busy-spin is exactly what the M-1 fix
+  // removed), so this tiny one-key table finishes its lap and returns false on the very first
+  // call regardless -- looping to convergence would just repeat that same false a few more times.
+  // Calling it a few times anyway is a stronger check on `gc_pending`'s own LAST value (below):
+  // it must stay false across repeated calls, not just the first one.
   bool stamp_survived = false;
   MvccStamp stamp_after_gc;
   bool gc_pending = true;
