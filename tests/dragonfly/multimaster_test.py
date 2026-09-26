@@ -19,6 +19,37 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 FIXED_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
+# drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: the pytest-side half of the foreign_arms_seen
+# canary (MvccStamper::Stats, mvcc.h) -- every test in this file gets it for free, the same way
+# the C++ MvccStoreTest/RdbMvccTest fixtures (multi_master_test.cc/rdb_test.cc) assert it in
+# their own TearDown. Runs AFTER the test body (below the yield), against every instance the
+# test's own df_factory usage left running -- a test that already stopped or crashed an instance
+# on purpose is skipped, not failed, on an unrelated connection error: this canary's job is to
+# catch a real positive reading when reachable, not to add flakiness to unrelated instance
+# lifecycle churn. mvcc_foreign_arms_seen is absent from INFO replication entirely on a
+# non-active instance (server_family.cc gates it on IsActiveReplica()), so `.get(...)` below
+# reads back 0 for one, exactly like it should.
+@pytest.fixture(autouse=True)
+async def assert_no_foreign_mvcc_arms(df_factory: DflyInstanceFactory):
+    yield
+    for instance in df_factory.instances:
+        if instance.proc is None:
+            continue
+        c = instance.client()
+        try:
+            info = await asyncio.wait_for(c.info("replication"), timeout=5)
+        except Exception:
+            continue
+        finally:
+            await c.aclose()
+        seen = int(info.get("mvcc_foreign_arms_seen", 0))
+        assert seen == 0, (
+            f"instance on port {instance.port} saw {seen} foreign MVCC arm(s) -- "
+            "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
+            "fiber's arm"
+        )
+
+
 async def assert_start_fails(node):
     try:
         node.start()

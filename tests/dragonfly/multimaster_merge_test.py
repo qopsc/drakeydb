@@ -47,6 +47,32 @@ from .multimaster_test import (
 )
 from .utility import assert_eventually, wait_available_async
 
+
+# drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: same canary as multimaster_test.py's own
+# assert_no_foreign_mvcc_arms (its docstring there has the full why) -- duplicated here rather
+# than imported, since pytest resolves fixtures by name in the collecting module's own
+# namespace and this file's tests use the same df_factory-tracked-instances shape.
+@pytest.fixture(autouse=True)
+async def assert_no_foreign_mvcc_arms(df_factory: DflyInstanceFactory):
+    yield
+    for instance in df_factory.instances:
+        if instance.proc is None:
+            continue
+        c = instance.client()
+        try:
+            info = await asyncio.wait_for(c.info("replication"), timeout=5)
+        except Exception:
+            continue
+        finally:
+            await c.aclose()
+        seen = int(info.get("mvcc_foreign_arms_seen", 0))
+        assert seen == 0, (
+            f"instance on port {instance.port} saw {seen} foreign MVCC arm(s) -- "
+            "Commit/EndOfWriteEpoch/LocalMintFloor/CommitOwnTombstone must never see another "
+            "fiber's arm"
+        )
+
+
 KEY_SPACE = 50
 DEFAULT_ROUNDS = 6
 # 80, not 40: the I-2 coverage assertion (>= 1 contested key per round) is a real per-round
