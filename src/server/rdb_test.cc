@@ -6398,16 +6398,14 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneForAbsentKeyInstallsNoneAtCap) {
 // for who -- if anyone -- still held an arm on the slot. Once Mvcc() went non-zero that way,
 // TombstoneGcStep (db_slice.cc) could reap the slot before the placeholder's own owner ever
 // committed, aborting that owner's later SetExistingMvcc call on CHECK(!it.is_done()).
-// InstallAbsentKeyTombstone now refuses that overwrite outright whenever OwnsArm(db_ind, key) is
-// false for the slot's existing {kTombstoneBit, 0} shape. Constructed directly here rather than
-// via real fiber timing: arms a tombstone for "ghost" and writes the matching placeholder
-// PerformDeletionAtomic would have left for a concurrent, not-yet-committed DEL, THEN loads a
-// peer tombstone for that same (still logically absent-live) key through the merge fallthrough.
-//
-// Also still pins the Disarm scoping D-14 (ISSUE-REGISTER.md) describes: found_mutable is false
-// on this path, so the loader's own Disarm call inside this fallthrough never runs at all, and
-// this test's own concurrent arm survives to be consumed below by the SAME fiber's own eventual
-// Commit() -- exactly as journal::RecordEntry's real Commit() call would.
+// InstallAbsentKeyTombstone now refuses that overwrite outright whenever the slot's existing
+// {kTombstoneBit, 0} shape is armed by a DIFFERENT fiber: IsArmedByAnyFiber(db_ind, key) true AND
+// OwnsArm(db_ind, key) false. A placeholder with no arm at all (already resolved, or never
+// armed) is NOT refused, and neither is this fiber's own still-armed one. Constructed directly
+// here rather than via real fiber timing: arms a tombstone for "ghost" and writes the matching
+// placeholder PerformDeletionAtomic would have left for a concurrent, not-yet-committed DEL, THEN
+// loads a peer tombstone for that same (still logically absent-live) key through the merge
+// fallthrough.
 TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
@@ -6496,6 +6494,168 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyRefusesToOverwriteConcur
   EXPECT_EQ(owned_arms_after_commit, 0u) << "Commit() must have consumed the arm";
 
   EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- CreateObjectOnShard's own live-value install can meet the identical foreign
+// placeholder: an inline client DEL leaves {kTombstoneBit, 0} plus its own arm, then yields in
+// AddLogRecord. AddOrFind finds no live prime entry (the DEL already erased it) and inserts a
+// fresh one; MergeAccepts({bit,0}, incoming) trivially accepts (Mvcc()==0 is the strict minimum),
+// so an earlier version of this authoritative reject let SetMvcc turn the slot live -- mvcc_
+// tombstones down by one -- while `prime` now holds the peer's value. The DEL's own later
+// Commit() then calls SetExistingMvcc(X|bit) on that now-live slot, putting mvcc_tombstones back
+// up by one while prime still holds the loader's value: the dense invariant
+// (mvcc->size() - mvcc_tombstones == prime.size()) breaks, caught here via TEST_VerifyMvccTable
+// rather than the CHECK abort a real command's OnCbFinishBlocking would hit. Same setup as the
+// tombstone-install test above, but the loader carries a LIVE record for "ghost" instead of a
+// tombstone one.
+TEST_F(RdbMvccTest, MergeLwwLiveInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+  const MvccStamp kIncomingStamp{(GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000,
+                                 kPeerHash};
+
+  size_t skips_before = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
+    // concurrent DEL of "ghost" that has not yet reached its own journal Commit().
+    db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"}, MvccStamp{});
+    skips_before = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+  });
+
+  std::string body;
+  uint8_t block[17] = {RDB_OPCODE_DF_MVCC};
+  absl::little_endian::Store64(block + 1, kIncomingStamp.packed);
+  absl::little_endian::Store64(block + 9, kIncomingStamp.origin_hash);
+  body.append(reinterpret_cast<const char*>(block), sizeof(block));
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "ghost");
+  AppendString(&body, "peer_value");
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    return loader.Load(&src);
+  });
+  ASSERT_FALSE(ec) << ec.message();
+
+  // drakeydb: P4-5 -- read via shard_set->Await, never a real client command (Run(...)), while
+  // "ghost"'s own arm is still pending: a real command reaches Transaction::RunCallback's own
+  // EndOfWriteEpoch() sweep unconditionally, on whichever fiber services that command, which would
+  // count this test's own still-pending, deliberately-armed placeholder as a "foreign" encounter
+  // (benign, but this fixture's TearDown gates 0 of them across every test).
+  std::optional<MvccStamp> got;
+  size_t skips_after = 0, owned_arms = 0, mismatches = 0;
+  bool ghost_absent_from_prime = false;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+    owned_arms = MvccStamper::tlocal()->OwnedArmedCount();
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    DbTable* table = db_slice.GetDBTable(0);
+    ghost_absent_from_prime =
+        table != nullptr && table->prime.Find(std::string_view{"ghost"}).is_done();
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, (MvccStamp{MvccClock::kTombstoneBit, 0}))
+      << "the placeholder must be left untouched -- a live peer value must never overwrite a "
+         "slot a different fiber still has an arm on";
+  EXPECT_EQ(skips_after, skips_before + 1)
+      << "the refusal must be counted in mvcc_foreign_placeholder_skips";
+  EXPECT_EQ(owned_arms, 1u) << "the concurrent fiber's own pending arm must survive";
+  EXPECT_EQ(mismatches, 0u) << "the dense invariant must hold with the fresh insert rolled back";
+  EXPECT_TRUE(ghost_absent_from_prime)
+      << "the loader's own AddOrFind insert must have been rolled back, not merely the mvcc side";
+
+  // Simulate the placeholder's own owner landing its own stamp afterward -- journal::RecordEntry's
+  // real Commit() call, mirrored here exactly like the tombstone-install test above.
+  const uint64_t kOwnMvcc = (GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x3000;
+  std::optional<MvccStamp> landed;
+  uint64_t own_origin_hash = 0;
+  size_t mismatches_after_commit = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    MvccStamper::tlocal()->Commit(
+        kOwnMvcc, /*origin_idx=*/0,
+        [&db_slice](DbIndex db, std::string_view k, const MvccStamp& st, bool /*tombstone*/,
+                    const MvccStamp& /*prev_stamp*/) { db_slice.SetExistingMvcc(db, k, st); });
+    landed = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    own_origin_hash = MvccStamper::tlocal()->OriginHash(0);
+    mismatches_after_commit = db_slice.TEST_VerifyMvccTable(0);
+  });
+  ASSERT_TRUE(landed.has_value());
+  EXPECT_EQ(landed->Mvcc(), kOwnMvcc) << "the owner's own commit must land its own mvcc";
+  EXPECT_EQ(landed->origin_hash, own_origin_hash)
+      << "the owner's own commit must land its own origin, never the peer's";
+  EXPECT_TRUE(landed->IsTombstone()) << "k must end up a tombstone with the owner's own stamp";
+  EXPECT_EQ(mismatches_after_commit, 0u)
+      << "the dense invariant must still hold after the owner's own commit lands";
+  EXPECT_THAT(Run({"get", "ghost"}), kMatchNil) << "k must still be absent from prime";
+
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the record must still parse";
+}
+
+// drakeydb: P4-5 -- coverage for the non-merge RDB_OPCODE_DF_TOMBSTONES(_V2) install's own
+// foreign-placeholder refusal (HandleTombstones' `install` lambda, rdb_load.cc), never exercised
+// by the merge-load tests above: LoadRdbData never calls SetMergeLww, so this callback takes the
+// plain skip-and-warn/unconditional-install branch instead of ApplyMergeTombstoneOnShard, and
+// this is the ONLY place that branch's own IsArmedByAnyFiber() && !OwnsArm() check runs at all.
+TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyRefusesToOverwriteConcurrentPlaceholder) {
+  ASSERT_TRUE(IsActiveReplica());
+  // ms must be realistic ("now"), not a near-epoch literal: TombstoneBornExpired (mvcc.h) floors
+  // on max(stamp.MsPart(), meta) + ttl, and an ancient stamp would make this install refuse
+  // itself as born expired before ever reaching the assertions below.
+  const MvccStamp kIncoming{
+      MvccClock::kTombstoneBit | ((GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000),
+      0xAAAA};
+
+  size_t skips_before = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
+    // concurrent DEL of "ghost" that has not yet reached its own journal Commit().
+    db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"}, MvccStamp{});
+    skips_before = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncoming}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  auto ec = pp_->at(0)->Await([&] { return LoadRdbData(service_.get(), WrapInRdb(body)); });
+  ASSERT_FALSE(ec) << ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t skips_after = 0;
+  bool after_present = false;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+    // Cleanup on the same fiber that armed it, BEFORE any real command (Run(...)) touches this
+    // shard: a real command reaches Transaction::RunCallback's own EndOfWriteEpoch() sweep
+    // unconditionally, which would count this test's own still-pending, deliberately-armed
+    // placeholder as a "foreign" encounter (benign, but this fixture's TearDown gates 0 of them).
+    MvccStamper::tlocal()->Disarm(0, std::string_view{"ghost"});
+    DbTable* table = db_slice.GetDBTable(0);
+    after_present = table != nullptr && !table->prime.Find(std::string_view{"after"}).is_done();
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, (MvccStamp{MvccClock::kTombstoneBit, 0}))
+      << "the placeholder must be left untouched by the non-merge install too";
+  EXPECT_EQ(skips_after, skips_before + 1)
+      << "the refusal must be counted in mvcc_foreign_placeholder_skips";
+  EXPECT_TRUE(after_present) << "bytes after the section must still parse";
 }
 
 // drakeydb: P4-3 Task 13 review fix (I4, Important) -- the per-(database, shard) tombstone cap

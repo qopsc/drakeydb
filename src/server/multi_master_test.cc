@@ -747,6 +747,9 @@ TEST_F(ActiveReplicaFamilyTest, InfoShowsActiveFieldsAndStaysMaster) {
   // drakeydb: P4-5 -- mvcc_tombstones_born_expired (table.h) beside mvcc_tombstones_dropped, same
   // gate; this test never installs or expires a tombstone, so 0 is the only value it can hold here.
   EXPECT_NE(std::string::npos, mem_info.find("mvcc_tombstones_born_expired:0\r\n"));
+  // drakeydb: P4-5 -- mvcc_foreign_placeholder_skips (table.h) beside mvcc_tombstones_born_expired,
+  // same gate; this test never meets a foreign placeholder, so 0 is the only value it can hold.
+  EXPECT_NE(std::string::npos, mem_info.find("mvcc_foreign_placeholder_skips:0\r\n"));
 }
 
 TEST_F(ActiveReplicaFamilyTest, ReplicaOfGrammarAndNoPeersPaths) {
@@ -794,6 +797,8 @@ TEST_F(MultiMasterFamilyTest, NonActiveInfoHasNoActiveFields) {
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_dropped:"));
   // drakeydb: P4-5 -- mvcc_tombstones_born_expired must be gated identically to its siblings.
   EXPECT_EQ(std::string::npos, mem_info.find("mvcc_tombstones_born_expired:"));
+  // drakeydb: P4-5 -- mvcc_foreign_placeholder_skips must be gated identically to its siblings.
+  EXPECT_EQ(std::string::npos, mem_info.find("mvcc_foreign_placeholder_skips:"));
 }
 
 // drakeydb: P4-4 Task A1 -- NoteLwwDrop touches ServerState::tlocal(), which only resolves on a
@@ -2435,16 +2440,21 @@ TEST_F(MvccStoreTest, TombstoneGcSkipsAnUncommittedPlaceholder) {
 // somehow ended up with a real-looking, non-zero Mvcc() while a delete's own arm was still
 // pending on it -- the shape a peer-sourced install would leave behind if it ever overwrote a
 // placeholder before that placeholder's own owner committed. Reproduces that shape directly
-// (SetTombstone, twice, on the SAME fiber -- matching the neighbouring test's own precedent of
-// constructing the shape rather than actually racing a stalled peer link), rather than via a real
-// two-fiber race: this check does not care who owns the arm, only that one exists, so a
-// single-fiber setup already exercises it fully.
+// (SetTombstone, twice), on the shard's own queue fiber (shard_set->Await) -- the same fiber
+// PerformDeletionAtomic's own placeholder+arm always lands on in production. TombstoneGcStep is
+// then driven from a GENUINELY DIFFERENT fiber (LaunchFiber on that same shard's proactor, never
+// the queue fiber shard_set->Await uses): the check under test, IsArmedByAnyFiber, is
+// owner-agnostic by design, so this two-fiber shape is load-bearing, not incidental -- a
+// single-fiber setup could not tell IsArmedByAnyFiber apart from OwnsArm, since self would equal
+// the owner either way.
 //
 // Falsifying: removing the IsArmedByAnyFiber check from TombstoneGcStep's erase branch
-// (db_slice.cc) makes GC reap `key` outright, `stamp` below comes back empty, and the final
-// Commit()-driven landing never happens because there is no slot left for it to land on --
+// (db_slice.cc) makes GC reap `key` outright, `stamp_survived` below comes back false, and the
+// final Commit()-driven landing never happens because there is no slot left for it to land on --
 // exactly the CHECK(!it.is_done()) precondition SetExistingMvcc would hit for a real delete's own
-// commit resuming into that gap.
+// commit resuming into that gap. Swapping IsArmedByAnyFiber for OwnsArm at that same call site
+// reproduces the identical failure: from the GC fiber's own perspective, OwnsArm(db, key) is
+// false (it never armed anything itself), so the slot is erased just the same.
 TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
   absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 1);  // seconds; ttl_ms == 1000
   absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_tombstone_ttl, 600); };
@@ -2455,44 +2465,113 @@ TEST_F(MvccStoreTest, TombstoneGcStepNeverErasesASlotStillArmedByAnyFiber) {
   const uint64_t old_ms = GetCurrentTimeMs() - 5000;
   const MvccStamp kPeerStamp = MvccStamp{old_ms << MvccClock::kCounterBits, 0xABCDu}.AsTombstone();
 
-  shard_set->Await(Shard(key, shard_set->size()), [&] {
+  const ShardId sid = Shard(key, shard_set->size());
+  util::ProactorBase* shard_proactor = nullptr;
+  shard_set->Await(sid, [&] { shard_proactor = util::ProactorBase::me(); });
+  ASSERT_NE(shard_proactor, nullptr);
+
+  // Mirrors PerformDeletionAtomic's own synchronous placeholder + arm (db_slice.cc) for a
+  // concurrent DEL that has not yet reached its own journal Commit(), then overwrites the slot
+  // directly with an already-expired stamp -- what an unguarded peer-sourced install would have
+  // done to it. This is the shard's own queue fiber -- the "owner" every check below is scoped
+  // against.
+  shard_set->Await(sid, [&] {
     DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
-    // Mirrors PerformDeletionAtomic's own synchronous placeholder + arm (db_slice.cc) for a
-    // concurrent DEL that has not yet reached its own journal Commit(), then overwrites the slot
-    // directly with an already-expired stamp -- what an unguarded peer-sourced install would have
-    // done to it.
     db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
     MvccStamper::tlocal()->ArmTombstone(0, key, MvccStamp{});
     db_slice.SetTombstone(0, key, kPeerStamp);
+  });
 
-    // A handful of calls, not a while-loop-to-convergence: this slot's own arm never resolves
-    // during this test, so a correctly-behaving TombstoneGcStep keeps reporting it pending
-    // forever (unlike the neighbouring test above, whose placeholder has nothing else pinning
-    // it) -- looping until it returns false would never terminate.
+  // A handful of calls, not a while-loop-to-convergence: this slot's own arm never resolves
+  // during this test, so a correctly-behaving TombstoneGcStep keeps reporting it pending forever
+  // -- looping until it returns false would never terminate. `gc_pending`'s LAST value is what
+  // the "no busy-spin on an arm-skipped slot" assertion below checks.
+  bool stamp_survived = false;
+  MvccStamp stamp_after_gc;
+  bool gc_pending = true;
+  util::fb2::Fiber fiber_gc = shard_proactor->LaunchFiber([&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     for (int i = 0; i < 5; ++i)
-      db_slice.TombstoneGcStep();
+      gc_pending = db_slice.TombstoneGcStep();
+    if (auto stamp = db_slice.GetMvcc(0, key); stamp.has_value()) {
+      stamp_survived = true;
+      stamp_after_gc = *stamp;
+    }
+  });
+  fiber_gc.Join();
 
-    auto stamp = db_slice.GetMvcc(0, key);
-    ASSERT_TRUE(stamp.has_value())
-        << "GC erased a slot that still had a pending arm -- the arm's own eventual commit would "
-           "have hit CHECK(!it.is_done()) the instant it resumed";
-    EXPECT_EQ(*stamp, kPeerStamp) << "GC must leave the slot's own value untouched, not merely "
-                                     "its existence";
+  ASSERT_TRUE(stamp_survived)
+      << "GC erased a slot that still had a pending arm -- the arm's own eventual commit would "
+         "have hit CHECK(!it.is_done()) the instant it resumed";
+  EXPECT_EQ(stamp_after_gc, kPeerStamp)
+      << "GC must leave the slot's own value untouched, not merely its existence";
+  EXPECT_FALSE(gc_pending)
+      << "a lap in which only arm-skipped slots remain must report no pending work -- marking "
+         "pending on that skip would busy-spin the on-idle task for as long as the arm stays "
+         "armed, the exact zero-progress hazard the budget==0 guard elsewhere in this function "
+         "already exists to prevent";
 
-    // The armed fiber's own eventual commit (Commit()'s CommitFn calls SetExistingMvcc) must
-    // still find the slot and succeed, landing its own stamp over the peer's -- exactly what
-    // would instead CHECK-fail had GC erased it above.
-    const uint64_t kOwnMvcc = GetCurrentTimeMs() << MvccClock::kCounterBits;
+  // Commit back on the owner: the SAME shard queue fiber the arm was placed from
+  // (shard_set->Await again). The owner's own eventual commit must still find the slot and
+  // succeed, landing its own stamp over the peer's -- exactly what would instead CHECK-fail had
+  // GC erased it above.
+  const uint64_t kOwnMvcc = GetCurrentTimeMs() << MvccClock::kCounterBits;
+  std::optional<MvccStamp> landed;
+  size_t owned_arms_after_commit = 0;
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
     MvccStamper::tlocal()->Commit(
         kOwnMvcc, /*origin_idx=*/0,
         [&db_slice](DbIndex db, std::string_view k, const MvccStamp& st, bool /*tombstone*/,
                     const MvccStamp& /*prev_stamp*/) { db_slice.SetExistingMvcc(db, k, st); });
-    auto landed = db_slice.GetMvcc(0, key);
-    ASSERT_TRUE(landed.has_value());
-    EXPECT_EQ(landed->Mvcc(), kOwnMvcc) << "the owner's own commit must land its own stamp";
-    EXPECT_EQ(MvccStamper::tlocal()->OwnedArmedCount(), 0u)
-        << "Commit() must have consumed the arm";
+    landed = db_slice.GetMvcc(0, key);
+    owned_arms_after_commit = MvccStamper::tlocal()->OwnedArmedCount();
   });
+  ASSERT_TRUE(landed.has_value());
+  EXPECT_EQ(landed->Mvcc(), kOwnMvcc) << "the owner's own commit must land its own stamp";
+  EXPECT_EQ(owned_arms_after_commit, 0u) << "Commit() must have consumed the arm";
+}
+
+// drakeydb: P4-5 -- the other half of the refusal condition (IsArmedByAnyFiber() &&
+// !OwnsArm()): this fiber's own still-pending placeholder -- e.g. a delete-then-recreate within
+// one callback, Arm()'s own placeholder-inheritance comment (mvcc.h) -- must NOT be refused.
+// Arms and installs from the SAME fiber (one shard_set->Await callback, no yield in between), so
+// OwnsArm(db, key) is true throughout: InstallAbsentKeyTombstone must overwrite it exactly as it
+// did before this refusal existed.
+//
+// Falsifying: dropping the `&& !OwnsArm(...)` conjunct from the refusal condition (db_slice.cc),
+// leaving only `IsArmedByAnyFiber(...)`, makes this fiber's own arm trigger the refusal too --
+// *got below comes back the untouched placeholder instead of kIncoming, and skips_after
+// over-counts.
+TEST_F(MvccStoreTest, InstallAbsentKeyTombstoneOverwritesItsOwnArmedPlaceholder) {
+  const std::string key = "own-arm-overwrite";
+  const MvccStamp kIncoming{
+      MvccClock::kTombstoneBit | ((GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000),
+      0xAAAA};
+
+  std::optional<MvccStamp> got;
+  size_t skips_before = 0, skips_after = 0;
+  shard_set->Await(Shard(key, shard_set->size()), [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, key, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, key, MvccStamp{});
+    skips_before = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+
+    db_slice.InstallAbsentKeyTombstone(0, key, kIncoming, kTombMetaNone, GetCurrentTimeMs());
+
+    got = db_slice.GetMvcc(0, key);
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+    // The install above overwrote the SLOT, but ArmTombstone's own bookkeeping entry in armed_ is
+    // untouched by SetTombstone -- clean it up here, on the same fiber that placed it, before
+    // BaseFamilyTest::TearDown()'s own FLUSHALL (a real command, on a likely-different fiber)
+    // could otherwise count it as a foreign encounter.
+    MvccStamper::tlocal()->Disarm(0, key);
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncoming)
+      << "this fiber's own placeholder must be overwritten exactly as before -- OwnsArm makes it "
+         "exempt from the foreign-placeholder refusal";
+  EXPECT_EQ(skips_after, skips_before) << "no refusal must be counted for this fiber's own arm";
 }
 
 // drakeydb: P4-3 Task 3, review fix (C1), Critical -- the reviewer's own repro: with
@@ -9950,6 +10029,8 @@ TEST_F(MvccStoreTest, DebugMvccWithNoKeyReportsPerShardAggregates) {
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_tombstones_born_expired:"));
   // drakeydb: P4-5 -- D-14(b): shard<N>_foreign_arms_seen (debugcmd.cc) had no coverage either.
   EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_foreign_arms_seen:"));
+  // drakeydb: P4-5 -- shard<N>_foreign_placeholder_skips (debugcmd.cc) had no coverage either.
+  EXPECT_THAT(resp.GetString(), testing::HasSubstr("shard0_foreign_placeholder_skips:"));
 }
 
 // drakeydb: P4-3 Task 8 -- INFO memory got
