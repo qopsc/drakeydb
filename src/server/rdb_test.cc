@@ -7096,4 +7096,58 @@ TEST_F(RdbTest, LoadConsumesAndDiscardsTombstoneV2SectionWhenInactive) {
          "proving SetTombstone's own `if (!db.mvcc) return;` guard (db_slice.cc) discarded it";
 }
 
+// drakeydb: P4-5 -- D-14(a), ISSUE-REGISTER.md: the ABA guard pasted at every rdb_load.cc
+// loader-callback exit (FlushShardAsync's own shard_set->Add callback here) must actually fire
+// through a REAL loader callback -- evaluating the DCHECK directly inside a test body, as an
+// earlier version of this test did, can never observe that the pattern's own wiring is wrong.
+// This drives it through RdbLoader::Load() itself: an arm is placed on the target shard's queue
+// fiber first (standing in for a client write that never committed), then a plain (non-merge)
+// load buffers a key that hashes to that SAME shard and flushes it via FlushShardAsync, whose
+// callback ends with exactly the DCHECK this pins. Needs a shard other than the one Load() itself
+// runs on (RdbTest's own default: num_threads_ == 3 gives 2 shards, on separate proactors) --
+// RdbMvccTest's single-shard config would make every key run_inlined instead, on the SAME
+// proactor Load() itself uses, never reaching this callback at all.
+//
+// "threadsafe" sidesteps the classic fork()-in-a-multithreaded-process hazard this fixture's own
+// proactor/shard threads would otherwise create for the default fork-only style (same rationale
+// as RollbackFreshInsertRefusesNonFreshEntry, above).
+//
+// Falsifying: removing the DCHECK from FlushShardAsync's own callback (rdb_load.cc) makes this
+// test fail to observe a crash.
+#ifndef NDEBUG
+TEST_F(RdbTest, FlushShardAsyncLoaderCallbackTripsTheAbaGuardOnALeakedArm) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_GE(shard_set->size(), 2u) << "needs a shard other than the one Load() itself runs on";
+
+  const ShardId sid = 1;
+  std::string key;
+  for (int i = 0;; ++i) {
+    key = absl::StrCat("aba-guard-key-", i);
+    if (Shard(key, shard_set->size()) == sid)
+      break;
+    CHECK_LT(i, 10000) << "could not find a key hashing to shard " << sid;
+  }
+
+  shard_set->Add(sid, [] { MvccStamper::tlocal()->Arm(0, "leak", MvccStamp{}); });
+
+  std::string body;
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, key);
+  AppendString(&body, "v");
+  const std::string rdb = WrapInRdb(body);
+
+  EXPECT_DEATH(
+      {
+        io::BytesSource src{io::Buffer(rdb)};
+        RdbLoadContext load_context;
+        auto ec = pp_->at(0)->Await([&]() -> std::error_code {
+          RdbLoader loader(service_.get(), &load_context);
+          return loader.Load(&src);
+        });
+        CHECK(!ec) << ec.message();
+      },
+      "loader callback exit");
+}
+#endif  // NDEBUG
+
 }  // namespace dfly

@@ -1000,9 +1000,11 @@ TEST(MvccStamperTest, OwnsArmReflectsThisFibersOwnArmsOnly) {
   EXPECT_FALSE(s->OwnsArm(0, "k")) << "gone once disarmed";
 }
 
-// The regression case the derived-DEL DCHECK sites (db_slice.cc, set_family.cc, hset_family.cc)
-// rely on now that they call OwnedArmedCount() instead of ArmedCount(): with only one fiber ever
-// having armed anything on this thread, the two counts must agree.
+// On the plain gtest main thread, every arm in this whole binary shares one owner (see
+// FiberActiveIsStableAndNonNullOnThePlainGtestMainThread above), so the two counts agree here --
+// a general single-fiber sanity check for OwnedArmedCount(), not a stand-in for either DCHECK
+// family: the derived-DEL sites use the raw ArmedCount() (mvcc.h), and the loader-callback-exit
+// ABA guards need a real, separate fiber to actually exercise (rdb_test.cc).
 TEST(MvccStamperTest, OwnedArmedCountMatchesArmedCountOnASingleFiber) {
   MvccStamper* s = FreshStamper();
   EXPECT_EQ(s->OwnedArmedCount(), 0u);
@@ -1011,21 +1013,6 @@ TEST(MvccStamperTest, OwnedArmedCountMatchesArmedCountOnASingleFiber) {
   EXPECT_EQ(s->OwnedArmedCount(), s->ArmedCount());
   EXPECT_EQ(s->OwnedArmedCount(), 2u);
 }
-
-#ifndef NDEBUG
-// drakeydb: P4-5 -- D-14(a): pins the exact pattern pasted at each rdb_load.cc loader-callback
-// exit (FlushShardAsync's shard_set->Add lambda, HandleTombstones' install lambda): a key still
-// armed at that point trips the DCHECK, regardless of which fiber armed it -- the loader never
-// calls EndOfWriteEpoch itself, and EngineShard::queue_ has exactly one consumer fiber shared by
-// every tx hop and every such callback, so a leaked arm would sit there, still "owned" by that
-// same fiber identity, for whatever unrelated task the queue runs on it next.
-TEST(MvccStamperDeathTest, OwnedArmedCountTripsTheLoaderCallbackExitDcheckPattern) {
-  MvccStamper* s = FreshStamper();
-  s->Arm(0, "leaked", MvccStamp{});
-  EXPECT_DEBUG_DEATH(DCHECK_EQ(s->OwnedArmedCount(), 0u) << "loader callback exit",
-                     "loader callback exit");
-}
-#endif  // NDEBUG
 
 // ---------------------------------------------------------------------------
 // multimaster_lww.h: the streaming LWW guard's pure decision module (P4-4 Task A1). These tests

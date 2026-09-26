@@ -1954,6 +1954,146 @@ TEST_F(MvccStoreTest, DeleteAtTombstoneCapDegradesToEraseAndCountsTheDrop) {
   EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones_dropped, 1u);
 }
 
+// drakeydb: P4-5 -- D-14(a): PerformDeletionAtomic's own disarm must stay owner-agnostic
+// (DisarmAnyOwner, mvcc.cc), unlike every other disarm site in this codebase, which is scoped to
+// the calling fiber. Fiber C arms key "k" (an inline client write, standing in for one that
+// yields in AddLogRecord's own journal-throttling wait before its journal commit ever runs) and
+// blocks. While C is blocked, a different fiber -- the shard's own queue consumer, driven here
+// via shard_set->Await, standing in for a concurrent merge-load delete -- physically deletes "k"
+// with the tombstone cap at 0, forcing PerformDeletionAtomic's erase branch (EraseMvcc, never a
+// re-arm). C then resumes and commits its own (now meaningless) write: if PerformDeletionAtomic
+// had left C's arm alive (a scoped disarm cannot see a different fiber's arm), C's Commit() would
+// hand that arm to SetExistingMvcc for a key whose mvcc slot no longer exists -- a CHECK failure,
+// even in a release build (db_slice.cc). With the fix, the arm is swept away along with "k"
+// itself: C's Commit() finds nothing to do, and the table stays dense.
+//
+// Falsifying: reverting PerformDeletionAtomic's own call (db_slice.cc) from DisarmAnyOwner back
+// to the owner-scoped Disarm reproduces the abort (verbatim output in the report).
+TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmAtTheTombstoneCap) {
+  absl::SetFlag(&FLAGS_multi_master_max_tombstones, 0);
+  absl::Cleanup restore = [] { absl::SetFlag(&FLAGS_multi_master_max_tombstones, 1000000); };
+
+  const ShardId sid = Shard("k", shard_set->size());
+  util::ProactorBase* shard_proactor = nullptr;
+  shard_set->Await(sid, [&] { shard_proactor = util::ProactorBase::me(); });
+  ASSERT_NE(shard_proactor, nullptr);
+
+  util::fb2::Done c_armed, resume_c, c_done;
+
+  util::fb2::Fiber fiber_c = shard_proactor->LaunchFiber([&] {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetCurrentDbSlice();
+    DbContext db_cntx{&ns, 0, GetCurrentTimeMs()};
+    PrimeValue v;
+    v.SetString("c-value");
+    auto res = db_slice.AddOrUpdate(db_cntx, "k", std::move(v), 0);
+    ASSERT_TRUE(res);
+    res->post_updater.Run();
+    c_armed.Notify();
+    resume_c.Wait();
+    // C's own eventual journal commit -- must not crash even though "k" no longer exists.
+    MvccStamper::tlocal()->Commit(
+        /*mvcc=*/424242, /*origin_idx=*/0,
+        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, bool, const MvccStamp&) {
+          db_slice.SetExistingMvcc(db, key, stamp);
+        });
+    c_done.Notify();
+  });
+  c_armed.Wait();
+
+  size_t armed_right_after_delete = 0;
+  shard_set->Await(sid, [&] {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetCurrentDbSlice();
+    DbContext db_cntx{&ns, 0, GetCurrentTimeMs()};
+    auto it_res = db_slice.FindMutable(db_cntx, "k");
+    ASSERT_TRUE(IsValid(it_res.it));
+    it_res.post_updater.Run();
+    db_slice.Del(db_cntx, it_res.it, nullptr, /*async=*/false, DbSlice::DeleteReason::kExplicit);
+    armed_right_after_delete = MvccStamper::tlocal()->ArmedCount();
+  });
+  EXPECT_EQ(armed_right_after_delete, 0u)
+      << "C's foreign arm for the physically-deleted key must not survive the delete";
+
+  resume_c.Notify();
+  c_done.Wait();
+  fiber_c.Join();
+
+  size_t mismatches = 0;
+  std::optional<MvccStamp> got;
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    got = db_slice.GetMvcc(0, std::string_view{"k"});
+  });
+  EXPECT_EQ(mismatches, 0u) << "the dense mvcc<->prime invariant must hold";
+  EXPECT_FALSE(got.has_value())
+      << "the cap forced an erase, not a tombstone -- \"k\" must stay absent";
+}
+
+// drakeydb: P4-5 -- D-14(a): same shape as the erase variant above, but Q's own delete earns a
+// tombstone instead (default cap and ttl) -- PerformDeletionAtomic's earns_tombstone branch
+// (db_slice.cc) re-arms "k" as its OWN tombstone arm right after disarming, so this pins that
+// DisarmAnyOwner does not disturb that immediately-following re-arm: only C's foreign arm is
+// gone, Q's own tombstone arm for the same key survives untouched.
+//
+// Falsifying: reverting PerformDeletionAtomic's own call (db_slice.cc) from DisarmAnyOwner back
+// to the owner-scoped Disarm makes armed_right_after_delete come back 2 (C's foreign arm
+// survives alongside Q's own), not 1.
+TEST_F(MvccStoreTest, PhysicalDeletionDisarmsAForeignFibersArmWhenATombstoneIsEarned) {
+  const ShardId sid = Shard("k", shard_set->size());
+  util::ProactorBase* shard_proactor = nullptr;
+  shard_set->Await(sid, [&] { shard_proactor = util::ProactorBase::me(); });
+  ASSERT_NE(shard_proactor, nullptr);
+
+  util::fb2::Done c_armed, resume_c, c_done;
+
+  util::fb2::Fiber fiber_c = shard_proactor->LaunchFiber([&] {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetCurrentDbSlice();
+    DbContext db_cntx{&ns, 0, GetCurrentTimeMs()};
+    PrimeValue v;
+    v.SetString("c-value");
+    auto res = db_slice.AddOrUpdate(db_cntx, "k", std::move(v), 0);
+    ASSERT_TRUE(res);
+    res->post_updater.Run();
+    c_armed.Notify();
+    resume_c.Wait();
+    MvccStamper::tlocal()->Commit(
+        /*mvcc=*/424242, /*origin_idx=*/0,
+        [&](DbIndex db, std::string_view key, const MvccStamp& stamp, bool, const MvccStamp&) {
+          db_slice.SetExistingMvcc(db, key, stamp);
+        });
+    c_done.Notify();
+  });
+  c_armed.Wait();
+
+  size_t armed_right_after_delete = 0;
+  shard_set->Await(sid, [&] {
+    Namespace& ns = namespaces->GetDefaultNamespace();
+    DbSlice& db_slice = ns.GetCurrentDbSlice();
+    DbContext db_cntx{&ns, 0, GetCurrentTimeMs()};
+    auto it_res = db_slice.FindMutable(db_cntx, "k");
+    ASSERT_TRUE(IsValid(it_res.it));
+    it_res.post_updater.Run();
+    db_slice.Del(db_cntx, it_res.it, nullptr, /*async=*/false, DbSlice::DeleteReason::kExplicit);
+    armed_right_after_delete = MvccStamper::tlocal()->ArmedCount();
+  });
+  EXPECT_EQ(armed_right_after_delete, 1u)
+      << "only Q's own tombstone arm may remain -- C's foreign arm must be gone";
+
+  resume_c.Notify();
+  c_done.Wait();
+  fiber_c.Join();
+
+  size_t mismatches = 0;
+  shard_set->Await(sid, [&] {
+    mismatches = namespaces->GetDefaultNamespace().GetCurrentDbSlice().TEST_VerifyMvccTable(0);
+  });
+  EXPECT_EQ(mismatches, 0u) << "the dense mvcc<->prime invariant must hold";
+  EXPECT_EQ(GetMetrics().db_stats[0].mvcc_tombstones, 1u);
+}
+
 // drakeydb: P4-3 Task 3 -- the idle-task GC that reclaims a tombstone once
 // MvccStamp::DeadlineMs(ttl_ms) has passed, bounded per call by
 // --multi_master_tombstone_gc_budget (MvccTable::Traverse calls, each visiting at most one
@@ -13753,15 +13893,18 @@ TEST_F(MvccOwnershipFiberTest, CommitOwnTombstoneIsScopedToTheOwningFiber) {
          "call for the same key";
 }
 
-// LocalMintFloor must only consider the CALLING fiber's own arms. Fiber A arms a key with a real,
-// modest prior stamp and blocks. While A is blocked, fiber B arms a DIFFERENT key with a prior
-// stamp near MvccClock::kStampMask -- if LocalMintFloor summed over every arm on the thread
-// regardless of owner, A's own floor would come back inflated to (near) kStampMask instead of
-// one tick above ITS OWN prior stamp.
+// LocalMintFloor stays owner-agnostic, unlike Disarm/CommitOwnTombstone/Arm()'s own inheritance
+// scan above -- paired with Commit() (mvcc.cc), which stamps EVERY currently-armed key with one
+// entry's mint regardless of which fiber placed it. Fiber A arms a key with a real, modest prior
+// stamp and blocks. While A is blocked, fiber B arms a DIFFERENT key with a prior stamp at
+// MvccClock::kStampMask. A's own LocalMintFloor() must still see B's arm: if Commit() is about to
+// sweep both keys with A's mint (its own contract, unchanged here), a floor that ignored B's own
+// prior stamp would let A's mint land BELOW it, rewinding B's key.
 //
-// Falsifying: dropping the owner check from LocalMintFloor's loop (mvcc.cc) makes a_floor_after_b
-// come back MvccClock::kStampMask (B's contribution), not kAPriorMvcc + 1.
-TEST_F(MvccOwnershipFiberTest, LocalMintFloorIgnoresAForeignFibersArm) {
+// Falsifying: adding the owner check back to LocalMintFloor's loop (mvcc.cc) makes
+// a_floor_after_b come back kAPriorMvcc + 1 (A's own contribution only), not
+// MvccClock::kStampMask (B's, correctly included).
+TEST_F(MvccOwnershipFiberTest, LocalMintFloorIncludesEveryArmRegardlessOfOwner) {
   util::fb2::Done a_armed, resume_a, b_armed, resume_b;
   uint64_t a_floor_after_b = 0;
 
@@ -13789,9 +13932,10 @@ TEST_F(MvccOwnershipFiberTest, LocalMintFloorIgnoresAForeignFibersArm) {
   resume_a.Notify();
   fiber_a.Join();
 
-  EXPECT_EQ(a_floor_after_b, kAPriorMvcc + 1)
-      << "A's own LocalMintFloor() must reflect only A's own prior stamp, never a different "
-         "fiber's, even a far larger one still pending on the same thread";
+  EXPECT_EQ(a_floor_after_b, MvccClock::kStampMask)
+      << "LocalMintFloor() must still see B's own pending arm too -- Commit() (mvcc.cc) is about "
+         "to sweep both keys with one mint regardless of who armed them, so the floor must not "
+         "ignore either";
 
   resume_b.Notify();
   fiber_b.Join();
@@ -13804,12 +13948,16 @@ TEST_F(MvccOwnershipFiberTest, LocalMintFloorIgnoresAForeignFibersArm) {
 // tombstone-clearing branch, db_slice.cc). A's call must NOT inherit B's prior stamp: observed
 // indirectly through A's own LocalMintFloor(), which floors on Mvcc() alone and skips a
 // {0,0}-Mvcc() prev_stamp entirely (mvcc.cc) -- inheriting B's real prior stamp would instead
-// give A's own arm a non-zero Mvcc(), inflating A's floor.
+// give A's own arm a non-zero Mvcc(), inflating A's floor. B disarms its own arm BEFORE A reads
+// the floor -- LocalMintFloor() is itself deliberately owner-agnostic (paired with Commit(),
+// above), so leaving B's arm pending would inflate A's floor via B's OWN arm directly,
+// confounding the signal this test actually cares about (whether A's Arm() call inherited it).
 //
 // Falsifying: dropping the owner conjunct from Arm()'s inheritance scan (mvcc.cc) makes A's own
-// arm inherit B's prior stamp -- a_floor comes back kBPriorMvcc + 1 instead of 0.
+// arm inherit B's prior stamp -- a_floor comes back kBPriorMvcc + 1 instead of 0, even with B's
+// own arm already gone.
 TEST_F(MvccOwnershipFiberTest, ArmPlaceholderInheritanceIsScopedToTheOwningFiber) {
-  util::fb2::Done b_armed, resume_b;
+  util::fb2::Done b_armed, a_armed_placeholder, b_disarmed;
   uint64_t a_floor = 0;
 
   constexpr uint64_t kBPriorMvcc = 999;
@@ -13818,13 +13966,16 @@ TEST_F(MvccOwnershipFiberTest, ArmPlaceholderInheritanceIsScopedToTheOwningFiber
   util::fb2::Fiber fiber_b = pp_->at(0)->LaunchFiber([&] {
     MvccStamper::tlocal()->ArmTombstone(0, "k", kBPrev);
     b_armed.Notify();
-    resume_b.Wait();
+    a_armed_placeholder.Wait();
     MvccStamper::tlocal()->Disarm(0, "k");  // cleanup on the same fiber that armed it
+    b_disarmed.Notify();
   });
   b_armed.Wait();
 
   util::fb2::Fiber fiber_a = pp_->at(0)->LaunchFiber([&] {
     MvccStamper::tlocal()->Arm(0, "k", MvccStamp{MvccClock::kTombstoneBit, 0});
+    a_armed_placeholder.Notify();
+    b_disarmed.Wait();
     a_floor = MvccStamper::tlocal()->LocalMintFloor();
     MvccStamper::tlocal()->Disarm(0, "k");  // cleanup A's own arm only
   });
@@ -13834,7 +13985,6 @@ TEST_F(MvccOwnershipFiberTest, ArmPlaceholderInheritanceIsScopedToTheOwningFiber
       << "A's own placeholder Arm() must not inherit a different fiber's pending tombstone arm's "
          "prior stamp -- it has none of its own to floor against here";
 
-  resume_b.Notify();
   fiber_b.Join();
 }
 
