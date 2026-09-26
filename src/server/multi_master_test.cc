@@ -2241,7 +2241,10 @@ TEST_F(ActiveReplicaFamilyTest, CommitScopingKeepsDebugPopulateFromStampingAPaus
           db_slice.SetExistingMvcc(db, key, stamp);
         });
   });
-  ASSERT_EQ(populate_committed.size(), 2u)
+  // EXPECT, not ASSERT: fiber_set is still blocked on resume_set.Wait() below and must be
+  // resumed and joined regardless of this check's outcome, or its own destructor aborts the
+  // whole process (util::fb2::Fiber's own "destructor called on a joinable fiber" CHECK).
+  EXPECT_EQ(populate_committed.size(), 2u)
       << "DEBUG POPULATE's own commit must process exactly its own two keys, never SET's";
   for (const auto& [key, stamp] : populate_committed) {
     EXPECT_EQ(stamp.Mvcc(), kPopulateMvcc) << "DEBUG POPULATE's own key must carry its own "
@@ -14236,7 +14239,13 @@ TEST_F(MvccOwnershipFiberTest, CommitSkipsAndCountsAForeignArm) {
   });
   fiber_b.Join();
 
-  ASSERT_TRUE(b_committed);
+  // Resume and join A BEFORE asserting on anything above: a fatal assertion failure here must
+  // never leave A still blocked on resume_a.Wait(), or its own Fiber destructor aborts the whole
+  // process (util::fb2::Fiber's own "destructor called on a joinable fiber" CHECK).
+  resume_a.Notify();
+  fiber_a.Join();
+
+  EXPECT_TRUE(b_committed);
   EXPECT_EQ(b_committed_stamp, kExpectedBStamp);
   EXPECT_FALSE(a_key_touched_by_b) << "Commit() must never call fn for A's own foreign arm";
   EXPECT_EQ(foreign_arms_seen_delta, 1u)
@@ -14244,10 +14253,7 @@ TEST_F(MvccOwnershipFiberTest, CommitSkipsAndCountsAForeignArm) {
   EXPECT_EQ(armed_after_b_commit, 1u)
       << "A's own arm must survive B's Commit() call untouched -- only B's own is erased";
 
-  resume_a.Notify();
-  fiber_a.Join();
-
-  ASSERT_TRUE(a_committed);
+  EXPECT_TRUE(a_committed);
   EXPECT_EQ(a_committed_stamp, kExpectedAStamp)
       << "A's own foreign arm, left alone by B's Commit(), must be committed correctly by A's "
          "own later Commit() call, with A's own mint -- never B's";
@@ -14293,9 +14299,17 @@ TEST_F(MvccOwnershipFiberTest, EndOfWriteEpochSkipsAndCountsAForeignArm) {
   });
   fiber_b.Join();
 
-  ASSERT_EQ(b_rolled_back.size(), 1u)
+  // Resume and join A BEFORE asserting on anything above: a fatal assertion failure here must
+  // never leave A still blocked on resume_a.Wait(), or its own Fiber destructor aborts the whole
+  // process (util::fb2::Fiber's own "destructor called on a joinable fiber" CHECK).
+  resume_a.Notify();
+  fiber_a.Join();
+
+  EXPECT_EQ(b_rolled_back.size(), 1u)
       << "B's own EndOfWriteEpoch() must roll back only its own tombstone arm";
-  EXPECT_EQ(b_rolled_back[0], "b-key");
+  if (!b_rolled_back.empty()) {
+    EXPECT_EQ(b_rolled_back[0], "b-key");
+  }
   EXPECT_EQ(b_unstamped_delta, 1u)
       << "only B's own arm may be folded into unstamped_writes by B's own epoch end";
   EXPECT_EQ(foreign_arms_seen_delta, 1u)
@@ -14303,13 +14317,12 @@ TEST_F(MvccOwnershipFiberTest, EndOfWriteEpochSkipsAndCountsAForeignArm) {
   EXPECT_EQ(armed_after_b_epoch_end, 1u)
       << "A's own pending placeholder must survive B's own EndOfWriteEpoch() call untouched";
 
-  resume_a.Notify();
-  fiber_a.Join();
-
-  ASSERT_EQ(a_rolled_back.size(), 1u)
+  EXPECT_EQ(a_rolled_back.size(), 1u)
       << "A's own placeholder, left alone by B's epoch end, must be rolled back correctly by "
          "A's own later EndOfWriteEpoch() call instead";
-  EXPECT_EQ(a_rolled_back[0], "a-key");
+  if (!a_rolled_back.empty()) {
+    EXPECT_EQ(a_rolled_back[0], "a-key");
+  }
 }
 
 // drakeydb: P4-5 -- D-14(b), ISSUE-REGISTER.md: arena_'s (off, len) indirection (ArmedKey(),
