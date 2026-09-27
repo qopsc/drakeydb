@@ -109,19 +109,17 @@ struct DbTableStats {
   // resent). This counter increments only once that wait times out; on that path the loader
   // itself refuses and returns WITHOUT ever calling DbSlice::InstallAbsentKeyTombstone (an
   // earlier version of this comment wrongly called that method's own
-  // identical check "the fallback for that timeout path", which it is not). What
-  // InstallAbsentKeyTombstone's own check IS a real fallback for is a caller that meets this same
-  // shape without waiting first at all: an ordinary streaming caller (SetCmd::Set, OpRestore,
-  // Renamer::DeserializeDest, RecordAbsentKeyRemoval) holds the key's own lock against every
-  // OTHER locked transaction, but not against the loader's own lock-free FindMutable ->
-  // ExpireIfNeeded -> Del path (rdb_load.cc), whose Del() can arm a tombstone and yield inside
-  // RecordExpiryBlocking (db_slice.cc) with no key lock held at all -- a streaming caller
-  // genuinely can meet that arm. Left alone,
-  // the overwrite this refuses would let TombstoneGcStep (db_slice.cc) later reap the slot
-  // before the placeholder's own owner ever commits, aborting that owner's SetExistingMvcc call
-  // on CHECK(!it.is_done()). Purely diagnostic, like mvcc_tombstones_dropped/
-  // mvcc_tombstones_born_expired above; the refused install is simply skipped -- the placeholder
-  // is left for its owner to resolve on its own.
+  // identical check "the fallback for that timeout path", which it is not).
+  // InstallAbsentKeyTombstone's own check has no currently known reachable path from any caller:
+  // an ordinary streaming caller (SetCmd::Set, OpRestore, Renamer::DeserializeDest,
+  // RecordAbsentKeyRemoval) holds the key's own lock against every OTHER locked transaction, and
+  // the loader's own lock-free FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc) does not
+  // leave an arm behind for one to meet either: RecordExpiryBlocking (tx_base.cc) commits (and
+  // disarms) that lazy expiry's own tombstone arm before its own journal::RecordEntry call, so the
+  // yield inside that call never has an arm left pending. It stays in place as a defensive guard
+  // regardless. Purely diagnostic, like mvcc_tombstones_dropped/mvcc_tombstones_born_expired
+  // above; the refused install is simply skipped -- the placeholder is left for its owner to
+  // resolve on its own.
   size_t mvcc_foreign_placeholder_skips = 0;
 
   // drakeydb: P4-2 Task 4 -- heap bytes held by the mvcc side table's own duplicated copy of a

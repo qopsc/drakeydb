@@ -718,6 +718,11 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
   size_t mismatches = 0;
   string scratch;
 
+  // drakeydb: P4-5 -- catches a prime key inserted twice (a distinct bug class from anything the
+  // two traversals below check: both copies still find the SAME one mvcc slot by name, so neither
+  // "live key with no stamp" nor "stamp with no live key" ever fires for a duplicate). Cost is
+  // test-only, so an extra per-key set insert is not a concern here.
+  absl::flat_hash_set<string> seen_prime_keys;
   // dash.h:355 -- Traverse is element-granular but bounded per call (it stops at the first
   // non-empty logical bucket it finds); the returned cursor must be fed back in until it is
   // exhausted (falsy) to guarantee full coverage. There is no CVisit / single-call whole-table
@@ -725,7 +730,12 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
   PrimeTable::Cursor prime_cursor;
   do {
     prime_cursor = db.prime.Traverse(prime_cursor, [&](auto it) {
-      if (db.mvcc->Find(it->first.GetSlice(&scratch)).is_done()) {
+      const string_view key = it->first.GetSlice(&scratch);
+      if (!seen_prime_keys.insert(string(key)).second) {
+        LOG(ERROR) << "mvcc: prime key appears more than once: " << it->first.ToString();
+        ++mismatches;
+      }
+      if (db.mvcc->Find(key).is_done()) {
         LOG(ERROR) << "mvcc: live key with no stamp: " << it->first.ToString();
         ++mismatches;
       }
@@ -768,6 +778,21 @@ size_t DbSlice::TEST_VerifyMvccTable(DbIndex db_ind) const {
     LOG(ERROR) << "mvcc: mvcc_tombstones stat (" << db.stats.mvcc_tombstones
                << ") does not match tombstones actually found in the table (" << tombstones_found
                << ")";
+    ++mismatches;
+  }
+
+  // drakeydb: P4-5 -- the same O(1) dense invariant OnCbFinishBlocking's own production DCHECK
+  // checks (this file), proven here from the from-scratch counts above rather than assumed: every
+  // mvcc slot is either a tombstone (no live counterpart) or a live key's own stamp (exactly one
+  // per live prime key), so the mvcc table's size minus its tombstone count must equal prime's own
+  // size. A duplicate prime entry (the seen_prime_keys check above) can violate this even though
+  // neither per-slot traversal above notices it on its own -- both copies of the SAME key resolve
+  // to the SAME mvcc slot by name, so this is the one check here that can still catch it via the
+  // resulting size mismatch even if the duplicate-key count above were somehow missed.
+  if (db.mvcc->size() - db.stats.mvcc_tombstones != db.prime.size()) {
+    LOG(ERROR) << "mvcc: size invariant violated: mvcc->size() (" << db.mvcc->size()
+               << ") - mvcc_tombstones (" << db.stats.mvcc_tombstones << ") != prime.size() ("
+               << db.prime.size() << ")";
     ++mismatches;
   }
 
@@ -1831,10 +1856,12 @@ void DbSlice::TEST_ForceTombMeta(DbIndex db_ind, string_view key, uint64_t meta)
 // Renamer::DeserializeDest all run under an already-scheduled transaction for a real db), but
 // load-bearing for RdbLoader::ApplyMergeTombstoneOnShard's own merge-load caller, which can name a
 // db index this node has never activated for a key arriving from an unfamiliar source.
-void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const MvccStamp& stamp,
-                                        uint64_t meta, uint64_t now_ms) {
+DbSlice::TombstoneInstallOutcome DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key,
+                                                                    const MvccStamp& stamp,
+                                                                    uint64_t meta,
+                                                                    uint64_t now_ms) {
   if (!TombstonesEnabled() || !IsDbValid(db_ind))
-    return;
+    return TombstoneInstallOutcome::kRefused;
   auto& db = *db_arr_[db_ind];
   // drakeydb: P4-5 -- checked before the born-expired refusal below (not left to SetTombstone's
   // own `if (!db.mvcc) return;`, further down): without this, a DbSlice whose table predates an
@@ -1842,7 +1869,7 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   // alone, not on active mode) would count a refusal for a tombstone that could never have been
   // installed here regardless -- not a real refusal, so not a real count.
   if (!db.mvcc)
-    return;
+    return TombstoneInstallOutcome::kRefused;
   const std::optional<MvccStamp> existing = GetMvcc(db_ind, key);
   // drakeydb: P4-5 -- `existing` may be a DIFFERENT fiber's still-uncommitted
   // {kTombstoneBit, 0} placeholder (PerformDeletionAtomic's synchronous pre-commit write,
@@ -1857,13 +1884,16 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
   // exactly as its owner left it, for that owner's own eventual Commit()/rollback to resolve.
   // Unreachable via the loader's own current calls (see the declaration, db_slice.h): the loader
   // itself waits for this exact placeholder to resolve, in its own caller, strictly before ever
-  // reaching this call. Reachable via a DIFFERENT caller, though: this
-  // key's lock, held by whichever transaction callback reaches this method, excludes every OTHER
-  // LOCKED transaction on the same key, but not the loader's own lock-free FindMutable ->
-  // ExpireIfNeeded -> Del path (rdb_load.cc), whose Del() can arm a tombstone and then yield inside
-  // RecordExpiryBlocking (this file) while journaling that lazy expiry, with no key lock of its
-  // own held at all. A genuinely foreign arm left behind that way is exactly the shape this check
-  // exists to catch, so this is a real defensive fallback, not merely a hypothetical one.
+  // reaching this call. No other caller is known to reach it either: every OTHER caller
+  // (SetCmd::Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval) holds this key's own
+  // lock, which excludes every other locked transaction on the same key -- and the loader's own
+  // lock-free FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc) does not leave a foreign arm
+  // behind for one to meet: RecordExpiryBlocking (tx_base.cc) commits (and disarms) that lazy
+  // expiry's own tombstone arm via CommitOwnTombstone strictly BEFORE its own journal::RecordEntry
+  // call, so the yield inside that call (AddLogRecord's throttle) never has an arm left pending by
+  // the time it runs. This check stays in place as a defensive guard with no currently known
+  // reachable path, not a fallback for a specific live scenario -- see the "key live" check below
+  // for the real hazard that same yield does create.
   //
   // IsArmedByAnyFiber(db_ind, key) && !OwnsArm(db_ind, key) -- "someone still has an arm on this
   // key, and it is not me" -- not OwnsArm() alone: a caller reached here right after Disarming
@@ -1880,7 +1910,7 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
     ++db.stats.mvcc_foreign_placeholder_skips;
     VLOG(1) << "refusing to overwrite a foreign in-flight tombstone placeholder: db=" << db_ind
             << " key=" << key;
-    return;
+    return TombstoneInstallOutcome::kRefused;
   }
   const bool would_grow = !existing.has_value() || !existing->IsTombstone();
   // drakeydb: P4-5 -- clamp here, at install (see the declaration's own comment, db_slice.h): a
@@ -1897,13 +1927,27 @@ void DbSlice::InstallAbsentKeyTombstone(DbIndex db_ind, string_view key, const M
     ++db.stats.mvcc_tombstones_born_expired;
     VLOG(2) << "refusing born-expired peer-sourced tombstone install: db=" << db_ind
             << " key=" << key;
-    return;
+    return TombstoneInstallOutcome::kRefused;
+  }
+  // drakeydb: P4-5 -- the choke point for a caller whose own "no live key" premise was observed
+  // before a yield (see the declaration's own comment, db_slice.h, for who that is and why every
+  // OTHER caller's own key lock keeps this from ever firing for them). Re-checked here, with no
+  // yield between this read and the SetTombstone write below, so nothing can invalidate it in
+  // between: if `prime` now holds this key, a tombstone must never be stamped directly over it --
+  // that would violate the dense invariant (mvcc->size() - mvcc_tombstones == prime.size()) and
+  // leave the live value permanently shadowed by an mvcc-side tombstone no read path expects.
+  // Installs nothing; the caller is expected to re-derive its own "is this key live" premise fresh
+  // and redo whatever comparison led it here, rather than treat this as an ordinary refusal.
+  if (!db.prime.Find(key).is_done()) {
+    VLOG(1) << "refusing to tombstone a key that is now live: db=" << db_ind << " key=" << key;
+    return TombstoneInstallOutcome::kKeyLive;
   }
   if (!would_grow || db.stats.mvcc_tombstones < absl::GetFlag(FLAGS_multi_master_max_tombstones)) {
     SetTombstone(db_ind, key, stamp, clamped_meta);
-  } else {
-    ++db.stats.mvcc_tombstones_dropped;  // at the cap: degrade to no-op, visibly
+    return TombstoneInstallOutcome::kInstalled;
   }
+  ++db.stats.mvcc_tombstones_dropped;  // at the cap: degrade to no-op, visibly
+  return TombstoneInstallOutcome::kRefused;
 }
 
 // drakeydb: P4-5 -- see the declaration (db_slice.h) for the full contract. false whenever
@@ -3383,9 +3427,8 @@ void DbSlice::DefragTableSegments(DbIndex db_ind, PageUsage* page_usage) {
 // first, letting this step reap a slot its own owner had not yet resolved. (The live install's
 // own version of this harm looks slightly different: the slot turns LIVE rather than staying a
 // tombstone, so this step's own Mvcc()!=0 check does not even apply to it -- it is the dense
-// invariant itself, mvcc->size() - mvcc_tombstones == prime.size(), that breaks instead. GC does
-// not skip it because the slot "no longer looks like a tombstone": this step's own
-// prime.Find(key) check just below is what skips it, exactly as it would for any other live
+// invariant itself, mvcc->size() - mvcc_tombstones == prime.size(), that breaks instead. This
+// step's own prime.Find(key) check just below skips it, exactly as it would for any other live
 // key, because prime genuinely still holds a resident value for that key now. The owner's own
 // eventual SetExistingMvcc call (this file) DOES re-tombstone the mvcc-side stamp once it
 // commits -- was_tombstone flips back to true there, and mvcc_tombstones is incremented again --

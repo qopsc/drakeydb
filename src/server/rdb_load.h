@@ -619,29 +619,28 @@ class RdbLoader : protected RdbLoaderBase {
   // --replication_timeout, 30s by default -- NOT by this wait's own ~1s bound, which is far
   // shorter. This bound is a trade, not a guarantee that the owner resolves within it: refuse
   // sooner (and count a placeholder skip) at the cost of occasionally waiting out a slow-but-live
-  // peer link that would have resolved a little later. Whichever this loader's call site is
-  // dispatched on this shard's queue (the same queue every ordinary transaction hop shares), the
-  // wait stalls EVERY later hop queued on that shard for its duration, not just this loader's own
-  // remaining load work -- and the bound is charged PER KEY: N keys all armed by the same
-  // throttled owner cost this shard N times this bound, not one.
+  // peer link that would have resolved a little later. Whichever of this loader's three call
+  // sites runs this wait, it runs on this shard's own queue (the same queue every ordinary
+  // transaction hop shares), so the wait stalls EVERY later hop queued on that shard for its
+  // duration, not just this loader's own remaining load work -- and the bound is charged PER KEY:
+  // N keys all armed by the same throttled owner cost this shard N times this bound, not one.
   //
   // Never called from DbSlice::InstallAbsentKeyTombstone itself: that method's OTHER callers
   // (SetCmd::Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval) run inside a
-  // transaction callback holding this key's lock against every OTHER locked transaction, but that
-  // does not exclude every possible foreign arm: this loader's own
-  // FindMutable, called with no key lock of its own
-  // (ApplyMergeTombstoneOnShard/CreateObjectOnShard, above in this file), can trigger
-  // ExpireIfNeeded's lazy delete, whose Del() arms a tombstone and then yields inside
-  // RecordExpiryBlocking (db_slice.cc) while journaling that expiry -- a lock-free pending arm,
-  // owned by this loader's own fiber, that a streaming caller's later InstallAbsentKeyTombstone
-  // call for the SAME key genuinely could meet and would need to wait on (or refuse) exactly like
-  // this loader's own three sites do. It stays in place as a real defensive fallback for that
-  // reachable case, not a hypothetical one for a caller that does not exist yet: this loader itself
-  // checks and waits BEFORE ever calling DbSlice::InstallAbsentKeyTombstone (with no yield in
-  // between the post-wait recheck and that call, so nothing can change in between), and on a
-  // timeout this loader refuses and returns WITHOUT calling it at all -- so no CURRENT call from
-  // this loader ever reaches that fallback, even though a future streaming caller's own call
-  // genuinely could.
+  // transaction callback holding this key's lock against every OTHER locked transaction, and that
+  // lock is what excludes a foreign arm for them too. This loader's own FindMutable, called with
+  // no key lock of its own (ApplyMergeTombstoneOnShard/CreateObjectOnShard, above in this file),
+  // can trigger ExpireIfNeeded's lazy delete -- but that delete's own RecordExpiryBlocking
+  // (tx_base.cc) commits (and disarms) its tombstone arm via CommitOwnTombstone strictly BEFORE
+  // its own journal::RecordEntry call, so the yield inside that call never has an arm left pending
+  // for a streaming caller to meet. InstallAbsentKeyTombstone's own foreign-placeholder refusal
+  // therefore has no currently known reachable path from any caller either -- this wait exists for
+  // the DIFFERENT, real owner named above instead: an in-flight peer-link write that still holds
+  // this key's own lock, mid-yield in its own journal throttle, which this loader's lock-free
+  // apply can meet even though a same-key transaction never could. This loader itself checks and
+  // waits BEFORE ever calling DbSlice::InstallAbsentKeyTombstone (with no yield in between the
+  // post-wait recheck and that call, so nothing can change in between), and on a timeout this
+  // loader refuses and returns WITHOUT calling it at all.
   static bool WaitForForeignArmToClear(DbIndex db_index, std::string_view key);
 
   // validates if the current chunk is fully read, resets the state. returns early if stop_early_ is

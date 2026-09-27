@@ -3310,15 +3310,8 @@ void RdbLoaderBase::CopyStreamId(const StreamID& src, struct streamID* dest) {
 // (BaseFamilyTest's own now, never advanced by AdvanceTime() in a test that never calls it) -- a
 // deadline computed from it would never elapse, hanging this loop forever instead of timing out.
 // steady_clock is never mocked, so a deadline computed from it always elapses on real wall-clock
-// time regardless of what TEST_current_time_ms holds.
-//
-// An earlier version of this bound counted `kForeignArmWaitBoundMs`
-// iterations of `ThisFiber::SleepFor(1ms)` instead of computing a deadline. Each iteration's own
-// scheduling overhead (fiber wakeup, the two IsArmedByAnyFiber()/OwnsArm() reads, loop bookkeeping)
-// added up: measured at roughly 3ms per iteration, not 1ms, so 1000 iterations bounded the wait at
-// roughly 3s, not the ~1s the comment (and the flag's own doc string) claimed. A real deadline on
-// an unmocked clock has no such drift: it bounds actual elapsed time directly, however many
-// iterations that takes.
+// time regardless of what TEST_current_time_ms holds, and bounds actual elapsed time directly
+// (kForeignArmWaitBoundMs milliseconds), independent of how many poll iterations that takes.
 bool RdbLoader::WaitForForeignArmToClear(DbIndex db_index, string_view key) {
   MvccStamper* const stamper = MvccStamper::tlocal();
   auto still_foreign = [&] {
@@ -3722,8 +3715,31 @@ void RdbLoader::ApplyMergeTombstoneOnShard(DbSlice* db_slice, DbIndex db_index, 
       continue;
     }
 
-    db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta, db_cntx.time_now_ms);
-    return;
+    // drakeydb: P4-5 -- `found_mutable`'s own FindMutable call, above, can have reported "not
+    // found" for a key that a peer-link SET made live again during that FindMutable's OWN
+    // internal yield (a lazy expiry's RecordExpiryBlocking call, whose ExpireIfNeeded always
+    // returns "not found" once it decides to expire a key, regardless of what happens to `prime`
+    // for that same key during its own yield): `resident_live` and the fallthrough here would then
+    // both be stale, and installing a tombstone straight from `existing` above would stamp it
+    // directly over that now-live value. InstallAbsentKeyTombstone's own choke point (db_slice.cc)
+    // catches that with a yield-free re-check right before it would mutate, rather than a second
+    // check here: it is the ONE place this function's fallthrough actually writes a tombstone, so
+    // gating there covers every route into it, including this one -- no separate re-check is added
+    // here.
+    const DbSlice::TombstoneInstallOutcome outcome =
+        db_slice->InstallAbsentKeyTombstone(db_index, key, stamp, meta, db_cntx.time_now_ms);
+    if (outcome != DbSlice::TombstoneInstallOutcome::kKeyLive)
+      return;
+    // Disarm defensively before restarting: the found_mutable branch above already disarmed
+    // synchronously with no yield since, so nothing this pass armed should still be pending, but a
+    // restart must never carry a stale arm into its next pass regardless. Then loop back to the
+    // top and redo everything on freshly re-derived state, exactly like the foreign-placeholder
+    // wait above: the key is live now, so this pass's own authoritative FindMutable/MergeAccepts
+    // compare -- not this refusal -- decides what happens to it.
+    MvccStamper::tlocal()->Disarm(db_index, key);
+    DbTable* fresh_table = db_slice->GetDBTable(db_index);
+    resident_live = fresh_table != nullptr && !fresh_table->prime.Find(key).is_done();
+    now_ms = GetCurrentTimeMs();
   }
 }
 
@@ -4868,7 +4884,14 @@ error_code RdbLoader::HandleTombstones(bool has_meta) {
                 MvccStamper::tlocal()->IsArmedByAnyFiber(db_index, key) &&
                 !MvccStamper::tlocal()->OwnsArm(db_index, key)) {
               if (!RdbLoader::WaitForForeignArmToClear(db_index, key)) {
-                ++cur_table->stats.mvcc_foreign_placeholder_skips;
+                // drakeydb: P4-5 -- db_slice.MutableStats(db_index), not `cur_table` (captured
+                // before this wait): a replicated FLUSHDB landing during the wait moves `cur_table`
+                // into deferred destruction and installs a new table at this index, so bumping
+                // through the stale pointer would count against a table nothing else can ever
+                // read again, matching the other two skip-counting sites
+                // (ApplyMergeTombstoneOnShard above, and InstallAbsentKeyTombstone itself, both
+                // db_slice.cc).
+                ++db_slice.MutableStats(db_index)->mvcc_foreign_placeholder_skips;
                 VLOG(1) << "timed out waiting for a foreign in-flight tombstone placeholder: db="
                         << db_index << " key=" << absl::CHexEscape(key);
                 return;

@@ -537,17 +537,28 @@ class DbSlice {
   // method itself never waits for that placeholder to resolve first. Its own callers -- SetCmd::
   // Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval -- run inside a transaction
   // callback holding this key's own lock, which excludes every OTHER locked transaction on the
-  // same key, but NOT every possible foreign arm. The loader's own
-  // FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc) takes no key lock at all, and that
-  // Del() can arm a tombstone and then yield inside RecordExpiryBlocking (this file) while
-  // journaling the lazy expiry -- a lock-free pending arm a streaming caller genuinely could meet
-  // here. Every one of the loader's OWN three peer-sourced install sites does the waiting itself,
-  // in its own caller, strictly before ever reaching this call (rdb_load.cc's own
-  // WaitForForeignArmToClear) -- so no CURRENT call from the loader ever reaches this refusal --
-  // but a streaming caller meeting the loader's own lazy-expiry arm has no such wait and refuses
-  // right here, which is exactly the real (not merely hypothetical) case this guards.
-  void InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key, const MvccStamp& stamp,
-                                 uint64_t meta, uint64_t now_ms);
+  // same key. The loader's own FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc) takes no
+  // key lock at all, but does not leave a foreign arm behind either: RecordExpiryBlocking
+  // (tx_base.cc) commits (and disarms) that lazy expiry's own tombstone arm via
+  // CommitOwnTombstone strictly BEFORE its own journal::RecordEntry call, so the yield inside that
+  // call never has an arm left pending. This refusal therefore has no currently known reachable
+  // path from any caller; it stays in place as a defensive guard, not a fallback for a specific
+  // live scenario.
+  //
+  // drakeydb: P4-5 -- returns TombstoneInstallOutcome::kKeyLive, installing nothing, when `prime`
+  // holds a live entry for `key` at the moment just before the write (checked with no yield in
+  // between): a caller that looked up "no live key" earlier and then yielded can reach this call
+  // with a stale premise -- the loader's own FindMutable, whose internal ExpireIfNeeded always
+  // reports "not found" once it decides to expire a key, regardless of what lands in `prime` for
+  // that same key during ITS OWN yield (rdb_load.cc's ApplyMergeTombstoneOnShard). Every OTHER
+  // caller (SetCmd::Set, OpRestore, Renamer::DeserializeDest, RecordAbsentKeyRemoval) holds this
+  // key's own lock across both its own no-live-key observation and this call, so `prime` cannot
+  // have changed in between and this never fires for them. kInstalled/kRefused otherwise, per the
+  // born-expired/cap checks above.
+  enum class TombstoneInstallOutcome : uint8_t { kInstalled, kRefused, kKeyLive };
+  TombstoneInstallOutcome InstallAbsentKeyTombstone(DbIndex db_ind, std::string_view key,
+                                                    const MvccStamp& stamp, uint64_t meta,
+                                                    uint64_t now_ms);
   // drakeydb: P4-5 -- names, once, the rule every call site below shares: a tombstone (`stamp`
   // plus `meta`) is "born expired" when it is already GC-eligible (TombstoneExpiredAt, mvcc.h) the
   // instant it would be installed, at `now_ms`. Three shapes of caller: a peer-sourced absent-key
@@ -620,6 +631,12 @@ class DbSlice {
   // size); this is the test-only counterpart to the O(1) DCHECK in OnCbFinishBlocking
   // (db_slice.cc), which this test coverage exists to justify trusting. Returns the mismatch
   // count (0 == clean). Scoped to the default namespace -- see the comment on the definition.
+  //
+  // drakeydb: P4-5 -- also checks the same size invariant OnCbFinishBlocking's own DCHECK checks
+  // (mvcc->size() - mvcc_tombstones == prime.size()) and flags a prime key visited more than once
+  // by this call's own traversal -- neither is subsumed by the per-slot checks above: a duplicate
+  // prime entry for the same key still resolves to the one mvcc slot that key name maps to, so the
+  // per-slot checks alone see nothing wrong.
   size_t TEST_VerifyMvccTable(DbIndex db_ind) const;
 
   // Creates a database with index `db_ind`. If such database exists does nothing.

@@ -542,10 +542,12 @@ class MvccStamper {
   //     lambda) to wait, bounded, for that arm's owner to resolve before ever installing over it.
   //   * InstallAbsentKeyTombstone's own identical conjunct (db_slice.h/.cc) is NOT the fallback
   //     for that wait's own timeout: on a timeout the loader itself refuses and returns WITHOUT
-  //     ever calling InstallAbsentKeyTombstone. It is the fallback for
-  //     a DIFFERENT caller that reaches the install without waiting first at all -- reachable, not
-  //     hypothetical: the loader's own lock-free FindMutable -> ExpireIfNeeded -> Del path
-  //     (rdb_load.cc) can leave exactly this shape of arm pending for a streaming caller to meet.
+  //     ever calling InstallAbsentKeyTombstone. It has no currently known reachable path from any
+  //     caller: the loader's own lock-free FindMutable -> ExpireIfNeeded -> Del path (rdb_load.cc)
+  //     does not leave this shape of arm pending either -- RecordExpiryBlocking (tx_base.cc)
+  //     commits (and disarms) that lazy expiry's own tombstone arm before its own yield, and every
+  //     OTHER caller of InstallAbsentKeyTombstone holds the key's own lock throughout. It stays in
+  //     place as a defensive guard, not a fallback for a specific live scenario.
   //   * TombstoneGcStep's own defence-in-depth check (db_slice.cc, unconditional -- ANY arm,
   //     including this fiber's own, blocks the erase there) does not assume either of the above
   //     is the only path that could leave a slot "correctly still armed" but "looking like an
