@@ -6681,6 +6681,79 @@ TEST_F(RdbMvccTest, NonMergeTombstoneInstallForAbsentKeyRefusesAfterTimeout) {
   EXPECT_TRUE(after_present) << "bytes after the section must still parse";
 }
 
+// drakeydb: P4-5 -- a replicated FLUSHDB landing mid-wait must not lose the eventual timeout's own
+// skip count: the count must land on db_slice.MutableStats(db_index), re-derived fresh, never a
+// `cur_table` pointer captured before the wait -- FlushDbIndexes moves the pre-flush table into
+// deferred destruction and installs a brand new one at the same index, so a stale `cur_table`
+// would count against a table nothing can ever read again.
+//
+// Falsifying: restoring `++cur_table->stats.mvcc_foreign_placeholder_skips` (the pointer captured
+// before the wait, rdb_load.cc) makes the CURRENT table's own counter, read fresh below, stay at
+// its baseline instead of advancing by one -- the count silently lands on the exiled pre-flush
+// table instead.
+TEST_F(RdbMvccTest, NonMergeTombstoneForeignPlaceholderTimeoutCountsAfterFlushDbMidWait) {
+  ASSERT_TRUE(IsActiveReplica());
+  const uint64_t saved_bound_ms = kForeignArmWaitBoundMs;
+  kForeignArmWaitBoundMs = 1000;  // long enough to comfortably fit the flush below inside the wait.
+  absl::Cleanup restore_bound = [saved_bound_ms] { kForeignArmWaitBoundMs = saved_bound_ms; };
+  const MvccStamp kIncoming{
+      MvccClock::kTombstoneBit | ((GetCurrentTimeMs() << MvccClock::kCounterBits) + 0x2000),
+      0xAAAA};
+
+  size_t skips_before = 0;
+  shard_set->Await(0, [&] {
+    skips_before = namespaces->GetDefaultNamespace()
+                       .GetCurrentDbSlice()
+                       .MutableStats(0)
+                       ->mvcc_foreign_placeholder_skips;
+  });
+
+  // Mirrors PerformDeletionAtomic's own synchronous placeholder write + arm (db_slice.cc) for a
+  // concurrent DEL of "ghost" that has not yet reached its own journal Commit() -- this arm is
+  // never resolved, so the loader's own wait below must time out against it.
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    db_slice.SetTombstone(0, std::string_view{"ghost"}, MvccStamp{MvccClock::kTombstoneBit, 0});
+    MvccStamper::tlocal()->ArmTombstone(0, std::string_view{"ghost"}, MvccStamp{});
+  });
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncoming}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  std::error_code load_ec;
+  util::fb2::Fiber loader_fiber =
+      pp_->at(0)->LaunchFiber([&] { load_ec = LoadRdbData(service_.get(), WrapInRdb(body)); });
+
+  // A sleep, well inside the (lengthened) bound above, is comfortably enough for the loader fiber
+  // to have already captured this pass's own table pointer and entered
+  // WaitForForeignArmToClear's poll loop before this flush lands -- generous (100ms, against a
+  // 1s bound) because this dispatch itself crosses from the test's own OS thread onto shard 0's
+  // proactor, so how soon the loader fiber (launched moments earlier, the same way) actually gets
+  // its own first scheduling turn is not otherwise controlled here.
+  pp_->at(0)->Await([&] {
+    ThisFiber::SleepFor(chrono::milliseconds(100));
+    namespaces->GetDefaultNamespace().GetCurrentDbSlice().FlushDb(0).Join();
+  });
+
+  loader_fiber.Join();
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  size_t skips_after = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    skips_after = db_slice.MutableStats(0)->mvcc_foreign_placeholder_skips;
+    // The placeholder's own arm was never resolved and never will be -- disarm it here,
+    // owner-agnostically (the arming fiber's own identity does not matter to DisarmAnyOwner),
+    // before any real command reaches this shard's own EndOfWriteEpoch sweep.
+    MvccStamper::tlocal()->DisarmAnyOwner(0, std::string_view{"ghost"});
+  });
+  EXPECT_EQ(skips_after, skips_before + 1)
+      << "the timeout's own skip count must land on the CURRENT (post-flush) table, not a stale "
+         "pointer to the one FlushDb just replaced";
+}
+
 // drakeydb: P4-5 -- shared driver for the win/lose-after-wait tests below. Arms a
 // {kTombstoneBit, 0} placeholder for `key`, then sleeps `resolve_after` (short: these tests
 // exercise the owner resolving WITHIN the wait bound, not the bound itself), then either commits
@@ -6834,9 +6907,15 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneKeyBecomesLiveDuringWaitTakesNormalDeletePa
 
 // drakeydb: P4-5 -- the non-merge counterpart: D-7's keep-the-resident-value rule must hold for a
 // key that became live DURING the wait, not just one that was already live before the loader ever
-// ran. Falsifying (restoring the compare-only retry, which never re-checks resident_live and so
-// installs unconditionally) makes `get ghost` come back nil (the revived value overwritten by the
-// tombstone) instead of "revived_value", and TEST_VerifyMvccTable's mismatches comes back 1.
+// ran. D-7's own install never calls Del(): it only ever overwrites the mvcc side (SetTombstone),
+// so falsifying (restoring the compare-only retry, which never re-checks resident_live) does NOT
+// change what `get ghost` itself returns -- "revived_value" stays resident in prime either way,
+// in both debug and release builds. What breaks is the mvcc side: a tombstone lands directly over
+// a still-resident value, which TEST_VerifyMvccTable's dense-invariant check below catches.
+// Asserted BEFORE any Run() below, not merely EXPECTed: once the table is in that state, a debug
+// build CHECK-fails and aborts the whole process on the very next command that touches this shard
+// (OnCbFinishBlocking's own O(1) version of the identical check), so this assertion must run
+// first or it never runs at all.
 TEST_F(RdbMvccTest, NonMergeTombstoneKeyBecomesLiveDuringWaitKeepsResidentValue) {
   ASSERT_TRUE(IsActiveReplica());
   const uint64_t now_ms = GetCurrentTimeMs();
@@ -6858,14 +6937,286 @@ TEST_F(RdbMvccTest, NonMergeTombstoneKeyBecomesLiveDuringWaitKeepsResidentValue)
   ASSERT_FALSE(ec) << ec.message();
 
   size_t mismatches = 0;
+  size_t mvcc_size = 0, mvcc_tombstones = 0, prime_size = 0;
   shard_set->Await(0, [&] {
-    mismatches = namespaces->GetDefaultNamespace().GetCurrentDbSlice().TEST_VerifyMvccTable(0);
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    DbTable* table = db_slice.GetDBTable(0);
+    if (table != nullptr) {
+      mvcc_size = table->mvcc->size();
+      mvcc_tombstones = table->stats.mvcc_tombstones;
+      prime_size = table->prime.size();
+    }
   });
+  ASSERT_EQ(mismatches, 0u);
+  ASSERT_EQ(mvcc_size - mvcc_tombstones, prime_size) << "the dense invariant must hold";
+
   EXPECT_EQ(Run({"get", "ghost"}), "revived_value")
       << "D-7's keep-the-resident-value rule must hold even for a key that became live DURING "
          "the wait, not just one that was already live before it";
-  EXPECT_EQ(mismatches, 0u);
   EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+namespace {
+// drakeydb: P4-5 -- a real journal consumer whose ThrottleIfNeeded blocks specifically for the
+// loader's own lazy-expiry DEL entry (RecordExpiryBlocking, tx_base.cc, tagged
+// journal::kEntryFlagExpired) and nothing else on this shard, so a write racing in during exactly
+// that yield -- a different yield than the foreign-placeholder wait above -- can be driven
+// deterministically. Registered and unregistered on shard 0's own thread (JournalSlice is
+// thread-local).
+class BlockOnExpiredDeleteConsumer final : public journal::JournalConsumerInterface {
+ public:
+  void ConsumeJournalChange(const journal::JournalChangeItem& item) override {
+    if (item.journal_item.entry_flags & journal::kEntryFlagExpired)
+      should_block_ = true;
+  }
+  void ThrottleIfNeeded() override {
+    if (!should_block_)
+      return;
+    should_block_ = false;
+    entered_.Notify();
+    release_.Wait();
+  }
+  void WaitEntered() {
+    entered_.Wait();
+  }
+  void Release() {
+    release_.Notify();
+  }
+
+ private:
+  bool should_block_ = false;
+  util::fb2::Done entered_;
+  util::fb2::Done release_;
+};
+}  // namespace
+
+// drakeydb: P4-5 -- a key that becomes live during the loader's OWN internal lazy-expiry yield
+// (FindMutable -> ExpireIfNeeded -> Del -> RecordExpiryBlocking's own journal throttle -- NOT the
+// foreign-placeholder wait the sibling tests above cover) must be caught by
+// InstallAbsentKeyTombstone's own "key live" choke point and take the normal delete path once the
+// apply restarts: ExpireIfNeeded always reports "not found" once it decides to expire a key,
+// regardless of what a concurrent write does to `prime` for that same key during ITS OWN yield, so
+// the fallthrough's own `resident_live`/`existing` reads are stale the instant a revive lands.
+// T > S: the loader's own incoming tombstone must still win, through the normal delete path, once
+// the restarted pass re-finds the key live and newer information changes nothing about who wins.
+//
+// Falsifying: removing the "key live" check in InstallAbsentKeyTombstone (db_slice.cc) makes the
+// install stamp T directly over the revived PrimeValue instead of refusing and restarting: *got
+// still ends up T (misleadingly "correct" looking) but absent_from_prime comes back false and
+// TEST_VerifyMvccTable's mismatches comes back nonzero.
+TEST_F(RdbMvccTest, MergeLwwTombstoneKeyBecomesLiveDuringLazyExpiryYieldTakesNormalDeletePath) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+
+  BlockOnExpiredDeleteConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)->Await([&] {
+    journal::StartInThread();
+    consumer_id = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    pp_->at(0)->Await([&] { journal::UnregisterConsumer(consumer_id); });
+  };
+
+  ASSERT_EQ(Run({"set", "ghost", "orig_value", "PX", "100"}), "OK");
+  AdvanceTime(200);  // ghost's own TTL has now elapsed -- unrelated to the wait bound elsewhere.
+
+  const uint64_t now_ms = GetCurrentTimeMs();
+  // T: comfortably newer than both the original resident stamp (minted before AdvanceTime, above)
+  // and whatever local stamp S the revive below mints (S mints at ~now_ms).
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{((now_ms + 10'000) << MvccClock::kCounterBits) + 0x9000, kPeerHash}.AsTombstone();
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  std::error_code load_ec;
+  util::fb2::Fiber loader_fiber = pp_->at(0)->LaunchFiber([&] {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    load_ec = loader.Load(&src);
+  });
+
+  // Blocks THIS (the test's own) fiber until the loader fiber is genuinely parked inside
+  // RecordExpiryBlocking's own journal throttle -- strictly after its own tombstone arm has
+  // already been committed and disarmed, so nothing is armed during this wait.
+  consumer.WaitEntered();
+  ASSERT_EQ(Run({"set", "ghost", "revived"}), "OK");
+  consumer.Release();
+  loader_fiber.Join();
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  bool absent_from_prime = false;
+  size_t mvcc_size = 0, mvcc_tombstones = 0, prime_size = 0;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    DbTable* table = db_slice.GetDBTable(0);
+    absent_from_prime = table != nullptr && table->prime.Find(std::string_view{"ghost"}).is_done();
+    if (table != nullptr) {
+      mvcc_size = table->mvcc->size();
+      mvcc_tombstones = table->stats.mvcc_tombstones;
+      prime_size = table->prime.size();
+    }
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(*got, kIncomingTombstone)
+      << "T > S, so the loader's tombstone must win once it re-finds the key live";
+  EXPECT_TRUE(absent_from_prime)
+      << "the NORMAL delete path must have removed the revived value -- a tombstone must never be "
+         "stamped directly over a still-resident PrimeValue";
+  // ASSERTed, and before any further Run() below: a debug build CHECK-fails and aborts the whole
+  // process on the next command that touches this shard once the table is in a violated state.
+  ASSERT_EQ(mismatches, 0u);
+  ASSERT_EQ(mvcc_size - mvcc_tombstones, prime_size) << "the dense invariant must hold";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- the sibling of the test directly above with S > T: the revive must stay
+// untouched. This is NOT the "key live" choke point's own case -- reaching that choke point at
+// all requires the authoritative MergeAccepts recheck (run immediately after FindMutable, against
+// a freshly re-read GetMvcc) to have already accepted `stamp`, which only happens when T beats
+// whatever is currently stored; since the revive here already holds S by the time that recheck
+// runs, S > T makes it reject outright and return before the no-live-key fallthrough (and the
+// choke point inside it) are ever reached. This test instead pins that same authoritative
+// recheck's own freshness -- reading GetMvcc AFTER FindMutable's own internal lazy-expiry yield,
+// never a value captured before it -- against this yield specifically, which no earlier test
+// exercised. Falsifying the choke point alone (db_slice.cc) leaves this test passing, verified;
+// it is not what protects this direction.
+TEST_F(RdbMvccTest, MergeLwwTombstoneKeyBecomesLiveDuringLazyExpiryYieldKeepsRevivedValue) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+
+  BlockOnExpiredDeleteConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)->Await([&] {
+    journal::StartInThread();
+    consumer_id = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    pp_->at(0)->Await([&] { journal::UnregisterConsumer(consumer_id); });
+  };
+
+  ASSERT_EQ(Run({"set", "ghost", "orig_value", "PX", "100"}), "OK");
+  AdvanceTime(200);
+
+  const uint64_t now_ms = GetCurrentTimeMs();
+  // T: one ms below `now_ms` -- newer than the original resident stamp (minted ~200ms earlier,
+  // before AdvanceTime, so it must still pass the fast-path pre-check), but strictly older than S,
+  // the revive's own stamp, which mints at ~now_ms (never below it).
+  const MvccStamp kIncomingTombstone =
+      MvccStamp{((now_ms - 1) << MvccClock::kCounterBits) + 0x9000, kPeerHash}.AsTombstone();
+
+  std::string body = BuildTombstoneSection(0, {{"ghost", kIncomingTombstone}});
+  body.push_back(RDB_TYPE_STRING);
+  AppendString(&body, "after");
+  AppendString(&body, "afterval");
+
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  std::error_code load_ec;
+  util::fb2::Fiber loader_fiber = pp_->at(0)->LaunchFiber([&] {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    load_ec = loader.Load(&src);
+  });
+
+  consumer.WaitEntered();
+  ASSERT_EQ(Run({"set", "ghost", "revived"}), "OK");
+  consumer.Release();
+  loader_fiber.Join();
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  size_t mismatches = 0;
+  shard_set->Await(0, [&] {
+    mismatches = namespaces->GetDefaultNamespace().GetCurrentDbSlice().TEST_VerifyMvccTable(0);
+  });
+  // ASSERTed, and before any Run() below: see the sibling test above for why.
+  ASSERT_EQ(mismatches, 0u);
+  EXPECT_EQ(Run({"get", "ghost"}), "revived")
+      << "S > T, so the revive must survive the loader's own restarted, losing compare";
+  EXPECT_EQ(Run({"get", "after"}), "afterval") << "bytes after the section must still parse";
+}
+
+// drakeydb: P4-5 -- the same key-becomes-live-during-the-lazy-expiry-yield race, reached through
+// CreateObjectOnShard's own already-expired-incoming caller of ApplyMergeTombstoneOnShard instead
+// of the tombstone-section fallthrough above -- both share the identical apply, so this proves the
+// fix through the OTHER production entry point into it, not a second, independent mechanism.
+TEST_F(RdbMvccTest,
+       MergeLwwExpiredIncomingKeyBecomesLiveDuringLazyExpiryYieldTakesNormalDeletePath) {
+  ASSERT_TRUE(IsActiveReplica());
+  constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;
+
+  BlockOnExpiredDeleteConsumer consumer;
+  uint32_t consumer_id = 0;
+  pp_->at(0)->Await([&] {
+    journal::StartInThread();
+    consumer_id = journal::RegisterConsumer(&consumer);
+  });
+  absl::Cleanup unregister = [&] {
+    pp_->at(0)->Await([&] { journal::UnregisterConsumer(consumer_id); });
+  };
+
+  ASSERT_EQ(Run({"set", "ghost", "orig_value", "PX", "100"}), "OK");
+  AdvanceTime(200);
+
+  const uint64_t now_ms = GetCurrentTimeMs();
+  const MvccStamp kIncoming{(now_ms + 10'000) << MvccClock::kCounterBits, kPeerHash};
+
+  // Long-elapsed absolute deadline (1000ms since epoch) on the wire record itself -- the peer's own
+  // delete of "ghost" -- is what routes this through CreateObjectOnShard's expired-incoming gate
+  // rather than an ordinary live install.
+  std::string body = BuildExpiredStringEntry("ghost", "incoming_v", kIncoming);
+  const std::string rdb = WrapInRdb(body);
+  io::BytesSource src{io::Buffer(rdb)};
+  RdbLoadContext load_context;
+  std::error_code load_ec;
+  // Unlike the sibling tests above (which toggle is_master to exercise ShouldDiscardKey's own
+  // parsing-fiber gate), this test leaves it at the fixture's default (true, matching production
+  // -- MergeLwwExpiredIncomingDeletesStaleResidentAsMaster's own comment): ShouldDiscardKey's own
+  // gate is `is_master && has_expired && !merge_lww_` (rdb_load.cc), which is already false here
+  // regardless of is_master, since merge_lww_ is true -- flipping is_master would only affect
+  // command dispatch's own read-only-replica gate (main_service.cc), unrelated to this loader path,
+  // and would reject the "revived" SET below with READONLY instead of applying it.
+  util::fb2::Fiber loader_fiber = pp_->at(0)->LaunchFiber([&] {
+    RdbLoader loader(service_.get(), &load_context);
+    loader.SetMergeLww(true, kPeerHash);
+    load_ec = loader.Load(&src);
+  });
+
+  consumer.WaitEntered();
+  ASSERT_EQ(Run({"set", "ghost", "revived"}), "OK");
+  consumer.Release();
+  loader_fiber.Join();
+  ASSERT_FALSE(load_ec) << load_ec.message();
+
+  std::optional<MvccStamp> got;
+  size_t mismatches = 0;
+  bool absent_from_prime = false;
+  shard_set->Await(0, [&] {
+    auto& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    got = db_slice.GetMvcc(0, std::string_view{"ghost"});
+    mismatches = db_slice.TEST_VerifyMvccTable(0);
+    DbTable* table = db_slice.GetDBTable(0);
+    absent_from_prime = table != nullptr && table->prime.Find(std::string_view{"ghost"}).is_done();
+  });
+  ASSERT_TRUE(got.has_value());
+  EXPECT_TRUE(got->IsTombstone());
+  EXPECT_EQ(got->origin_hash, kPeerHash + 1)
+      << "the tombstone must derive from the peer's own incoming stamp, one origin_hash tick "
+         "above it, exactly as ExpiryTombstoneFor mints it for an already-expired incoming key";
+  EXPECT_TRUE(absent_from_prime) << "the NORMAL delete path must have removed the revived value";
+  ASSERT_EQ(mismatches, 0u);
 }
 
 // drakeydb: P4-5 -- the core case the wait-and-retry exists for: the placeholder's owner
@@ -6941,10 +7292,10 @@ TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyWinsAfterWait) {
 // DEL never actually committed) instead of resolving to a real stamp, so the key is genuinely
 // absent by the time the loader's re-entered apply re-reads it. MergeAccepts(nullopt, P) always
 // accepts, so the loader's own tombstone must install exactly as if it had never met a
-// placeholder at all -- this is the "roll back before the wait, full restart" behavior the
-// re-review confirmed for the live site; this test pins the identical behavior for the
-// merge-tombstone site, which previously had no rollback coverage of its own (only the
-// commits-older / commits-newer cases above).
+// placeholder at all -- the same roll-back-before-the-wait, full-restart behavior the live-install
+// site already covers; this test pins the identical behavior for the merge-tombstone site, which
+// previously had no rollback coverage of its own (only the commits-older / commits-newer cases
+// above).
 TEST_F(RdbMvccTest, MergeLwwTombstoneInstallForAbsentKeyInstallsAfterRollback) {
   ASSERT_TRUE(IsActiveReplica());
   constexpr uint64_t kPeerHash = 0xFEDCBA9876543210ULL;

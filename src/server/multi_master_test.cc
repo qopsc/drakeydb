@@ -3090,6 +3090,56 @@ TEST_F(MvccStoreTest, VerifyCatchesMetaOnLiveSlot) {
   EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
 }
 
+// drakeydb: P4-5 -- TEST_VerifyMvccTable's own two new checks (db_slice.cc): a prime key visited
+// twice by its own traversal, and the O(1) size invariant (mvcc->size() - mvcc_tombstones ==
+// prime.size()) proven from scratch. Neither is subsumed by the pre-existing per-slot checks: a
+// duplicate prime entry for the SAME key name still resolves to the one mvcc slot that name maps
+// to, so "live key with no stamp" never fires for either copy, and "stamp with no live key" never
+// fires either, since prime.Find(key) still succeeds. PrimeTable::InsertNew (dash.h) is the exact
+// primitive AddOrFindInternal's own insert branch calls (db_slice.cc) -- force-inserts
+// unconditionally, with NO uniqueness check against a key already resident -- so this constructs
+// the identical physical shape a concurrent AddOrFind's own insert branch can produce after a
+// yield (rdb_load.cc's own comment on CreateObjectOnShard's install_now loop), not a synthetic
+// stand-in for it.
+//
+// This ONE construction (one extra prime entry for an already-live key, mvcc/tombstones
+// untouched) trips BOTH new checks at once: the duplicate-key check (the second visit to "key")
+// AND the size invariant (prime.size() grows by one, mvcc->size() does not) -- exactly 2
+// mismatches, not 1, proving each contributes independently rather than one subsuming the other.
+//
+// Falsifying: removing the seen_prime_keys duplicate check alone (db_slice.cc) drops this to 1
+// mismatch (the size invariant alone still catches it); removing the size-invariant check alone
+// also drops it to 1 (the duplicate-key check alone still catches it); removing both makes
+// SumMvccMismatchesAcrossShards() come back 0 instead -- neither check alone ever fired for a
+// duplicate prime key before either existed.
+TEST_F(MvccStoreTest, VerifyCatchesDuplicatePrimeKeyAndSizeInvariant) {
+  const std::string key = "verify-duplicate-prime-key";
+  Run({"set", key, "v1"});
+  ASSERT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+
+  const ShardId sid = Shard(key, shard_set->size());
+  shard_set->Await(sid, [&] {
+    DbSlice& db_slice = namespaces->GetDefaultNamespace().GetCurrentDbSlice();
+    DbTable* table = db_slice.GetDBTable(0);
+    ASSERT_NE(table, nullptr);
+    PrimeValue v;
+    v.SetString("v2");
+    table->prime.InsertNew(std::string_view{key}, std::move(v));
+  });
+
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 2u)
+      << "VERIFY must catch both the duplicated prime key and the size invariant it breaks";
+
+  // Clean up the invariant-violating state this test intentionally injected -- a genuine
+  // duplicate key cannot be repaired by any ordinary per-key API (there is no way to address just
+  // one of the two colliding entries), so discard the whole table wholesale, mirroring
+  // GcDoesNotEraseATombstoneFlaggedSlotWithALivePrimeKey's own cleanup pattern above at the table
+  // level instead of the slot level.
+  shard_set->Await(
+      sid, [&] { namespaces->GetDefaultNamespace().GetCurrentDbSlice().FlushDb(0).Join(); });
+  EXPECT_EQ(SumMvccMismatchesAcrossShards(), 0u);
+}
+
 // drakeydb: review fix round 1 (F1) -- "a"/"b" restored (the brief's original pair). Verified
 // empirically (temporary LOG(WARNING) of Shard(key, shard_set->size()); the reviewer separately
 // confirmed via XXH64(...) % 2) that under this fixture's shard count (2), Shard("a")=1 and
