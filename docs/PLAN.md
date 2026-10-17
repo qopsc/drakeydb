@@ -14,7 +14,7 @@
 | **P4 — MVCC store + stamping + wire** | ✅ **complete** — P4-0 [#5](https://github.com/darkspadez/drakeydb/pull/5), P4-1 [#6](https://github.com/darkspadez/drakeydb/pull/6), P4-2 [#7](https://github.com/darkspadez/drakeydb/pull/7), P4-3 [#8](https://github.com/darkspadez/drakeydb/pull/8), P4-4 [#9](https://github.com/darkspadez/drakeydb/pull/9) all merged (last: `c60dfdb`, 2026-09-24) | see [Phase 4](#phase-4); P4-4's own exit gate was partial, so the full Phase-4 gate is re-run as P7-0 Task 0.2's baseline |
 | P5 — Streaming LWW guard | ✅ **superseded by P4-4** | see [Phase 5](#phase-5) |
 | P6 — Merge-on-full-sync LWW | ✅ **delivered by P4-3** (PR #8) | see [Phase 6](#phase-6) |
-| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
+| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** — P7-0 [#10](https://github.com/darkspadez/drakeydb/pull/10) and P7-1 [#11](https://github.com/darkspadez/drakeydb/pull/11) open (stacked); P7-2..P7-4 pending | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
 | P8–P9 | not started | — |
 
 The design spec's planned P4-5 (tombstones) shipped inside P4-3, so there is no separate P4-5.
@@ -296,7 +296,7 @@ tiering, and `--experimental_cascaded_partial_sync`.
 | `transaction.cc` (~1622-1663) | `LogJournalOnShard` reads origin/mvcc from context (default self + clock tick) |
 | `tx_base.cc` (~55-70) | manual `RecordJournal` helpers read origin context; expiry `DEL` sets entry-flag bit0; collection-derived `DEL` sets bit1 |
 | `conn_context.h` (~352) | += `repl_origin_id` (u32), `repl_mvcc` (u64) |
-| `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. P7 (future): `capa activeExpire` on the redis path, `ConsumeRedisStream` RREPLAY unwrap |
+| `replica.h/.cc` | P1 (done): greeting adds `REPLCONF UUID`. **P2 (done):** `ReplicaPeerMode{SyncGate*, PeerRegistry*, PeerIdentityClaims*}` trailing ctor param, `IsPeerMode()`; guards the `SetShardStates` flip (both directions in `MainReplicationFb`), a `SyncGate::Lease` around full sync, and the flush skip in `InitiateDflySync`/`InitiatePSync` (the latter also adds `SetOverrideExistingKeys(true)`; the DF path already had it set), plus self/duplicate UUID refusal, live claim release, and `PeerRegistry::AddOrGet`. **P7-1 (Task 1.2):** `ConsumeRedisStream` hands RREPLAY envelopes to `ClassicApplier` (`classic_replay.h`) instead of queuing them, and skips a raw command whose name is an array (U-14). **P7-1 (Task 1.3):** a raw KeyDB-only command is dropped and counted (`classic_applier.SkipKeyDbOnly`), and `GetSummary()` fills the classic-link fields of `ReplicaSummary`. **P7-1 (Task 1.4):** `Greet()` sends `REPLCONF capa activeExpire` once, after an `active-replica` capa reply, and the main link applies the shards' replica active expiry flag (`ApplyReplicaActiveExpiry`, `SetMainLink`) |
 | `dflycmd.cc` | **P2 (done):** `DflyCmd::TakeOver` refuses on an active node. **P3 (done):** `CreateSyncSession` stores the consumer's uuid, `DRAKEY-VERSION` and peer flag in `ReplicaInfo` (`dflycmd.cc:801-808`); the admission refusal itself (version below `kDrakeydbReplVersion`, 68 since P4-4; a peer consumer without a UUID) lives in `ServerFamily::ReplConf` (`server_family.cc:3841`), master-side only |
 | `debugcmd.cc` | **P4-1 (done):** additive `DEBUG MVCC [<key> \| VERIFY]` debug subcommand |
 | `server_family.cc` | P1 (done): additive `REPLCONF UUID` case. **P2 (done):** `peers_` member; `ReplicaOfInternal` delegates to `ReplicaOfActive` (`PeerReplicationManager`) when active (replace-vs-append by `--multi_master`, `REPLICAOF REMOVE <h> <p>`, NO ONE clears all); `ReplConf` refuses all replication consumers on an active node (single choke point; P3 replaces it with peer admission); `REPLTAKEOVER` refused; INFO block appended after `master_replid`; `Shutdown`/`PauseReplication` route through `peers_`; `--replicaof` now parses a comma-separated peer list (`ParseOneReplicaOf`) and, in active mode, `Init` loads the node's own snapshot before attaching peers |
@@ -929,7 +929,50 @@ the top, or the Non-goals list at the end. The design spec is
   payload drakeydb cannot load is skipped and counted (`keydb_mvccrestore_failed`); the Non-goals
   list below no longer lists it. Spec D-7a.
 - An active KeyDB never propagates expiry deletes (`db.cpp:1966-1985`), so a plain replica of one
-  has to run active expiry itself (ledger decision 13).
+  has to run active expiry itself (ledger decision 13). Built in P7-1 Task 1.4 (spec D-9): the
+  node's main link sets a per-shard flag after a successful greet with an `active-replica` master,
+  which opens the heartbeat's expiry sweep and the read-path gate on a replica, never eviction, and
+  sends `REPLCONF capa activeExpire`. **Expiry window (owner decision 24, option A, accepted, no
+  grace flag):** the replica deletes a key on the first access after its own per-command clock
+  passes the key's absolute expiry (a replicated command counts as much as a client's), else in
+  the sweep. It diverges from the master when the master ran a command on the key before the
+  deadline and the replica applies it after: a band of `lag + skew` around each expiry, since an
+  active KeyDB streams every TTL absolute (`SET .. PXAT`, `PEXPIREAT`; live captures in
+  `tests/dragonfly/data/README.md`). The mirror case diverges too: a command the master ran after
+  the deadline, applied by a replica whose clock is behind its master's by more than the lag,
+  before its own deadline, lands on the stale key. The outcome depends on the class: **loss** for
+  TTL refreshes (`EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `GETEX`: a no-op, so the
+  two differ until the new deadline, and for good after a `PERSIST`) and `SET .. XX` without an
+  expiry (for good); a permanent **orphan** for TTL-keeping writes (`INCR`, `APPEND`, `SETRANGE`,
+  `HSET`, `HSETNX`, `SADD`, `LPUSH`, `SET .. KEEPTTL`, ...: the key is recreated with no TTL, the
+  master's keeps its deadline and is gone at it, and an active KeyDB never streams that DEL, so the
+  replica keeps it forever; owner decision 31 ships this as a known interim limitation of P7-1,
+  ISSUE-REGISTER D-32, closed in P7-2); **source missing** for the movers and the STORE family
+  (`RENAME`, `COPY`, `LMOVE`, `SMOVE`, `SUNIONSTORE`, ...: what the master wrote to the destination
+  is not written here, a live destination is left as it was, emptied, or recomputed from the
+  remaining sources of a multi-source STORE, and a `RENAME` or `COPY .. REPLACE` onto a live
+  destination leaves a permanent stale key when it has no TTL of its own: the master's goes at the
+  source's deadline and no `DEL` is streamed); **converges** for a plain `SET`, `DEL` and `SET .. XX
+  KEEPTTL` (the replica lacks the key until the master's own expiry); and `SET .. NX` is not
+  affected (a failed one is not propagated). The behaviour and most outcomes, the permanent ones
+  included, are upstream Dragonfly's default (`--replica_delete_expired=true`) under any master that
+  is not an active KeyDB; the orphan and that stale destination are not, because Redis, Valkey and
+  Dragonfly masters stream an expiry `DEL` that removes them. KeyDB's own *active* replicas and
+  drakeydb peers share the orphan. KeyDB's own **plain** replicas do not share the window: they
+  never delete on access and apply replicated writes to logically expired keys until their slow
+  sweep reaps them (seconds to tens of minutes), a different and wider failure, which is why serving
+  the key and sweeping later (options B and C) was rejected. Neither reliably avoids the orphan:
+  under C the replica's own sweep usually reaps the due key first and the late write recreates it
+  with no TTL, and B converges for that class only when the write lands before the slow reap.
+  `--replica_delete_expired=false` stays ignored on a flagged replica (decision 28). P7-2 closes the
+  window while the link is healthy: Task 2.8 (decisions 27 and 30) runs each enveloped command at
+  its outermost layer's time (`mvcc >> 20`, less one for KeyDB's `>`), which closes it for the
+  commands that find the key still in the table, and Task 2.9 (decisions 29 and 33) puts the sweep
+  and client reads, `SCAN`/`KEYS`/`RANDOMKEY` included, on a stream clock (the largest outermost
+  envelope time applied, which KeyDB's enveloped `PING` keeps moving, floored 60 s behind the local
+  clock), which closes the rest, the orphan included. Operators get it in the "Onboarding from
+  KeyDB" section of `docs/multi-master.md` that P7-4 adds; until then spec D-9 is where it is
+  written down.
 - "Apply-context from envelope" cannot ride the squasher: `repl_mvcc` is copied once per batch
   (`main_service.cc:1815-1816`, `multi_command_squasher.cc:114-115`), so RREPLAY commands dispatch
   one by one, each with its own mvcc and origin (ledger decision 11).
@@ -939,8 +982,8 @@ the top, or the Non-goals list at the end. The design spec is
   `CheckRespIsSimpleReply` (`protocol_client.cc:433`, `replica.cc:432`, `:611`). P1's "inbound
   KeyDB works" claim (the "P1 KeyDB interop" note near the top) was validated against plain Redis
   only. P7-0 parses the reply, but its adversarial pass found that an accepted link would drop
-  every streamed write, so P7-0 refuses active-KeyDB links until P7-1 unwraps RREPLAY (ledger
-  decision 23).
+  every streamed write, so P7-0 refused active-KeyDB links until P7-1 unwrapped RREPLAY (ledger
+  decision 23; P7-1 Task 1.2 lifted the refusal).
 
 Owner scheduling decisions made alongside: the overdue upstream sync (`docs/UPSTREAM-SYNC.md`)
 lands as its own PR **after** P7, and a dedicated "tombstone-lifecycle" phase after P7 owns D-14,
@@ -976,12 +1019,16 @@ delivered in P4-3 and gains its "Onboarding from KeyDB" section in P7-4.
 
 See `docs/UPSTREAM-SYNC.md`. Summary: merge (not rebase) `upstream/main` monthly + after upstream
 releases; fork changes stay additive and flag-gated so `--active_replica`-off behavior is
-byte-identical to upstream **except** cross-shard `SORT ... STORE`, which journals its effect
+byte-identical to upstream **except** `SORT ... STORE`: a cross-shard one journals its effect
 (`RESTORE <dst>`) on every node since P4-3 — upstream's own per-shard auto-journal payload dropped
-that effect entirely, so a plain replica silently did not converge; the fix is deliberately
-ungated (see `docs/UPSTREAM-SYNC.md` and `docs/differences.md`). INFO replication's `node_uuid:`
-line is the other documented exception (D-5). Verification gate = build + `ctest -L DFLY` +
-replication pytest subset + multimaster suite.
+that effect entirely, so a plain replica silently did not converge; the fix is deliberately ungated
+(see `docs/UPSTREAM-SYNC.md` and `docs/differences.md`). The same code writes three more entries the
+merge base does not: a same-shard `STORE` of a missing or fetch-emptied source journals `DEL <dst>`
+alone (P7-1, decision 32), a same-shard sorted `STORE` whose fetch emptied the source journals `DEL
+<dst>` ahead of the verbatim `SORT` (P4-3), and a partial lazy member expiry journals `SREM <key>
+<members>` ahead of the `SORT` (P4-0); the exception list in `docs/UPSTREAM-SYNC.md` has them. INFO
+replication's `node_uuid:` line is the other documented exception (D-5). Verification gate = build +
+`ctest -L DFLY` + replication pytest subset + multimaster suite.
 
 ## Non-goals for v1
 

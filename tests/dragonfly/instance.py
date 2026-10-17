@@ -742,7 +742,11 @@ class KeyDBServer:
             # Keeps the rdb files of a disk-based sync out of the cwd, which is the repo root.
             self._owned_dir = tempfile.mkdtemp(prefix="keydb-")
 
-        self.proc = subprocess.Popen(self._command())
+        # drakeydb: P7-1 (SORT review M5) -- LC_ALL=C pins the locale a KeyDB sorts ALPHA replies in:
+        # SORT .. ALPHA compares with strcoll(), which follows the inherited locale (a mixed-case
+        # list sorts "a" before "B" under en_US.UTF-8), where drakeydb is bytewise like the C locale
+        # (and like KeyDB's STORE, which compares bytes whatever the locale).
+        self.proc = subprocess.Popen(self._command(), env={**os.environ, "LC_ALL": "C"})
         logging.info(f"Started {self.server_bin} on port {self.port}, pid={self.proc.pid}")
         try:
             self._wait_ready(timeout)
@@ -789,6 +793,13 @@ class KeyDBServer:
             return ""
         with open(self.log_path, errors="replace") as f:
             return "".join(f.readlines()[-lines:])
+
+    def log_text(self):
+        """Everything the server has logged so far ("" without a log)."""
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        with open(self.log_path, errors="replace") as f:
+            return f.read()
 
     def client(self, **kwargs) -> RedisClient:
         """A new asyncio client for this server; the caller closes it."""

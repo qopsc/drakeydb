@@ -673,7 +673,44 @@ producing an older-compatible file at the cost of discarding all stamps and tomb
 a reduced feature set, an active mesh should be upgraded node by node with each new binary able to
 admit and be admitted by the others before traffic depends on it — there is no mixed-version
 "tombstones on some links, not others" steady state; a link either meets the minimum version and
-gets the full feature set, or it is refused at handshake.
+gets the full feature set, or it is refused at handshake. One thing the gate does not cover is
+`SORT`'s ordering: a same-shard `SORT ... STORE` is journaled as the command, so a node of an older
+build re-runs it in the old order (tied `BY` weights, a stored `BY nosort` set, a missing or tied
+`ALPHA BY` weight), fails on a form the new build accepts (a negative `LIMIT`, several `*`) or reads
+a hash-field pattern (`BY w_*->f`, `GET h_*->f`) as a plain key name, while a newer node computed the
+new result, and no counter shows the difference; keep such `SORT ... STORE` forms out of the traffic
+until every node runs the new build (ISSUE-REGISTER D-13, D-34, D-35). For the same reason every
+node must run the same `--sort_set_max_intset_entries`.
+
+## A classic master's stream is trusted
+
+A drakeydb replica of a classic master (Redis, Valkey, KeyDB, plain or active) applies whatever that
+master streams. Commands that would crash, stall or deadlock the replica, or rewire its own link
+(`INFO`, `CLIENT`, `REPLICAOF`, `REPLTAKEOVER`, `ROLE`, `DEBUG REPLICA`, `DFLYMIGRATE`, ...), are
+refused on the replication path (ISSUE-REGISTER U-15, U-17, U-19), but the stream is otherwise
+trusted, as it is on a KeyDB or Redis replica:
+
+- **`SHUTDOWN` stops the replica** (owner decision 39). A streamed `SHUTDOWN` makes the replica
+  exit cleanly with status **0**, so a supervisor that restarts only on failure leaves it down, and
+  `SHUTDOWN SAVE|NOSAVE` decides its exit snapshot. No conforming master sends it (KeyDB and Redis
+  never propagate `SHUTDOWN`); a KeyDB replica does the same with one it reads from its master.
+- Other commands a hostile or broken master could stream change or empty the replica's data or
+  files (`FLUSHALL`, `CONFIG SET dir` with `SAVE`, `DFLY LOAD`), as on any replica.
+- `SORT` re-run from the stream orders as Redis and KeyDB do (decisions 34–38) and reads `BY` and
+  `GET` hash-field patterns (`w_*->field`) as they do (decision 35). Set
+  `--sort_set_max_intset_entries` (default 512) to the master's `set-max-intset-entries` if that is
+  not 512: it is the size up to which Redis and KeyDB hold a set of integers as an intset, whose
+  ascending order decides the ties of `SORT <set> BY <weights> ALPHA`, and a replica with another
+  limit orders those ties differently for a set of a size in between (a master at 600 holds 550
+  integers as an intset, a replica at 512 breaks their ties on the element). It matters for no other
+  `SORT`, and for no set that is not all integers (ISSUE-REGISTER D-34, D-35). **Run the same value
+  on every drakeydb node**, peers and replicas alike: a same-shard `SORT ... STORE` is replicated as
+  the command and each node applies its own flag, so two drakeydb nodes with different values store
+  differently ordered `dst` lists, silently (a cross-shard `STORE` is journaled as its result and is
+  unaffected).
+
+Point drakeydb only at masters you control. The full KeyDB onboarding guide lands with Phase 7's
+last sub-PR.
 
 ## Known residual exposures
 

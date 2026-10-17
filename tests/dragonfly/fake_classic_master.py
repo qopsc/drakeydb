@@ -55,12 +55,16 @@ class FakeClassicMaster:
     Answers PING with +PONG; REPLCONF UUID, DRAKEY-VERSION and PEER with the error a pre-fork
     master gives for an unknown option (REPLCONF UUID with a bare `+<uuid>`, as KeyDB does, after
     script_uuid()); every other REPLCONF (listening-port, capa, ip-address) with +OK (every capa
-    one with what script_capa_reply() set), except `REPLCONF ACK`, which is never answered.
+    one with what script_capa_reply() set, those naming a word it was given `only_for` with that
+    word's reply), except `REPLCONF ACK`, which is never answered.
     PSYNC/SYNC is answered by one write() of the bytes given to script_psync(), so coalescing on
     the wire is deterministic; the optional stream bytes follow in a second write, after
     `stream_delay` seconds if given (long enough for the replica to read the first write alone:
     coalescing is deterministic only then). Afterwards the connection stays open, still recording
-    requests, until the replica closes it or `close_after_psync` is set.
+    requests, until the replica closes it or `close_after_psync` is set; `send_stream()` writes
+    more stream bytes into it whenever a test wants them, to time commands against the clock.
+    Every other command is answered +OK, unless script_silent() named it: a real master never
+    replies to a replica's command once the replica is in the stream.
 
     Recorded: `connection_count` (every accepted connection), `requests` (every request as a list
     of words, all connections, in arrival order) and `psync_requests` (the PSYNC ones).
@@ -77,9 +81,12 @@ class FakeClassicMaster:
         self._close_after_psync = False
         self._uuid = None
         self._capa_reply = b"+OK\r\n"
+        self._capa_rules = {}
+        self._silent = set()
         self._server = None
         self._handler_tasks = set()
         self._writers = set()
+        self._stream_writer = None
 
     def script_psync(self, reply, stream=b"", close_after_psync=False, stream_delay=0):
         """Sets what every following PSYNC is answered with (see the class docstring)."""
@@ -92,15 +99,45 @@ class FakeClassicMaster:
         """Makes every following `REPLCONF UUID` be answered with `+<uuid>`, like a KeyDB does."""
         self._uuid = uuid
 
-    def script_capa_reply(self, reply):
-        """Sets the reply (a complete RESP line) to every following `REPLCONF capa ...`, e.g.
-        b"+OK active-replica\\r\\n" for what an active KeyDB says."""
-        self._capa_reply = reply
+    def script_capa_reply(self, reply, only_for=None):
+        """Sets the reply (a complete RESP reply: a line, or an array's whole bytes) to the
+        `REPLCONF capa ...` requests, e.g. b"+OK active-replica\\r\\n" for what an active KeyDB
+        says. Without `only_for` it is the reply to every one of them. With `only_for` (a
+        capability word, e.g. "dragonfly" or "activeExpire", any case), only the requests that name
+        it get `reply`, in addition to whatever the default is (+OK until set); one call per word.
+        """
+        if only_for is None:
+            self._capa_reply = reply
+        else:
+            self._capa_rules[only_for.lower()] = reply
+
+    def script_silent(self, *names):
+        """Makes the requests named `names` (any case) recorded and never answered, as a real
+        master treats whatever its replica sends once it is streaming (e.g. "DFLY": a Dragonfly
+        replica's `DFLY TAKEOVER`)."""
+        self._silent.update(name.upper() for name in names)
+
+    async def send_stream(self, data):
+        """Writes `data` into the replication stream of the connection that was last answered a
+        PSYNC, behind whatever script_psync() wrote there (the scripted stream, once its delay has
+        passed, included), as a live master streams a command that was just run. The caller owns
+        the timing: nothing is written until it is called."""
+        writer = self._stream_writer
+        assert writer is not None, "no replica is in the replication stream yet"
+        writer.write(data)
+        await writer.drain()
 
     async def drop_connections(self):
         """Closes every open connection, as a master that went away does, and keeps listening."""
         for writer in list(self._writers):
             writer.close()
+
+    @property
+    def stream_writer(self):
+        """The connection send_stream() writes into: the one that was last answered a PSYNC and is
+        still open, None before that and once it closed. A test that needs the replica back in the
+        stream (after drop_connections(), say) polls for it not being None."""
+        return self._stream_writer
 
     @property
     def psync_requests(self):
@@ -192,12 +229,16 @@ class FakeClassicMaster:
             pass
         finally:
             self._writers.discard(writer)
+            if self._stream_writer is writer:
+                self._stream_writer = None
             self._handler_tasks.discard(task)
             writer.close()
 
     async def _answer(self, request, writer):
         """Writes the reply to `request`; returns False when the connection should be closed."""
         name = request[0].upper()
+        if name in self._silent:
+            return True
         if name == "PING":
             writer.write(b"+PONG\r\n")
         elif name == "REPLCONF":
@@ -209,7 +250,13 @@ class FakeClassicMaster:
             elif option in ("UUID", "DRAKEY-VERSION", "PEER"):
                 writer.write(b"-ERR Unrecognized REPLCONF option: " + option.encode() + b"\r\n")
             elif option == "CAPA":
-                writer.write(self._capa_reply)
+                named = [word.lower() for word in request[1:]]
+                writer.write(
+                    next(
+                        (self._capa_rules[w] for w in named if w in self._capa_rules),
+                        self._capa_reply,
+                    )
+                )
             else:
                 writer.write(b"+OK\r\n")
         elif name in ("PSYNC", "SYNC"):
@@ -218,6 +265,9 @@ class FakeClassicMaster:
             if self._psync_stream:
                 await asyncio.sleep(self._stream_delay)
                 writer.write(self._psync_stream)
+            # Only now: a send_stream() during the delay above would land ahead of the scripted
+            # stream, and the caller asked for it to come behind it.
+            self._stream_writer = writer
             await writer.drain()
             return not self._close_after_psync
         else:

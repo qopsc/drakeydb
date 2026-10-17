@@ -2,14 +2,16 @@
 
 > Status: design locked with the owner 2026-10-03, revised the same day after the spec/plan review
 > and the advisor's resolution of its forks (per-author dedup reservation, offset/watermark
-> coupling, the release-build perf bar, the full-sync tail). Branch
-> `feat/phase7-0-closeout-and-harness` off `origin/main` (`c60dfdb`); `src/` is unchanged since
-> except the P7-0 implementation (Tasks 0.4-0.6 and 0.9, which also fixed U-10), the review fix round
-> that followed it (U-12, a log fix in `ParseReplicationHeader`), the whole-branch review's loud
-> log lines for the RREPLAY envelopes a build without P7-1 drops (`replica.cc`) and the adversarial
-> pass's two fixes: the refusal of active-KeyDB links until P7-1 (decision 23, D-2) and U-13 (an
-> empty command name in a classic stream). The other commits since are ledger/doc commits and the
-> test/CI harness (Tasks 0.7, 0.8).
+> coupling, the release-build perf bar, the full-sync tail). **Built so far** (status as of the
+> close of P7-1, 2026-10-05): P7-0 (`feat/phase7-0-closeout-and-harness` off `origin/main`
+> `c60dfdb`, PR #10: the handshake, the harness and the U-9 ... U-13 fixes) and, stacked on it,
+> P7-1 (`feat/phase7-1-rreplay-unwrap`: the RREPLAY unwrap, the counters, replica active expiry,
+> the throughput bar, the U-14 and U-15 guards, the `SORT .. STORE` abort fix of decision 32 and,
+> in progress, decision 34's SORT ordering), whose whole-branch review and adversarial pass are
+> done and whose gate and PR are pending.
+> P7-2 to P7-4 are specified here and not built. Text that says "until P7-1" or describes P7-0's
+> interim refusal of active-KeyDB links (D-2, decision 23) is **history**: P7-1 removed that
+> refusal.
 > Ships as five stacked sub-PRs — see [PR stack](#pr-stack).
 >
 > This is the next numbered phase: Phase 5 was superseded by P4-4, Phase 6 was delivered by P4-3,
@@ -312,42 +314,48 @@ space-separated, unknown words ignored. `Greet()` replaces its two strict checks
 bad response. Every other `CheckRespIsSimpleReply("OK")` in `Greet()` is unchanged.
 
 - `active_replica` is recorded per `Greet()` in a `Replica` member (`master_active_replica_`),
-  cleared at the top of each `Greet()`. It is the *only* trigger for D-9 and for activeExpire. It is
+  cleared at the top of each `Greet()`. It is the *only* trigger for activeExpire, and for D-9 together
+  with `classic_master_` (the last successful `Greet()` found a classic master). It is
   set by the capa reply, which is not the last step of `Greet()`, so after a **failed** `Greet()` it
   may be stale: anything that reads it (INFO, D-9, activeExpire) does so only once `R_GREETED` is set
   in `state_mask_`.
-- **`capa activeExpire`.** Immediately after the first capa reply (`replica.cc:431-432`) reveals
-  `active-replica`, send `REPLCONF capa activeExpire` as its **own** command. KeyDB answers
-  `+OK active-replica` again; this reply is parsed leniently (warn once, continue) — the master
-  already showed it is active, so expiry (D-9) does not depend on the acknowledgement. Sent on plain
-  **and** peer links: a peer link's node already runs active expiry (`!IsReplica()`, heartbeat),
-  and a plain link's node implements it via D-9, so the capability is advertised only where true.
+- **`capa activeExpire`.** Immediately after the first capa reply that reveals `active-replica`,
+  at either of the two capa sites, send `REPLCONF capa activeExpire` as its **own** command, **once
+  per `Greet()`** (a lambda in `Greet()` with its own sent bit). KeyDB answers `+OK active-replica`
+  again; this reply is parsed leniently (`ParseCapaReply(...).ok`, a warning once otherwise,
+  continue) — the master already showed it is active, so expiry (D-9) does not depend on the
+  acknowledgement; a transport error still fails the `Greet()` like any other command's. Sent on
+  plain **and** peer links: a peer link's node already runs active expiry (`!IsReplica()`,
+  heartbeat), and a plain link's node implements it via D-9, so the capability is advertised only
+  where true. A peer link sends it but never touches the shard flag (D-9).
 - A master that does not answer `active-replica` — plain Redis, Valkey, stock Dragonfly, drakeydb,
   a non-active KeyDB — sees a handshake **byte-identical to today**; no extra command is sent.
   `keydb-fastsync-save` is parsed and ignored: drakeydb never sends `capa keydb-fastsync`.
-- **Interim refusal (P7-0 only; decision 23, the adversarial pass's C1).** With the suffix accepted
-  but RREPLAY not yet unwrapped, a link to an active KeyDB would connect, full-sync, report itself
-  up (KeyDB even reports the replica caught up) and drop every streamed write. So until P7-1,
-  `Greet()` **refuses** a link whose capa reply advertises `active-replica`, **after** the reply
-  parsed (`ParseCapaReply` still accepts the suffix; the refusal is a logged policy, not a parse
-  failure), at both capa sites: `LOG_EVERY_T(ERROR, 60)` ("advertises active-replica: this build
-  cannot apply its RREPLAY stream yet (Phase 7, P7-1); refusing the link") and
-  `std::errc::protocol_not_supported`, which takes the existing failed-handshake paths: `REPLICAOF`
-  fails **with the reason in the reply** (`-ERR Protocol not supported: master advertises
-  active-replica; unsupported until P7-1`, built by `Replica::Start()`, which every `REPLICAOF`
-  path sends as it is; the ERROR log is rate-limited, so the reply is where each attempt's reason
-  shows) and leaves no link, and a `--replicaof` link retries on the usual 500 ms reconnect (the
-  retry's per-attempt WARNING is rate-limited like the peer refusals). It happens before `PSYNC`
-  (and before `REPLCONF UUID` at the first capa site, which is the only one a real KeyDB reaches),
-  so the master never forks an RDB for the replica or lists it. The refused link has no master: the
-  refusal clears the uuid and clock an earlier greeting of the same `Replica` recorded (the first
-  capa site comes before the identity exchange that clears them) and, in peer mode, gives the UUID
-  admission back. In peer mode a `REPLICAOF` to an endpoint that is already attached (one attached
-  by `--replicaof` and being refused in the background) answers `OK`, the existing "already
-  attached" short-circuit that makes no handshake, while that link keeps being refused. The refusal
-  is marked `// drakeydb: P7-0 interim` in `replica.cc`; **P7-1 Task 1.2 removes it** together with
-  the three strict `xfail`s that pin it. `ConsumeRedisStream` keeps a defensive ERROR for an RREPLAY
-  from a master that did not advertise `active-replica`, until Task 1.2's unwrap replaces it.
+- **Interim refusal (P7-0 only; decision 23, the adversarial pass's C1). History, not current
+  behaviour: P7-1 Task 1.2 removed it together with the three strict `xfail`s that pinned it, and
+  `Greet()` now accepts a master that advertises `active-replica`.** With the suffix accepted but
+  RREPLAY not yet unwrapped, a link to an active KeyDB would have connected, full-synced, reported
+  itself up (KeyDB even reports the replica caught up) and dropped every streamed write. So until
+  P7-1, `Greet()` **refused** a link whose capa reply advertised `active-replica`, **after** the
+  reply parsed (`ParseCapaReply` still accepted the suffix; the refusal was a logged policy, not a
+  parse failure), at both capa sites: `LOG_EVERY_T(ERROR, 60)` ("advertises active-replica: this
+  build cannot apply its RREPLAY stream yet (Phase 7, P7-1); refusing the link") and
+  `std::errc::protocol_not_supported`, which took the existing failed-handshake paths: `REPLICAOF`
+  failed **with the reason in the reply** (`-ERR Protocol not supported: master advertises
+  active-replica; unsupported until P7-1`, built by `Replica::Start()`; the ERROR log was
+  rate-limited, so the reply was where each attempt's reason showed) and left no link, and a
+  `--replicaof` link retried on the usual 500 ms reconnect (the retry's per-attempt WARNING was
+  rate-limited like the peer refusals). It happened before `PSYNC` (and before `REPLCONF UUID` at
+  the first capa site, which is the only one a real KeyDB reaches), so the master never forked an
+  RDB for the replica or listed it. The refused link had no master: the refusal cleared the uuid
+  and clock an earlier greeting of the same `Replica` recorded (the first capa site comes before
+  the identity exchange that clears them) and, in peer mode, gave the UUID admission back. In peer
+  mode a `REPLICAOF` to an endpoint that was already attached (one attached by `--replicaof` and
+  being refused in the background) answered `OK`, the existing "already attached" short-circuit
+  that makes no handshake, while that link kept being refused. The refusal was marked
+  `// drakeydb: P7-0 interim` in `replica.cc`, and `ConsumeRedisStream` kept a defensive ERROR for
+  an RREPLAY from a master that did not advertise `active-replica`, until Task 1.2's unwrap
+  replaced both.
 
 ### D-3. Unwrapping RREPLAY (B.1)
 
@@ -379,6 +387,15 @@ inner is a string; optional db is an integer with `0 <= db < FLAGS_dbnum` (`gene
 optional mvcc is a `u64`. uuid is compared and keyed in **normalized lowercase** form
 (`NormalizeNodeUuid`), including the self-uuid check.
 
+Two deliberate deviations from KeyDB's number parsing, neither reachable from a real KeyDB, whose
+values are canonical decimals: **mvcc.** KeyDB reads it with a bare `strtoull`
+(`getUnsignedLongLongFromObject`, `object.cpp:743-769`), which takes `-5` (wrapped to 2^64-5),
+`12abc` and an overflowing number (`ULLONG_MAX`); `-5` then poisons KeyDB's own per-author dedup
+watermark, which every later envelope of that author falls below. drakeydb accepts digits only,
+within 64 bits (`kBadMvcc` otherwise), so that P7-2's watermark stays sane. **db.** KeyDB reads it
+with `string2ll`, which refuses a leading zero (`03`); drakeydb accepts `03`, as it does for any
+db it parses (Task 1.1). The code keeps both.
+
 `ClassicApplier::HandleRreplay(args, depth = 1)` (testable without a socket) returns
 `EnvelopeResult::{kConsumed, kNotConsumed}`; `IsRreplay(const RespExpr&)` is the stream loop's
 predicate. At each level:
@@ -389,12 +406,23 @@ predicate. At each level:
    envelope, a livelock. Operators with a nonzero `rreplay_malformed` re-run `REPLICAOF` to force a
    full resync. Malformed is per level (clarification of decision 14): a malformed inner of a nested
    envelope advances nothing itself, and the enclosing level still advances (step 6).
-2. **Self.** uuid equals self: `rreplay_self_dropped++`, skip (`kConsumed`), no advance.
-3. **Cancellation, depth 1 only.** `running()` is checked **once**, before the outermost
-   envelope's first dispatch of any kind (a synthetic `SELECT` is a dispatch): false returns
-   `kNotConsumed` with nothing touched. After that point of no return the whole envelope tree runs
-   to completion (D-5): `DispatchCommand(ONLY_SYNC)` returns only after a command ran or was
-   rejected before running, so no "cancelled mid-dispatch, may not have run" state exists.
+2. **Cancellation, depth 1 only.** For a layer that parsed `kOk`, or failed only on its mvcc
+   (step 3 selects its db), `running()` is checked **once**, before the outermost envelope touches
+   the context at all: its db is selected (a first selection dispatches a synthetic `SELECT`) and
+   its commands are dispatched. False returns `kNotConsumed` with nothing touched. After this check
+   the whole envelope tree runs to completion (D-5), save one exit: the leaf's `Reserve` may still
+   return `kCancelled`, before it dispatches anything. `DispatchCommand(ONLY_SYNC)` returns only
+   after a command ran or was rejected before running, so no "cancelled mid-dispatch, may not have
+   run" state exists. A layer that failed an earlier check selects nothing and is consumed without
+   the check.
+3. **Db, then self, then nesting** — KeyDB's order in `replicaReplayCommand`
+   (`replication.cpp:5416`, `:5435`, `:5442`). The layer's db, if it has one, is **selected as the
+   layer is validated** (`SelectDb`, below), before the author is looked at and whatever the inner
+   command turns out to be: a self-authored envelope, a control command, an inner that is not one
+   command, a nesting overflow and an mvcc that fails to parse (KeyDB reads it after the db) have
+   all moved the stream's selected db. A layer that fails the arity, uuid or db check has not.
+   Then uuid equals self: `rreplay_self_dropped++`, skip (`kConsumed`), no advance. Then a layer
+   deeper than 64 is malformed (step 1's counter and warning).
 4. **Dedup early-out** (D-5). At every level `IsApplied(uuid, mvcc)` drops the envelope
    before its inner is parsed (`rreplay_deduped++`, `kConsumed`): a cheap read. It does not close
    the race between two links, which can pass it together; the *leaf's* reservation does (step 5).
@@ -402,22 +430,50 @@ predicate. At each level:
    `catCommandForAofAndActiveReplication` emits one, `aof.cpp:682-726`). Parse it with a
    `RedisParser(Mode::SERVER)` local to the call — one per nesting depth by construction, never the
    link's `parser_` — so no parser state is shared between levels or envelopes and there is nothing
-   to recreate after an error. An empty inner, a partial command, or bytes after the command are
-   malformed (step 1) and nothing is applied. Then, by class: `MULTI`/`EXEC`/`PING`/`REPLCONF`/
-   `SELECT` skip (the db travels in the envelope); `RREPLAY` recurses with `depth + 1`, malformed at
-   65; KeyDB-only commands drop and count (D-7); `KEYDB.MVCCRESTORE` is translated to a `RESTORE`
-   first (D-7a); `FindCmd == nullptr` counts `classic_unknown_cmds_dropped`; anything else is a leaf
-   and dispatches with the apply context (D-4) under a reservation (D-5).
+   to recreate after an error. An empty inner, a partial command, bytes after the command, or a
+   command whose name is not a string (`*0\r\n`, `*-1\r\n`, `*1\r\n$-1\r\n`: valid RESP that parses
+   to an array, a nil array, a nil; U-14) are malformed (step 1) and nothing is applied. Then, by
+   class: `MULTI`/`EXEC`/`PING`/`REPLCONF`/`SELECT` skip (the db travels in the envelope);
+   `RREPLAY` recurses with `depth + 1`, malformed at 65; KeyDB-only commands drop and count (D-7);
+   `KEYDB.MVCCRESTORE` is translated to a `RESTORE` first (D-7a); a command with no registry entry
+   (`FindExtended`, as D-7 says; not `FindCmd`) counts
+   `classic_unknown_cmds_dropped`; anything else is a leaf and dispatches with the apply context
+   (D-4) under a reservation (D-5).
 6. **Advance.** An envelope whose command was handled advances its own author's watermark (D-5):
    after a skipped command, after a dispatched one that was not rejected (`Commit`), and after a
    nested inner that returned `kConsumed` — deduped or not. At depth 64 a malformed 65th level
    (step 1) returns `kConsumed`, so the 64th level still advances. A `kNotConsumed` inner makes this
    level `kNotConsumed` and advances nothing.
 
-**Inner db.** The envelope db applies to the inner command through a `SelectDb` helper mirroring
-`JournalExecutor::SelectDb` (`journal/executor.cc:85-100`: first use dispatches a real `SELECT` so
-the `DbTable` exists, later uses set `conn_state.db_index`). Synthetic `SELECT`s are not stream
-bytes, never touch `repl_offs_`, and — being dispatches — come after the cancellation check.
+**Selected db.** The stream's apply context has one selected db (`conn_state.db_index`), shared by
+the raw commands and the envelopes, as KeyDB's master client has one: `replicaReplayCommand`
+selects each layer's db on its client while it validates the layer (`:5416`), carries it down to
+the client that runs the inner command (`:5468`) and back up afterwards (`:5478`, `:5488`), so
+the db a stream ends a layer in is the one the next command without a db runs in — a raw command
+and the 3-argument `RREPLAY` (no db) alike. drakeydb selects in step 3 through a `SelectDb` helper
+mirroring `JournalExecutor::SelectDb` (`journal/executor.cc:85-100`: first use dispatches a real
+`SELECT` so the `DbTable` exists, later uses set `conn_state.db_index`); a nested layer selects as
+well, so the innermost layer that has a db decides the leaf's, and an inner without one inherits.
+One deviation, harmless against real KeyDB: KeyDB would run a wrapped `SELECT n` and move the db to
+`n`, while step 5 skips it; KeyDB never wraps one, as the db travels in the envelope. If a
+`SelectDb` fails (counted in `classic_apply_errors`; a `SELECT` to db > 0 does in a real cluster,
+`--cluster_mode=yes`, but not in `emulated`: `generic_family.cc:3117` tests `IsClusterEnabled()`),
+the leaf of the layer that asked is skipped unless a deeper layer selects another db. Synthetic
+`SELECT`s are not stream bytes and never touch `repl_offs_`.
+
+The selected db is state of the *stream*, not of one connection. A Redis replica keeps its cached
+master client, and with it the db, across a partial resync, and the master's backlog after the
+resume point carries no `SELECT` unless its db changed (KeyDB, from the same code: the cached master
+survives `replicationCacheMaster`/`replicationResurrectCachedMaster`, `replication.cpp:4322`,
+`:4450`, and `resetClient` leaves its db alone; `replicaseldb`, Redis's `slaveseldb`, makes the
+master feed a `SELECT` when it differs from the command's db, `:476`, and is reset to -1 only when a
+replica attaches for a full sync, `:874`, or the node turns master, `:4054`). **P7-3 must persist
+the selected db across a `+CONTINUE`** (D-8, hazard (i)) and re-select it on the resumed link: a
+context that restarts in db 0 applies the resumed writes in the wrong db. Observed by hand, once,
+on `redis-server` 7.0.15 (no Redis source tree is at hand): after a write in db 3 and a killed
+replica link, a further write in db 3 reaches `PSYNC <replid> <offset+1>` as `+CONTINUE` and a bare
+`set`, with no `SELECT`, and a `redis-server` replica ends with the key in db 3 and
+`sync_partial_ok:1`. P7-3's test is what pins it in the tree.
 
 **Dispatch** is per command, `DispatchCommand(ParsedArgs{*cmd}, cmd, ONLY_SYNC)` on a
 `CommandContext` built with `FillBackedArgs`. Its reply builder is a link-owned
@@ -525,17 +581,30 @@ topology, so the reservation is **per author and on the innermost dispatched lev
 
 **Leaf** (an inner command that is not itself an `RREPLAY`, reserved under the *innermost*
 envelope's author and mvcc; one reservation per envelope tree, never held across the recursion):
-the `running()` check of D-3.3 has passed, then `Reserve`:
+the `running()` check of D-3.2 has passed, then `Reserve`:
 
 - `kDrop`: consumed, `rreplay_deduped++`.
-- `kCancelled`: **not** consumed — nothing was dispatched, nothing is touched.
-- `kApply`: `SelectDb`, rewrites (D-4.3), `DispatchCommand`. `DispatchResult::OK` is `Commit`; OK
+- `kCancelled`: **not** consumed — no command was dispatched and nothing was counted; the selected
+  db may have moved (below).
+- `kApply`: rewrites (D-4.3), `DispatchCommand`. Every layer's db was already selected, while the
+  layer was validated (D-3.3), before this leaf's `Reserve`. `DispatchResult::OK` is `Commit`; OK
   includes "ran and replied an error such as `WRONGTYPE`" (KeyDB parity: its `commandsExecuted++`
   either way). `ERROR` / `OOM` — rejected before the command ran (`VerifyCommandState`,
   `main_service.cc:1589-1610`; `PrepareTransaction`, `:1628-1632`; the `DENYOOM` gate,
   `:1721-1724`) or reported OOM by the command itself — is `Release` plus `classic_apply_errors++`
   and a `LOG_EVERY_T`: the envelope is still **consumed** (the offset advances, the link does not
   stall) but the watermark does not move.
+
+**A `kCancelled` after a layer's db was selected is allowed.** KeyDB v6.3.4 always sends the db, so
+by the time the leaf reserves, its layers have selected theirs (D-3.3), and the cancelled envelope
+leaves the context's selected db moved. That is harmless because selecting is idempotent and
+replayable: on resume the same envelope is re-read, and its layers select the same dbs in the same
+order before anything is dispatched, so the moved db is exactly the state the resumed stream
+recreates. It holds even if P7-3 keeps the context's selected db across a partial resync (D-3
+"Selected db"): a layer that selects overwrites it, and an envelope with no db in any layer selected
+nothing. The synthetic `SELECT` a first selection dispatches is no stream command (it only makes the
+db's tables exist, as `JournalExecutor::SelectDb` does), so "no command was dispatched" holds.
+`kNotConsumed` means: no command was dispatched, nothing was counted, the offset stays.
 
 **Outer levels** hold no reservation: they take the `IsApplied` early-out (the one KeyDB has) and
 otherwise recurse. An inner result of `kConsumed` — *including a deduped inner*: KeyDB parity, the
@@ -546,12 +615,15 @@ drop, an unknown-command drop, a rejected or type-64 `KEYDB.MVCCRESTORE`) are co
 or self-authored envelope; a malformed inner of a nested envelope does not advance itself but its
 outer still does (D-3.6).
 
-**Cancellation and offsets (I1).** The only not-consumed outcome is `running()` being false before
-the outermost envelope's first dispatch (D-3.3): checked **once** per outermost envelope — the
-point of no return — after which the whole tree finishes unconditionally (`Reserve`'s `running`
-callback only matters until that first dispatch). `Commit`/`Advance` run *before* `repl_offs_ +=
-total_read`, so a resume offset never covers an envelope whose watermark was not recorded; a link
-cancelled between the two resumes at the old offset and the replayed envelope is deduped. A
+**Cancellation and offsets (I1).** There are two not-consumed outcomes, both before the first
+command of the envelope is dispatched: `running()` being false before the outermost envelope's
+first touch of the context (D-3.2), checked **once** per outermost envelope; and a leaf `Reserve`
+that returns `kCancelled`, which may follow the layers' db selections (the rule above). The point of
+no return for *dispatching and counting* is the leaf's first dispatch, after which the whole tree
+finishes unconditionally (`Reserve`'s `running` callback only matters until it).
+`Commit`/`Advance` run *before* `repl_offs_ += total_read`, so a resume offset never covers an
+envelope whose watermark was not recorded; a link cancelled between the two resumes at the old
+offset and the replayed envelope is deduped. A
 rejected-before-run envelope counts its bytes but leaves the watermark alone, so the same envelope
 replayed by another link, or by a partial resync, still applies once.
 
@@ -617,8 +689,12 @@ standard), `KEYDB.CRON`, `KEYDB.HRENAME`, `KEYDB.NHSET`, `KEYDB.NHGET`, `KEYDB.M
 `RREPLAY` (never dispatched as a command). **`KEYDB.MVCCRESTORE` is not on this list: it is
 applied (D-7a).**
 
-Inside envelopes, a command with `FindCmd == nullptr` is counted `classic_unknown_cmds_dropped`
-with its own rate-limited warning instead of being dispatched into a `NONE` builder. On the raw
+Inside envelopes, a command the dispatcher has no entry for (`CommandRegistry::FindExtended`, the
+dispatcher's own lookup, which reads `ACL <sub>` as one name; not `FindCmd`) is counted
+`classic_unknown_cmds_dropped` with its own rate-limited warning instead of being dispatched into
+the error builder. The check runs after the layers' dbs were selected (D-3.3), so a KeyDB-only or
+unknown leaf still leaves the db its layers selected, as KeyDB selects before it knows the
+command. On the raw
 path (a non-active KeyDB sends `PEXPIREMEMBERAT` raw) only the KeyDB-only check runs; raw-path
 unknowns stay on upstream's `unknown_*` accounting so the squashed hot path gains no second registry
 lookup. Member TTLs are documented as lost; native conversion is a registered follow-up.
@@ -720,43 +796,281 @@ restart, or a new `Replica` object, means a full resync.
 - Hazards, each with a catching test (D-15): (a) leftover after CONTINUE; (b) off-by-one PSYNC
   offset; (c) deferred MULTI/EXEC bytes; (d) envelope bytes; (e) parser `INPUT_PENDING` across
   reads; (f) mid-load drop must FULLRESYNC; (g) header overwrite on a malformed FULLRESYNC; (h)
-  stream bytes behind the RDB of a full sync (Task 0.6, the same buffer).
+  stream bytes behind the RDB of a full sync (Task 0.6, the same buffer); (i) the stream's selected
+  db must survive the resume (D-3 "Selected db"): the backlog after the resume point carries no
+  `SELECT`, so a context that restarts in db 0 applies the resumed writes there.
 
 ### D-9. Active expiry on plain replicas of an active KeyDB (decision 13)
 
-A plain replica whose master answered `active-replica` runs active expiry itself. Today
-`EngineShard::Heartbeat` runs `RetireExpiredAndEvict` only when `!IsReplica()`
-(`engine_shard.cc:847`), and that function interleaves expiry (`DeleteExpiredStep`, `:942`) with
-eviction (`FreeMemWithEvictionStepAtomic`, `:964`). The split:
+A plain replica whose master answered `active-replica` runs active expiry itself. `EngineShard::
+Heartbeat` runs `RetireExpiredAndEvict` only when `!IsReplica()` (upstream's `engine_shard.cc`),
+and that function interleaves expiry (`DeleteExpiredStep`) with eviction
+(`FreeMemWithEvictionStepAtomic`). As built (Task 1.4, `ReplicaActiveExpiryTest`):
 
-- New per-shard flag `replica_active_expiry_` on `EngineShard` (`engine_shard.h`, beside
-  `is_replica_` at `:327`) with `SetReplicaActiveExpiry(bool)`. `Heartbeat` becomes
-  `if (!IsReplica()) RetireExpiredAndEvict(); else if (replica_active_expiry_)
-  RetireExpiredAndEvict(/*expire_only=*/true);`. With `expire_only`, `eviction_goal` is forced to 0:
-  eviction never runs on a replica, so `FreeMemWithEvictionStepAtomic`'s
-  `DCHECK(!owner_->IsReplica())` (`db_slice.cc:2681`) is never reached and stays as is. The
-  extra-namespace and rotating-db sweeps are already `IsActiveReplica()`-gated, so a non-active
-  replica skips them.
-- **A second gate must open too.** `DbSlice::ExpireIfNeeded` returns without deleting when
-  `owner_->IsReplica() && !FLAGS_replica_delete_expired` (`db_slice.cc:2097-2098`); the sweep calls
-  it (`:2574`). The gate becomes `IsReplica() && !owner_->ReplicaActiveExpiry() &&
-  !FLAGS_replica_delete_expired`. Defaults are unchanged.
-- The flag follows `master_active_replica_` (D-2) and is applied **only after a successful
-  `Greet()`** (one that fails midway neither sets nor clears it). `Start()`'s `Greet()` runs before
-  `MainReplicationFb` flips shards to replica mode (`replica.cc:272-273`), so the fiber applies the
-  recorded value right after `SetShardStates(true)` and again after every later successful
-  `Greet()` (a master that stops advertising `active-replica` clears it). It is cleared where shards
-  leave replica mode (`SetShardStates(false)`, `:383-385`). Peer-mode links never flip shards to
-  replica (`:272`), so they are unaffected: those nodes already expire. Cluster `ADDREPLICAOF`
-  replicas run the same `MainReplicationFb` and `SetShardStates`, so shard state is last-writer-wins
-  across them; the expiry flag is therefore applied and cleared only by the node's main `replica_`
-  link (`!slot_range_`), and replica active expiry through a cluster-replica link is unsupported
-  (documented).
-- Deletions journal when a journal exists (`journal_deletions = true`, flagged
-  `kEntryFlagExpired`), so a DFLY sub-replica of this replica converges. With a **plain Redis**
-  master the flag is never set: the replica still never expires on its own.
-- A replica with `--replica_delete_expired=false` that onboards from an active KeyDB expires anyway;
-  the master will never send the DEL. Documented.
+- **The seam.** New per-shard flag `replica_active_expiry_` on `EngineShard` (`engine_shard.h`,
+  beside `is_replica_`), `SetReplicaActiveExpiry(bool)` / `ReplicaActiveExpiry()`. `Heartbeat` gates
+  on `!IsReplica() || replica_active_expiry_`. There is no `expire_only` parameter:
+  `RetireExpiredAndEvict` derives `eviction_goal = (!IsReplica() && FLAGS_enable_heartbeat_eviction)
+  ? CalculateEvictionBytes() : 0`, so on a replica neither `FreeMemWithEvictionStepAtomic` (whose
+  `DCHECK(!owner_->IsReplica())` stays as it is and is unreachable) nor `CalculateEvictionBytes`
+  (which advances `eviction_state_`) runs. The extra-namespace and rotating-db sweeps, and the
+  member-TTL reaper, are gated on `IsActiveReplica()`, a boot flag, so a plain replica skips them.
+  Every other replica gate stays: the insert path's eviction and `apply_memory_limit`
+  (`db_slice.cc`), and `rdb_load.cc`'s.
+- **A second gate opens too.** `DbSlice::ExpireIfNeeded` returns without deleting when `owner_->
+  IsReplica() && !FLAGS_replica_delete_expired`; the sweep calls it. The gate becomes `IsReplica() &&
+  !owner_->ReplicaActiveExpiry() && !FLAGS_replica_delete_expired`. Defaults are unchanged. With the
+  flag on, the read path deletes on such a replica too, whatever `--replica_delete_expired` says
+  (KeyDB's read path on a replica only hides an expired key, `expireIfNeeded` returns 1; it is
+  KeyDB's sweep, `expireOwnKeys`, that deletes there).
+  Without the flag, `--replica_delete_expired=false` leaves an expired key **served as live**; with
+  it true (the production default) the read path deletes it and journals the delete.
+- **Who sets it.** The flag follows `classic_master_ && master_active_replica_` (D-2; INFO reads
+  the pair the same way), so a Dragonfly master never drives it, whatever a capa reply claimed. It
+  goes through one helper, `Replica::ApplyReplicaActiveExpiry(bool)`, which mirrors
+  `SetShardStates` and does nothing for a
+  peer-mode link (those nodes never leave master mode and already expire) or for a link that is not
+  the node's **main** link. The main link is marked by `Replica::SetMainLink()`, called by
+  `ServerFamily::ReplicaOfInternal` on `replica_` and never by `AddReplicaOf`. It is not `!slot_
+  range_`: `REPLICAOF <host> <port> <start> <end>` gives the main link a slot range too (pinned by
+  the `with_slot_range` pytest case). An `ADDREPLICAOF` link therefore never drives the flag
+  (it shares `SetShardStates`, last writer wins), and replica active expiry through one is
+  unsupported. The flag is per **shard**, not per link, and follows the **main** link only, so the
+  mismatch runs both ways, by design (the adversarial pass's M1, which walked nine link
+  transitions with fake masters): while the main link has it on, keys that arrive through an
+  `ADDREPLICAOF` link are self-expired too, those of a **stock** add-link included (decision 24's
+  window applies to them); and while the main link is a stock master, or the node has none, an
+  `ADDREPLICAOF` link to an **active KeyDB** never self-expires: that KeyDB sends no `DEL` for its
+  TTL keys and nothing sweeps them here, so a key leaves only when something reads it (the read
+  path deletes by default, see above) and an unread one lives forever. A KeyDB reached only
+  through `ADDREPLICAOF` is the unsupported case.
+- **Where it is applied.** `Start()`'s `Greet()` runs before `MainReplicationFb` flips the shards to
+  replica mode, so the fiber applies the recorded value right after `SetShardStates(true)` (only if
+  `R_GREETED`: a `--replicaof` link is greeted by the fiber instead) and after every later
+  successful `Greet()` (a master that stops advertising `active-replica` clears it), and clears it
+  with `SetShardStates(false)`. A **failed** `Greet()` neither sets nor clears it. The window that
+  leaves is documented: a KeyDB replaced by a plain Redis at the same host:port keeps expiring on its
+  own until the first successful `Greet()` clears it, and a full resync follows, so nothing lasts
+  (KeyDB's own replica behaves alike: `mi->isActive` is rewritten only by `parseMasterCapa`, which
+  a failed handshake does not reach, and when a master is created, `server.cpp:3251`).
+- **Journaling.** Deletions journal only when the shard has a journal: on a plain replica that is
+  under `--experimental_cascaded_partial_sync` with a sub-replica, where the sub-replica gets the
+  expiry `DEL` (flagged `kEntryFlagExpired`); the peer echo filter applies only in peer mode. No code
+  beyond the existing path. With a **plain Redis** master the flag is never set: the replica still
+  never expires on its own.
+- **`--replica_delete_expired=false` stays ignored (owner decision 28).** A flagged replica deletes
+  an expired key on access whatever the flag says: the master will never send the `DEL`, and the
+  flag is not an escape hatch to sweep-only behaviour. Serving the key as live on access (option C
+  of decision 24) would make every command on it run against the stale object until the sweep got
+  to it, the wider failure of the contrast paragraph below. The flag keeps its meaning on a replica
+  that is not flagged (`ReplicaActiveExpiryTest.ControlWithoutTheFlagAReplicaThatDeletesNothing...`
+  in D-15).
+- **What the replica does with an expired key, and where it diverges (owner decision 24, option
+  A).** A flagged replica deletes a key on the **first access after its own clock passes the key's
+  absolute expiry**: the clock is the per-command one (`Transaction::InitTxTime`, read once per
+  command, whatever its source), and any access counts, a replicated command or a client's
+  (`DbSlice::ExpireIfNeeded`, `db_slice.cc:2098-2101`, reached from the read path at `:948`).
+  Otherwise the heartbeat sweep deletes it. A command that finds the key due therefore sees no key.
+  - **When it diverges.** An active KeyDB deletes lazily on access and propagates no `DEL` for it
+    (`db.cpp:1980`, `:2110`), then propagates the command it ran, on the absent key. Master and
+    replica disagree about a key exactly when they disagree on whether it is due at the moment the
+    command runs: the master at its own time `Tm` against its expiry `E`, the replica at the time
+    it applies the command, `Tm + lag + skew` (`skew`: its clock minus the master's), against the
+    deadline `E_r` it holds. The main case is the master running a command at `Tm < E`, on a key
+    that was live there, and the replica applying it at or past `E_r`: the command finds no key and
+    does what the table below says for its class. The mirror case, a command the master ran after
+    `E` (it found no key) that the replica applies before `E_r`, applies it to a stale key; it
+    needs `lag + skew < 0`, a replica clock behind the master's by more than the lag. It matters
+    for the commands that create the key on the master (`INCR`, `HSET`, `SADD`, ...): the replica
+    computes them from the old value and keeps the old deadline, so its key is gone at it while the
+    master's fresh key has none. Decision 27 closes the mirror case for an enveloped command with a
+    plausible stamp (the author's time is after `E`, so the key is due there too).
+  - **The band.** `E_r` is `E`: an active KeyDB streams every TTL **absolute** (D-1.14). Its feed
+    passes each command through `catCommandForAofAndActiveReplication` (`aof.cpp:682-726`, called
+    from `replicationFeedSlave` at `replication.cpp:521` and from the RREPLAY builder at `:658`, in
+    both whenever the master is itself an active replica: `fSendRaw = !fActiveReplica`, `:584`),
+    which turns the relative `EXPIRE`, `PEXPIRE` and `GETEX .. EX/PX` (which rewrites itself to
+    `PEXPIRE`) into `PEXPIREAT <ms>` and `SET .. EX/PX` into `SET .. PXAT <ms>`; the commands' own
+    rewrites alone (`t_string.cpp:120-133`, `:386-392`, `expire.cpp:776-781`) would leave them
+    relative. The live capture shows it (`tests/dragonfly/data/README.md`, segments 2, 6 and 12,
+    checked against the bytes of `keydb_v6.3.4_rreplay_stream.bin`: `SET k2 v2 EX 100` arrives as
+    `SET k2 v2 PXAT 1791058569837`, `SET expiring v PX 200` likewise, `INCR c` as `INCRBY c 1`), and
+    the envelope's mvcc milliseconds are the same clock that deadline was computed from (the
+    deadline from the live `mstime()`, the mvcc from the cached copy of it): in both captures
+    `mvcc >> 20` equals the `PXAT` minus the relative TTL asked for. So the band around each expiry
+    is the full `lag + skew` for **every** key, one a stream command set and one that arrived in a
+    full-sync RDB or through `KEYDB.MVCCRESTORE` alike. (A TTL anchored on the replica's clock when
+    applied, which a relative `SET .. PX` or `EXPIRE` on the stream would give, would have `E_r = E
+    + lag_at_set`, skew cancelling, and a band of `|lag_now - lag_at_set|`. The relative form is on
+    no stream this design meets: a flagged replica's master is an active KeyDB, and Redis 7+,
+    Valkey and Dragonfly stream `PXAT` and `PEXPIREAT` too (Dragonfly: `string_family.cc:1170-1171`,
+    `generic_family.cc:1063`).)
+  - **Outcome per class**, for a command the master ran at `Tm < E` on its live key and the replica
+    applies at or past `E_r`. The replica finds no key (the first access deleted it, or the sweep
+    did) and the command runs against nothing:
+
+    | Outcome | Commands, as they reach the replica | Replica | Master |
+    |---|---|---|---|
+    | **Loss** | TTL refreshes: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` (all arrive as `PEXPIREAT <ms>`), `PERSIST`, `GETEX` (as `PEXPIREAT` or `PERSIST`); and `SET .. XX` with no expiry | No key: the refresh is a no-op, the `XX` fails | The key lives on. After a refresh (the `EXPIRE` family, `GETEX` with an expiry) it has the new deadline `E'`, and the two differ only until `E'`. After `PERSIST` (and `GETEX .. PERSIST`) it has none, and after `SET .. XX` it holds the new value and has none (`XX` without `KEEPTTL` drops the TTL): only these two are lost on the replica for good |
+    | **Orphan** | TTL-keeping writes, every command that creates the key when it is absent and leaves its TTL alone when it is there: `INCR` (arrives as `INCRBY`), `INCRBYFLOAT` (arrives as `SET k <result> KEEPTTL`, `t_string.cpp:671-673`: the master's own value, so only its TTL is missing), `APPEND`, `SETRANGE`, `HSET`, `HSETNX`, `HINCRBY`, `SADD`, `LPUSH`, `RPUSH`, `ZADD`, `SET .. KEEPTTL`, ... | The key is created from nothing **with no TTL**, and nothing ever removes it | The key keeps `E` and is gone at it; an active KeyDB never streams that `DEL`. A permanent orphan on the replica (decision 31) |
+    | **Source missing** | The movers and the STORE family, with the due key as a source: `RENAME`, `RENAMENX`, `COPY`, `LMOVE`, `RPOPLPUSH`, `SMOVE`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `SORT .. STORE` | The source is missing: `RENAME` replies `no such key` (an enveloped one is a `classic_apply_errors`), `COPY` 0, `LMOVE` nil, `SMOVE` 0, `SORT .. STORE` deletes an existing destination and replies 0 (the due source is a missing one, and an empty STORE result deletes the destination, as in Redis, `sort.cpp:580`; before decision 32 it replied an empty array and kept the destination, and aborted the replica when the destination was on another shard), and every other STORE command computes from the sources that remain, the due one counting as an empty set: when that makes the result empty (the due key is the only source, any source of an intersection, or the first source of a difference) an existing destination is removed; otherwise (a union of several sources, a difference whose first source is live) the live sources' result is stored, which is not the master's and **not** necessarily empty. Nothing reaches the destination of the movers | The destination holds the source's data. `RENAME` and `COPY` carry the source's deadline `E` to it (`db.cpp:1507-1511`, `:1651`, `:1687-1688`), so it is gone from the master at `E`: the replica converges if it had no destination. Onto a **live** destination (`RENAME`, or `COPY .. REPLACE`) it does not: the replica finds no source and keeps its old destination, a **permanent** stale key when that one has no TTL of its own (the master's is gone at `E` and an active KeyDB streams no `DEL` for it; a TTL of its own ends it). A moved element (`LMOVE`, `SMOVE`) has no deadline there: lost on the replica for good. A computed result (STORE) has none either: the replica's destination is wrong for good |
+    | **Converges** | A plain `SET` (replaces the key and its TTL), `DEL`, and `SET .. XX KEEPTTL` | The key is replaced or absent | The same, or (`XX KEEPTTL`) the key kept with `E` and gone at it |
+    | **Not affected** | `SET .. NX`, `MSETNX` | Never arrives | A failed `SET NX` is not propagated: KeyDB propagates only commands that changed the dataset (`server.cpp:4624`; `t_string.cpp:104-109` returns before it changes) |
+
+    `ReplicaActiveExpiryTest.EveryCommandClassOfTheWindowHasItsDocumentedOutcome` and
+    `.MoversAndStoresSeeTheDueSourceAsMissing` pin the rows (D-15): replies, values and `PTTL`,
+    for `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `GETEX`, `SET .. XX`, `SET .. XX
+    KEEPTTL`, `INCR`, `APPEND`, `SETRANGE`, `HSET`, `LPUSH`, `SADD`, `SET .. KEEPTTL`, `SET`, `DEL`,
+    and, with no destination, `RENAME`, `COPY`, `LMOVE`, `SMOVE` and `SUNIONSTORE`, plus `RENAME`,
+    `LMOVE` and `SUNIONSTORE` onto a live destination. The other names in a row are argued from the
+    same rule and not run, except `SORT .. STORE`, which `GenericFamilyTest.SortStoreOf*` runs
+    against a missing source, not a due one (decision 32). `SET .. NX` is not a row of a test:
+    what makes it unaffected is on the
+    master's wire, which the replica cannot show. In the mirror case a `SET .. NX` that did succeed
+    on the master fails against the stale key here. Task 2.4 (P7-2) rewrites `SET .. NX|XX` to the
+    author's effect on **every** envelope link, plain links included (D-4.3: the rewrites are not
+    gated on `LwwGuardActive`; raw streams are untouched). `SET .. XX` becomes a plain `SET`, which
+    is its effect on the master: from then on it converges and the `NX` stops failing. `SET .. XX
+    KEEPTTL` (rewritten to `SET .. KEEPTTL`) turns from a converging case into an orphan wherever
+    the key is missing when it arrives: the rewrite creates it without a TTL where the `XX` would
+    have failed and left it absent until the master's own expiry. Tasks 2.8 and 2.9 close that on
+    a healthy link (the key is found, with its TTL); it stays open where they fall back (a stamp
+    more than 60 s from the local clock, a stream more than 60 s behind) and, on a peer link,
+    under D-27.
+  - **The orphan is an interim limitation of P7-1 (owner decision 31).** A write that keeps the
+    TTL, run on the master before `E`, reaches the replica at or after it, recreates the key
+    without a TTL, and the key stays: DBSIZE does not move, the sweep has no TTL to act on, and
+    the master never streams a `DEL` for its own key's expiry. A rate limiter (`INCR`, then `EXPIRE`
+    only when the value is 1) meets it at a window rollover on a hot key; a counter whose `EXPIRE`
+    is streamed right behind the `INCR` is not orphaned (the `PEXPIREAT` gives the recreated key a
+    TTL), which is why the counter pytest streams one and the orphan pytest does not (D-15). The
+    outcome is documented here, in ISSUE-REGISTER D-32 and in the P7-1 PR description, beside the
+    double-apply-until-dedup note. Tasks 2.8 and 2.9 (P7-2) close it while the link is healthy: the
+    write runs at its author's time, before `E`, on a key the sweep, on the stream clock, has not
+    deleted, so it finds the key with its TTL; the orphan pytest flips. They do not close it when
+    the stream is more than 60 s behind (the floor below) or the stamp is unusable (the local clock
+    is kept).
+  - **Equivalences.** The behaviour, a command that finds no key (the loss and source-missing
+    rows), equals upstream Dragonfly's default (`--replica_delete_expired=true`) under any master
+    that is not an active KeyDB (Redis, Valkey, Dragonfly), and so do most of those rows'
+    outcomes, the permanent ones included (`PERSIST`, `SET .. XX`, a moved element, a STORE
+    result: nothing is ever streamed about a key the master still holds). Two outcomes do not
+    carry over, because an expiry `DEL` cleans them up under those masters (`RecordExpiryBlocking`,
+    `db_slice.cc:2159`) and an active KeyDB never streams it: the orphan, whose recreated key that
+    `DEL` removes, and the stale live destination of `RENAME` or `COPY .. REPLACE`, which the
+    master's own `DEL` of its destination at `E` removes. For those two the outcome is transient
+    under them and permanent under an active KeyDB. KeyDB's own *active* replicas (`expireIfNeeded`
+    falls through to the delete for `fActiveReplica`, `db.cpp:2101`) and drakeydb peers
+    (`PassesPeerEchoFilter` drops `kEntryFlagExpired`) share the orphan, and by the same mechanism
+    the stale destination.
+  - **KeyDB's own plain replica of an active master is different, and wider.** `expireIfNeeded`
+    returns 1 without deleting (`db.cpp:2101`), `lookupKeyWriteWithFlags` hands back the stale
+    object (`:249-253`), so replicated writes apply to a logically expired key; only a client's
+    read-only commands hide it (`:181-186`, the `CMD_READONLY` test). Only the slow
+    `activeExpireCycle` reaps (`expireOwnKeys`, `server.cpp:2054-2064`, called from `databasesCron`;
+    the fast cycle skips a replica, `:2891-2892`): hz 10, a 25 ms budget, 20 keys sampled per db
+    per iteration and a further iteration only while over 10% of a sample was stale
+    (`expire.cpp:311-314`, `server.h:344`, `:382`), about 200 keys a second per db when little is
+    stale, so a due key can wait seconds to tens of minutes. For all that time `INCR` followed by
+    `EXPIRE`, `SET NX` and `SADD`/`LPUSH`/`HSET`/`APPEND` into an expired key diverge for good, not
+    for a band of lag. Options B (copy that behaviour) and C (sweep only) were rejected as wider
+    for the same reason (ledger decision 24). Neither reliably avoids the orphan either. Under C
+    the replica's own sweep usually reaps the due key first, so the late write recreates it with no
+    TTL, the same orphan as option A's. B converges for that class only when the write lands before
+    KeyDB's slow reap: the write goes into the stale object, which keeps its deadline and goes when
+    the reap runs; one that lands after the reap recreates the key with no TTL as well. The owner
+    kept A for P7-1 knowing that (decision 31).
+  - **Closing the band for enveloped commands (owner decisions 27 and 30, plan Task 2.8, P7-2).**
+    Each enveloped command's transaction runs at the **outermost** envelope layer's time, the
+    milliseconds of its mvcc (`mvcc >> 20`: `ms << 20 | counter`, `MVCC_MS_SHIFT 20`,
+    `server.h:960`) less one (below), instead of the replica's clock, so the replica compares a
+    key's deadline with its master's own time on every access, whatever the lag and the skew. The
+    outermost layer is the master's: a forwarding master wraps the original author's envelope in
+    its own, whose mvcc it minted on its own clock when it ran the command and decided expiry, and
+    its replica is to hold what it holds. The author's mvcc, the innermost, stays the LWW stamp
+    (Task 2.2); under `multi-master-no-forward yes` there is one layer and the two coincide. The
+    seam is a per-command override on `ConnectionContext`, set by `ClassicApplier::ApplyCommand`,
+    copied onto the `Transaction` in `PrepareTransaction` beside `SetReplOrigin` and honoured by
+    `Transaction::InitTxTime`. The local clock is kept for a raw (non-envelope) command, when the
+    mvcc is 0, and when it is more than 60 s from the local clock (a garbage or ancient stamp must
+    neither expire keys early nor anchor a TTL in the past).
+    - **The 1 ms edge.** KeyDB expires on `now > when` (`db.cpp:2068`), drakeydb on `now >=
+      expire`, so the replica runs the command at `m - 1`, which makes its comparison KeyDB's own
+      (`m - 1 >= E` is `m > E`). `m` is KeyDB's best stand-in on the wire for its decision's time,
+      not that time. KeyDB mints an envelope's mvcc in the feed (`replicationFeedSlavesCore`,
+      `replication.cpp:652`), after the command ran, from its cached clock (`g_pserver->mstime`,
+      which a time thread refreshes in a loop with a 100 ns sleep, `timeThreadMain`,
+      `server.cpp:7331`), where the decision read the live clock (`keyIsExpired`'s `mstime()`,
+      `db.cpp:2063`; the fixed-time branch above it does not apply inside `call()`, whose
+      increment, `server.cpp:4520`, is of another field than the one `keyIsExpired` tests,
+      `:2058`). `call()` mints once before the command (`incrementMvccTstamp`, `server.cpp:4521`)
+      and the feed again after it: the capture shows counter 1 on the single commands (segments
+      0-2 and 8-12 of `tests/dragonfly/data/README.md`) and 0 on the cron `ping` (segment 13),
+      which is not run through `call()`. So `m` is at or after the decision's time, up to the
+      cache's lag, and a key KeyDB found due (`t_d > E`) has `m > E`: it is due here too. Without
+      the shift `m == E` would find the key due where KeyDB, deciding at or before `m`, found it
+      live. What is left is a command KeyDB ran at `t_d <= E` whose `m` ticked past `E` before the
+      feed, or a cache that trailed the clock: a sub-millisecond residual that no shift removes.
+      A relative TTL anchored on the transaction's time is anchored one millisecond early; an
+      active KeyDB streams none (every TTL is absolute, D-1.14).
+  - **What it leaves open, and what closes it (owner decisions 29, 30 and 33, plan Task 2.9,
+    P7-2).**
+    Decision 27 alone leaves two paths on the replica's clock. The heartbeat sweep deletes a due
+    key at the replica's own `E`, so a command the master ran before `E` that is still in flight
+    then finds no key whatever clock it is applied at. A client's read of a due key deletes it
+    too, and so does a `SCAN` or `KEYS` that passes it. So decision 27 closes the window only for a
+    key neither has reached: the whole band for one the sweep has not got to (it walks the prime
+    table, 1 ms per heartbeat, `DeleteExpiredStep`, so a large keyspace or a low `--hz` leaves due
+    keys standing), and none of it for one either did reach, as in a small table. Skew remains for
+    both in any case. The pytests show the split (D-15): with `--hz=0` the envelope cases flip, with
+    the default heartbeat they do not. Task 2.9 closes both, with a **stream clock** for them to
+    compare deadlines with:
+    - **The clock.** A process-wide `stream_ms`: the largest plausible outermost envelope time the
+      main link's applier has applied (the 60 s window of Task 2.8), including the envelope KeyDB
+      wraps around its periodic `PING` (every `repl-ping-replica-period`, 10 s by default,
+      `config.cpp:2920`; segment 13 of the capture). The time is the one Task 2.8's single
+      `EnvelopeTimeMs` evaluation produced for the outermost layer, which the layer's command
+      runs at as well: evaluated twice, the two reads of the local clock could disagree at the
+      60 s edge, the advance seeing a stamp implausible that the apply then found plausible, so
+      the command would run at a time past the clock and the hide would fire on its own read. It
+      is taken after the self-author check and before the inner command is parsed or applied,
+      and **not** reset wherever the expiry flag is applied: only when the master's node **uuid**
+      differs from the one the clock last advanced under, or the flag is cleared. The replication
+      id is not part of the identity: `ApplyReplicaActiveExpiry` runs right after `Greet()`, before
+      the PSYNC reply sets `master_repl_id`, so at that point the id is the previous connection's
+      and could never differ, and a `+CONTINUE <newid>` from the same process must not reset the
+      clock anyway. A KeyDB process mints a new uuid at every start, which is the case the reset is
+      for. A reconnect to the same master, and a `+CONTINUE` resume (Task 3.1), continue the same
+      stream, whose last stamp is still the best known clock; the floor bounds a long outage.
+      The sweep of a flagged shard runs on `S = stream_ms ?
+      max(stream_ms, now - 60 s) : now` (`now - 60 s` clamped at 0 on a small clock): the floor
+      bounds how long a stalled stream can hold due keys, and a node that has seen no envelope
+      since the flag was set keeps the local clock.
+    - **The hide.** On a flagged shard, a read-only access (`UpdateStatsMode::kReadStats` in
+      `DbSlice::FindInternal`) to a key that is due at the transaction's time but not yet on the
+      stream clock (`stream_ms` set and `S(now) < E`) finds nothing and counts a miss, and leaves
+      the entry in the table for the command still in flight. The mutable path is unchanged: a
+      hide there would collide with inserts. An enveloped command of the publishing link with a
+      plausible stamp never reaches the hide, since its time is the stamp that has just advanced
+      `stream_ms` (an `ADDREPLICAOF` link's commands can reach it, and see what they saw before:
+      no key, the entry left in the table). **`SCAN`, `KEYS` and `RANDOMKEY` hide too (owner
+      decision 33):** `ScanCb` (`generic_family.cc:814`), the callback of `OpScan`, which all
+      three reach (`RANDOMKEY` through `RandomKey`'s own `OpScan` calls, `:3394`), applies the
+      same test before its `ExpireIfNeeded` and skips the key, neither returning nor deleting
+      it. A monitoring scan runs on the replica's clock, not a transaction's, so without this
+      one `SCAN` or `KEYS` would delete a key that is due locally but not yet on the stream clock,
+      and bring the orphan back for it.
+    - **What it costs and what stays.** A due key can linger, hidden, for up to one ping period
+      (10 s by default), and for 60 s with the link down. `DbSlice::ExpireAllIfNeeded` (`DFLY
+      EXPIRE`) stays on the local clock, and so does the insert-time garbage collection of a full
+      bucket (it runs on the inserting transaction's clock, the author's for an enveloped
+      insert). INFO carries `replica_stream_clock_lag_ms` (`now - S(now)`) in the link block of
+      the main link.
+    Until Tasks 2.8 and 2.9 land the window above is the behaviour, the orphan included, pinned by
+    `ReplicaActiveExpiryTest` and the pytests of D-15.
+  - Accepted and documented, with no grace flag. The operator page, `docs/multi-master.md`, has no
+    KeyDB section yet (P7-4 adds "Onboarding from KeyDB"); until it does, this section and the
+    `PLAN.md` note are where it is written down.
 
 ### D-10. RDB loader tolerance (B.6)
 
@@ -813,28 +1127,49 @@ bar:
 - **Setup.** `./helio/blaze.sh -release -DWITH_AWS=OFF -DWITH_GCP=OFF`, building only
   `ninja -C build-opt -j4 dragonfly` with `CCACHE_DISABLE=1` (free disk first by deleting the
   non-gate debug test binaries; they relink from objects later). KeyDB `--server-threads 1` and
-  drakeydb `--proactor_threads 2`, each pinned to its own cpuset with `taskset`, the load
-  generator on a third: `redis-benchmark -P 100 -c 50 -t set,incr -r 100000`. Sample KeyDB's
+  drakeydb `--proactor_threads 2`, each pinned to its own cpu set (the test pins them with
+  `sched_setaffinity`, not `taskset`), the load generators on a third. **As built (Task 1.5):** two
+  `redis-benchmark` processes side by side, `-P 100 -c 25 -r 100000`, one `-t set` and one `-t
+  incr` (50 connections in all), killed at the end of a 30 s window. One `-t set,incr -c 50` would
+  run the two commands one after the other and has no duration. Sample KeyDB's
   `master_repl_offset` and drakeydb's `slave_repl_offset` at 1 Hz.
 - **Bar**, over the steady window: `apply_rate / produce_rate >= 0.95` (rates are the offset
   deltas per second); the maximum byte lag stays `<= max(2 s x produce_rate, 8 MB)`; the lag drains
   to zero within 2 s of the load stopping; the link never reconnects and KeyDB logs one full sync.
 - **Comparator.** The same load with a second KeyDB attached as an active replica of the same
-  master: drakeydb's lag must be within 1.5x of that replica's. Three runs, median. Also record
-  the raw (squashed) path — a non-active KeyDB or Redis master — as the reference the envelope path
-  pays against.
+  master: drakeydb's maximum lag must stay within `max(1.5 c, c + max(1 MB, 40 ms x r))`, where
+  `c` is that replica's maximum lag and `r` the master's stream output in bytes/s (the larger of
+  the two legs'). The floor is part of the bar, not slack on top of it. A lag is the difference
+  of two `INFO` reads a few milliseconds apart, so it resolves only to the output of those
+  milliseconds (a few hundred KB at 30 MB/s) and the comparator's own maximum lag swings between
+  runs (1.5-5.6 MB in the first campaign), so two small lags would otherwise compare as a ratio of
+  2. The floor is 1 MB, which was 35-40 ms of that campaign's 25-30 MB/s, and 40 ms of output
+  above 25 MB/s (1.6 MB at 40 MB/s), so it follows the rate of a faster box. Three runs, median.
+  Also record the raw (squashed) path — a non-active KeyDB or Redis master — as the reference
+  the envelope path pays against.
 - **Gating.** The release bar runs when `DRAKEYDB_PERF=1` (a pinned, quiet box). The default (CI,
   debug) run is a **functional smoke**: rate-capped to about 5k ops/s with loose bounds (ratio
   `>= 0.5`, lag `< 32 MB`, drain `< 10 s`) — it proves the test and the plumbing, not the bar.
 
-The test is `test_keydb_onboarding_keeps_up_under_load` (`slow`); the achieved ops/s and the lag
-series are recorded in the ledger. The cost P7-2 adds (stamping, dedup reservation, guard) is
-re-measured in peer mode (Task 2.4). If the **release** bar fails — and only then — **Task 1.6**
-(conditional) optimizes inside P7: same-author/same-shard micro-batching through the squasher with
-**per-command** mvcc, which needs per-command stamp plumbing because `repl_mvcc` is batch-level at
-`main_service.cc:1815` and `multi_command_squasher.cc:114`; it starts with a measurement and a
-design note, and stops for the advisor before touching squasher files. Peer lines gain a
-`repl_offset=` field so the peer-mode lag is observable.
+The tests are `slow` and `keydb`. `test_keydb_onboarding_keeps_up_under_load` is the smoke by
+default and the absolute half of the bar under `DRAKEYDB_PERF=1`.
+`test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica` (perf-only) is the comparator half: it
+runs the KeyDB-replica leg, then the drakeydb leg under the same pinning and load, and asserts the
+bound above (one run of each leg per call, so the median of three is three calls; it is also the
+re-run of Task 2.4 Step 5). `test_keydb_throughput_reference_setups[keydb|drakeydb_raw]`
+(perf-only, no bounds) measures the comparator and the raw reference with the same harness. The
+bound's arithmetic is unit-tested without KeyDB (`test_comparator_bound_*`,
+`test_comparator_floor_*`). For a KeyDB replica "one full sync" is read from its three sync
+counters: it first sends `PSYNC` with its own replication id, which the master counts as a failed
+partial sync, so the harness requires `sync_full == 1` and that none of them moves during the
+load. The achieved ops/s and the lag series are recorded in the ledger. The cost P7-2 adds
+(stamping, dedup reservation, guard) is re-measured in peer mode (Task 2.4). If the **release**
+bar fails — and only then — **Task 1.6** (conditional) optimizes inside P7: same-author/same-shard
+micro-batching through the squasher with **per-command** mvcc, which needs per-command stamp
+plumbing because `repl_mvcc` is batch-level at `main_service.cc:1815` and
+`multi_command_squasher.cc:114`; it starts with a measurement and a design note, and stops for the
+advisor before touching squasher files. Peer lines gain a `repl_offset=` field so the peer-mode
+lag is observable.
 
 ### D-13. Observability, flags, docs (B.10, decision 15)
 
@@ -858,15 +1193,40 @@ ones.
 **Where they render — a stock master keeps upstream's INFO.** A classic field renders only for a
 classic link whose master answered `active-replica` **or** whose own counter is nonzero
 (`ReplicaSummary` gains `classic_link` and `master_active_replica` for that). Process-wide counters
-use the same predicate (any link `master_active_replica`, or the counter nonzero; the loader
-counters can be nonzero when onboarding from a **non-active** KeyDB, which also holds cron jobs and
-member TTLs): beside `multimaster_lww_dropped` in the active-node block
+use a node-wide predicate (an active KeyDB master has completed a handshake since boot, or the
+counter is nonzero; the loader counters can be nonzero when onboarding from a **non-active**
+KeyDB, which also holds cron jobs and member TTLs; the series' predicate is decision 25, below):
+beside `multimaster_lww_dropped` in the active-node block
 (`server_family.cc:3138-3162`) and in the plain-replica block after the per-link fields. In
 Prometheus a plain replica never reaches the master-side branch where
 `multimaster_lww_dropped_total` lives (`metrics.cc:511-518`), so the mirrors are also emitted in the
 replica-side branch (`:486-489`); otherwise the series would be missing exactly on the nodes that
 onboard from KeyDB. With a stock Redis master and every counter zero, INFO and `/metrics` are
 byte-for-byte upstream's.
+
+As built (P7-1 Task 1.3, with its review round): INFO's predicate is per field. A link to an active
+KeyDB shows every counter, zeros included, whatever its state; any other classic link shows only the
+counters that moved (a non-active KeyDB sending `PEXPIREMEMBERAT` raw shows `keydb_cmds_dropped`
+alone), and on a peer line `repl_offset` follows whenever any field is shown. "Active" sticks per
+link: `ReplicaSummary::master_active_replica` is set once a completed `Greet()` of that `Replica`
+found `active-replica` in a capa reply (`Replica::classic_master_was_active_`) and is never cleared
+for that `Replica`, so a link that is down, or reconnecting with a handshake that fails, keeps its
+zero fields. `classic_link` is the protocol of the last completed handshake and survives a
+disconnect likewise. The per-Greet `Replica::master_active_replica_` (cleared at every `Greet()`,
+read only once `R_GREETED` is set) is what Task 1.4's expiry decision uses; INFO does not read it.
+
+**The `<name>_total` series deliberately deviate from the per-link wording above (owner decision
+25).** They are the process-wide sums (`ClassicTotals()`, bumped with every per-link counter, so a
+link that went away leaves its counts), emitted at one place in `Metrics::Print` after the
+replica/master branches, which covers both and a node that was promoted with counters still
+nonzero. A series renders when a process-wide sticky flag is set (`NoteActiveKeyDbMaster()`, called
+by `Replica::Greet()` when a classic master that answered `active-replica` completes a handshake,
+never cleared; `ActiveKeyDbMasterSeen()`), or when its own total is nonzero. So the zero series do
+not come and go with a link, and `/metrics` does not look at the links: the first version computed
+"some link has an active KeyDB master" per scrape, a hop to every peer thread under
+`PeerReplicationManager::mu_`, and only to decide this. The `multimaster_*` process-wide INFO
+counters named above arrive with the tasks that count them (P7-2, P7-4); Task 1.3 has none to
+render there.
 
 **Clock skew.** KeyDB answers `REPLCONF UUID` with a bare `+<uuid>` (D-1.1), so the handshake clock
 echo that feeds `clock_skew_ms` for DFLY peers is absent and the field stays 0 ("no sample"). A
@@ -924,8 +1284,9 @@ Delivered by Task 0.6: `tests/dragonfly/fake_classic_master.py` — a minimal as
 record of every request, connection and `REPLCONF ACK` offset), needed because the existing `Proxy`
 replaces only the first line of one response (`proxy.py:21-37`): it makes the post-load paths,
 malformed envelopes, mixed raw/envelope ordering and coalesced `+CONTINUE` + stream bytes
-deterministic. Tasks 1.2 and 3.1 reuse it. Still to come: the `Proxy`'s additive request-capture
-list (Task 1.4).
+deterministic. Tasks 1.2 and 3.1 reuse it. Task 1.4 as built made **no `proxy.py` change**: the
+request capture its handshake tests need is `FakeClassicMaster.requests` (every request as a list
+of words, all connections, in arrival order), so P7-1 leaves the `Proxy` as it was.
 
 ### D-15. Tests
 
@@ -943,14 +1304,26 @@ still pass under if the feature were removed.
 | `test_classic_stream_empty_command_name_does_not_abort[diskless_later_write\|disk_later_write\|disk_behind_rdb]` (fake master: a valid sync, then `*1\r\n$0\r\n\r\n`, then `SET a 1`: replica alive, `a == 1`, settled ACK exact; U-13) | Dropping the `!cmd.empty()` guard in `ConsumeRedisStream`: SIGABRT (`i < size()`, `absl/types/span.h`) |
 | `test_classic_stream_rreplay_is_dropped_and_logged_until_p7_1` (fake master that did not advertise `active-replica`; Task 1.2 replaces it) | Removing the defensive drop ERROR: nothing is logged |
 | `test_psync_stream_bytes_behind_full_sync_are_applied` (fake master: `$<len>` + RDB + raw `SET a 1` in one `write()`; the `$EOF:` framing too): `a == 1`, offsets exact; `test_psync_*_token_mismatch*` and `*_length_*` reconnect | Unclamped first read (`CHECK`/reconnect loop, `a` never set); dropping the hand-off (`a == 0`); counting the hand-off twice (offsets apart) |
-| `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
-| `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsBytesDoesNotAdvance`, `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; `Commit` on a rejected dispatch; deferring `Commit` past the return |
-| `test_plain_replica_unwraps_keydb_rreplay`, `..._nested_...`, `test_unwrap_offsets_exact`; `test_keydb_active_live_write_during_full_sync[plain_replica\|peer_mode]` (no longer `xfail`) | Skipping `repl_offs_ +=` (offset lags); removing unwrap (no keys; the live-write test goes back to strict-xfail) |
+| `ClassicReplayTest.ParseRreplayEnvelope*` (incl. the golden captures); `ClassicApplyFamilyTest.*` (unwrap, db, skips, self, malformed, nested to 64, depth-65 leaves the 64th consumed, an inner with zero or two commands, or with an array, nil array or nil for a name, malformed, known-command error counted) | Dropping the 65th-nesting refusal; applying inner `PING`; accepting a second inner command; the `NONE` builder (no `classic_apply_errors`) |
+| `ClassicApplyFamilyTest.RunningFalseBeforeDispatchReturnsNotConsumed*`, `.RunningFalseDuringFirstDispatchStillConsumesWholeEnvelope`, `.RejectedDispatchCountsAndConsumes` (a wrong-arity `SET k` is rejected before it runs: `classic_apply_errors == 1`, `kConsumed`); P7-2 Task 2.3 adds `.RejectedDispatchCountsBytesDoesNotAdvance` and `.ReplayAfterCommitBeforeCountIsDeduped` | Checking `running()` after the first dispatch; checking it before every inner dispatch; (P7-2) `Commit` on a rejected dispatch; deferring `Commit` past the return |
+| `test_classic_stream_command_with_an_array_for_a_name_does_not_abort[empty_array\|nil_array\|behind_a_queued_command]` (fake master: a valid sync, then `*0\r\n` or `*-1\r\n`, with a raw command queued ahead of it in the last case, then `SET a 1`: replica alive, `a == 1`, settled ACK exact, the warning logged; U-14) | Dropping the U-14 guard in `ConsumeRedisStream`: SIGABRT (`std::bad_variant_access` out of `RespExpr::GetView`) |
+| `test_classic_stream_info_command_does_not_abort[raw\|in_envelope]` (fake master: a valid sync, then `SET a 1`, `INFO` raw or inside an envelope, `SET b 2`: replica alive, `a == 1`, `b == 2`, settled ACK exact; in an envelope also `classic_apply_errors == 1` and the logged reason; U-15); `ClassicNoConnectionTest.*` (one case per guarded handler, dispatched raw on the stream's context: the reply is `No connection`, `OK` for `QUIT`; also `WATCH`, `REPLCONF GETACK`, `CLIENT LIST\|PAUSE\|HELP` and an `EVAL` of `INFO`, `HELLO` and `QUIT`); `ClassicApplyFamilyTest.ReplicatedMonitorAndSubscribeLeaveNothingForClientsToTripOver`, `.InfoInAnEnvelopeIsAnApplyErrorNotACrash`, `.EvalOfAConnectionCommandInAnEnvelopeIsAnApplyErrorNotACrash`, `.ReplicatedWatchLeavesNoRegistrationBehind` (counts `DbTable::watched_keys` across every shard and db, with a control that a real client's `WATCH` is counted); `test_classic_stream_eval_of_a_connection_command_does_not_abort[raw\|in_envelope]` (fake master: `SET a 1`, `EVAL` of `INFO`, `HELLO 3` and `QUIT`, `SET b 2`: replica alive, settled ACK exact, in an envelope `classic_apply_errors == 2`) | Removing the `ServerFamily::Info` guard: the replica process dies (SIGSEGV or SIGABRT) and `b` never arrives; removing the guard of a handler: that case dies, one at a time under `--gtest_filter`; removing the `MONITOR` or `SUBSCRIBE` guard: the next client command or `PUBLISH` dies; removing the `ServerFamily::Client` guard: the five `CLIENT` cases die and `LIST`, `PAUSE`, `HELP` get a reply instead of `No connection`; removing the `Watch` guard: the stream's `WATCH` is accepted and the registration outlives the link (no crash in a debug build, so the test reads the count); removing the `Info` or `Hello` guard: the `EVAL` cases and the pytest die; removing the `ReplConf` guard: `GETACK` replies `syntax error` |
+| `test_plain_replica_unwraps_keydb_rreplay`, `..._nested_...`, `test_unwrap_keeps_offsets_exact`; `test_keydb_active_live_write_during_full_sync[plain_replica\|peer_mode]` (no longer `xfail`) | Skipping `repl_offs_ +=` (offset lags); removing unwrap (no keys; the live-write test goes back to strict-xfail) |
 | `test_unwrap_flushes_raw_batch_before_envelope` (fake master: raw `SET a 1`, envelope `SET a 2`) | Removing the pre-envelope flush (final `a == 1`) |
-| `test_keydb_only_commands_dropped_with_counters` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`) |
-| `test_info_and_metrics_show_classic_counters`; `..._absent_for_stock_master` (INFO/`/metrics` for a Redis master with all counters zero equal upstream's: no classic field); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master test fails); omitting the replica-side Prometheus branch |
-| `test_greet_sends_capa_active_expire_only_after_active_replica_reply` (KeyDB log lacks "does not support active expiration"; Redis capture shows no send) | Never sending it (the KeyDB warning appears) |
-| `test_plain_replica_of_active_keydb_expires_keys` (+ Redis control with `DEBUG SET-ACTIVE-EXPIRE 0`: replica must not expire) | Not setting the shard flag (DBSIZE stays N) |
+| `test_unwrap_selected_db_is_the_one_the_raw_commands_after_it_run_in` (fake master: an envelope in db 2, then a raw `SET c` and a 3-argument envelope, then an envelope in db 0 and a raw `SET g`) | Giving the applier a connection context of its own: `c` lands in db 0 |
+| `ClassicApplyFamilyTest.DbIsSelectedBeforeTheAuthorAndInnerChecks`, `.SkipsInnerControlCommands` (a control, self-authored, bad-mvcc, malformed-inner and over-nested layer each leave their db selected; arity, uuid and db failures do not) | Selecting the db after the self check, or only for a well-formed layer, or after the nesting check; `ParseRreplayEnvelope` not handing back the db of a bad mvcc |
+| `ClassicApplyFamilyTest.FailedSelectSkipsTheCommandUnlessADeeperLayerSelects` (**real** cluster mode, `cluster_mode=yes` with a one-node config: `SELECT 3` fails there, not in `emulated`; own db, outer 3 / inner 0, outer 0 / inner 3, inner without a db, a later envelope without a db: one `classic_apply_errors` per failed select, `db_index` unchanged, only the commands that had a db applied) | Running the leaf without the `db_selected` guard (the skipped keys land in db 0); a failure that stays sticky for a deeper layer (`inner_db0` missing); a layer without a db resetting the failure (`no_inner_db` applied); remembering a failed `SELECT` as ensured (the retry runs in an unactivated db: SIGSEGV) |
+| `test_keydb_only_commands_dropped_with_counters` (real KeyDB: `EXPIREMEMBER` and `KEYDB.CRON` dropped, `keydb_cmds_dropped == 2`, the set whole, no unknown or apply error); `ClassicReplayTest.IsKeyDbOnlyCommandTable`; `ClassicApplyFamilyTest.KeyDbOnlyDroppedAndCounted`, `.UnknownInnerCommandCountedNotDispatched`, `.KeyDbMvccRestoreCountedUnknownUntilItIsApplied` (decision 22: `classic_unknown_cmds_dropped`, never `keydb_cmds_dropped`), `.KeyDbOnlyAndUnknownLeavesKeepTheSelectedDb`, `.CountsAlsoFeedTheProcessWideTotals` | `IsKeyDbOnlyCommand` returning false (counter lands in `classic_unknown_cmds_dropped`); also matching `KEYDB.MVCCRESTORE`; `PERSIST` without the arity check; no pre-dispatch unknown check (the command reaches the dispatcher, `unknown_` is filled); a dropped command resetting the db; `Count` not feeding the totals |
+| `test_info_and_metrics_show_classic_counters[plain_replica\|peer_mode]` (real KeyDB), `test_scripted_active_master_exact_classic_counters`, `test_scripted_quiet_active_master_shows_zero_counters`, `test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter` (exact counts, INFO and `/metrics`; the raw path); `PeerReplicationInfo.ShowsClassicFieldsOnlyForClassicLinks`, `.OmitsClassicFieldsWhenMasterNotActiveAndCountersZero`; `ClassicReplayTest.ClassicLinkFieldsFollowTheRenderPredicate`, `.ClassicTotalSeriesFollowTheRenderPredicate` | Omitting the INFO branch (plain) or the peer-line branch; omitting the replica-side Prometheus branch (the plain replica has no series); ignoring `master_active_replica` (a quiet active KeyDB shows nothing); removing the raw-path check |
+| `test_scripted_active_master_down_link_keeps_zero_counters[plain_replica\|peer_mode]x[master_gone\|greet_fails]` (fake master that says `active-replica`: after a full sync the master goes away, or answers every capa with an error; INFO still shows the six zeros, and in peer mode the offset; D-13 "shown whatever its state"); `test_scripted_active_master_series_outlive_the_link[plain_replica\|peer_mode]` (`REPLICAOF NO ONE` / `REMOVE`: the six zero series stay; decision 25); `ClassicReplayTest.ActiveKeyDbMasterSeenSticksOnceNoted` | Reading `active-replica` only while the link is greeted (the down link shows nothing); clearing the per-link flag at the top of `Greet()` (`greet_fails` shows nothing); not calling `NoteActiveKeyDbMaster()` in `Greet()`, or computing the series' gate per scrape from the node's links (no series once the link is gone) |
+| `test_info_and_metrics_absent_for_stock_master`, `..._absent_for_keydb_that_is_not_active[plain_replica\|peer_mode]`, `..._have_no_classic_fields_between_dfly_nodes[plain_replica\|peer_mode]` (no classic field or series, and the link's block ends where it did: `psync_successes`, `clock_skew_ms`); `test_active_replica_boot_warning_names_keydb_drops` | Rendering unconditionally (the stock-master and DFLY tests fail); removing the sentence from the boot warning |
+| `test_greet_sends_capa_active_expire_only_after_active_replica_reply[never\|both_sites\|first_site_only\|second_site_only]x[plain_replica\|peer_mode]` (fake master, `FakeClassicMaster.requests`: with no `active-replica` reply none, else exactly one `["REPLCONF","capa","activeExpire"]` immediately after the request whose reply revealed it, either site, peer links too); `test_keydb_is_told_the_replica_expires_keys_itself` (real KeyDB: the `Synchronization with replica ... succeeded` line present, `does not support active expiration` absent); `test_greet_survives_any_reply_to_capa_active_expire[error\|two_element_array\|integer]x[plain_replica\|peer_mode]` (a per-request reply for `activeExpire`: the link comes up, one connection, and the requests after it, `UUID`, `DRAKEY-VERSION`, [`PEER`,] `capa`, `PSYNC`, follow in order) | Never sending it (the six active cases fail, and the KeyDB warning appears); sending it to every master (`never` and `second_site_only` fail); sending it from only one site (the other site's cases fail); once per site instead of once per `Greet()` (`both_sites` and `first_site_only` count two); a `Greet()` that fails on a reply that is not an OK (`survives_any_reply` fails with `replication cancelled`) |
+| `test_plain_replica_of_active_keydb_expires_keys[plain\|with_slot_range\|boot_replicaof]` (real KeyDB: N keys `PX 3000`, the replica's DBSIZE polled without reading a key reaches N+2 and then the two keys that did not expire, after KeyDB's own has; `with_slot_range` is `REPLICAOF <host> <port> 0 16383`; `boot_replicaof` is the `--replicaof` flag, whose first greet is the in-loop one); `test_replica_active_expiry_follows_the_master_of_every_reconnect` (fake master, same address: `active-replica`, then plain `+OK`, then `active-replica` again, each a full resync whose stream sets keys with a TTL: DBSIZE drops to the key without one, stays full past the TTL, drops again; the last phase waits for its own `c:keep` before counting, since the phase before left as many keys); `test_dfly_master_that_says_active_replica_never_turns_replica_expiry_on` (a real Dragonfly master with `--hz=0` behind a proxy that makes its first capa reply `+OK active-replica`: master and replica both keep every key); `test_plain_replica_of_plain_redis_never_expires_on_its_own` (a Redis 7 of its own with `enable-debug-command yes` and `DEBUG SET-ACTIVE-EXPIRE 0`: the replica's DBSIZE stays N+2 past the TTL, then drops by exactly the one key read on the master) | Not setting the shard flag (the replica's DBSIZE stays 52 while KeyDB's is 2); the flag set for any master (the control's replica falls to 2 while Redis holds 52); predicating on `!slot_range_` instead of the main-link marker (`with_slot_range` fails alike); no apply after the in-loop `Greet()` (`boot_replicaof` stays at 52, the reconnect test's middle phase expires keys of a plain master); the in-loop apply always clearing (`boot_replicaof` and the reconnect test's last phase); reading `master_active_replica_` without `classic_master_` (the Dragonfly-master test's replica falls to 2 while the master holds 52) |
+| `ReplicaActiveExpiryTest.ReapsExpiredKeysButNeverEvicts` (shards `SetReplica(true)` with the flag on, memory limit far under usage: DBSIZE, not the `deleted` stat, shows the expired keys gone and the rest all there, `evicted_keys == 0`, over many more heartbeats), `.ControlAMasterHeartbeatUnderTheSamePressureEvicts`, `.ReapsNothingWithoutTheFlag`, `.BypassesReplicaDeleteExpiredFlag` (`--replica_delete_expired=false`: the sweep and the read path both delete), `.ControlWithoutTheFlagAReplicaThatDeletesNothingServesExpiredKeys` (served as live) | The heartbeat gate back to `!IsReplica()` (the sweep tests fail); the `ExpireIfNeeded` gate without the flag (`BypassesReplicaDeleteExpiredFlag`); eviction allowed on a replica (`DCHECK(!owner_->IsReplica())` in `FreeMemWithEvictionStepAtomic` aborts); the sweep on every replica (`ReapsNothingWithoutTheFlag`); no eviction at all (the control fails); the fixture without its `FlagSaver` (the next test finds `hz` and `replica_delete_expired` off their defaults) |
+| `ReplicaActiveExpiryTest.ARefreshThatArrivesAfterTheDeadlineFindsNoKey` (decision 24, option A pinned: shards in replica mode with the flag on, `SET k v PX 100`, time moved past it, no heartbeat: DBSIZE still 1, then `PERSIST k` replies 0 and DBSIZE is 0), `.ControlARefreshBeforeTheDeadlineKeepsTheKey` (`PERSIST` replies 1 and the key outlives the deadline: the 0 above is the deletion's), `.EveryCommandClassOfTheWindowHasItsDocumentedOutcome` (D-9's outcome table against a due key: the loss rows, `SET .. XX` among them; `SET .. XX KEEPTTL` finding no key; the orphan rows, `SET .. KEEPTTL` among them, with `PTTL == -1` asserted on every recreated key; the plain `SET` and `DEL` last; no `NX` row, because a failed `SET NX` is never propagated, so nothing on the replica can pin it), `.MoversAndStoresSeeTheDueSourceAsMissing` (`RENAME`, `COPY`, `LMOVE`, `SMOVE` and `SUNIONSTORE` with no destination, then `RENAME`, `LMOVE` and `SUNIONSTORE` onto a live one: `RENAME` leaves it as it was, `LMOVE` pushes nothing, `SUNIONSTORE` empties it) | The gate serving a due key as live when flagged (`ExpireIfNeeded` returns it), on every path or on access only: observed with the gate changed to `IsReplica() && (ReplicaActiveExpiry() \|\| !replica_delete_expired)`, `PERSIST` replies 1 and DBSIZE stays 1; the outcome table fails row by row with the values the master holds (25 expectations: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` and `PERSIST` reply 1, `GETEX` returns `5`, `SET .. XX` and `SET .. XX KEEPTTL` reply `OK`, the due keys exist, `INCR` replies 6, `APPEND` leaves `5x`, `SETRANGE` `x555`, the hash, list and set hold 2), and the first `PTTL` of a recreated key aborts the process (`OpTtl`'s `DCHECK_GT(ttl_ms, 0)`, `Check failed: ttl_ms > 0 (-900 vs. 0)`: the key is served live past its deadline); the movers test fails 12 expectations (every mover and STORE command succeeds, and the live destinations change: `s:old` is gone, `lmove:over_dst` holds 2, `union:over_dst` exists); the plain `SET` row alone passes |
+| `test_plain_replica_of_active_keydb_loses_a_ttl_refresh_that_arrives_after_the_deadline[raw\|envelope]x[sweep\|access_only]`, `test_plain_replica_of_active_keydb_recomputes_a_counter_from_nothing_after_the_deadline[raw\|envelope_applied_after_the_deadline\|envelope_applied_before_the_deadline]x[sweep\|access_only]` (fake master saying `active-replica`, with the forms a real one streams: `SET .. PXAT`, `PEXPIREAT`, `INCRBY`; the late commands are applied a second past the deadline, told by a marker `SET` behind them, and the due key is never read before them; `access_only` starts the replica with `--hz=0` and asserts the due key is still in the table) | Serving a due key as live when flagged: all ten fail (`k survived a refresh that arrived after its deadline`, `c is '6'`). The same on access only, with the sweep still deleting (option C): the five `access_only` cases fail and the five `sweep` ones pass, so only the former pin "any access deletes". Of the ten, four flip under Tasks 2.8 and 2.9 together and six stay (D-9). Under Task 2.8 alone only the two `access_only` ones do (`envelope-access_only` of the first test: `k` survives with a TTL of at most 60 s; `envelope_applied_before_the_deadline-access_only` of the second: `c` is `6`); Task 2.9 adds `envelope-sweep` and `envelope_applied_before_the_deadline-sweep`, whose keys the sweep no longer deletes at the replica's own deadline. The `raw` cases (a raw command has no author time and publishes no stream clock) and `envelope_applied_after_the_deadline` (the author's time is after the deadline: the key is due there too) keep their values |
+| `test_plain_replica_of_active_keydb_keeps_a_ttl_less_orphan_of_a_ttl_keeping_write[sweep\|access_only]` (fake master saying `active-replica`: enveloped `SET c 5 PXAT`, `HSET h`, `PEXPIREAT h`, `SET kt old PXAT` and a control `SET swept v PXAT`, all with a deadline 3 s ahead; a second past it, enveloped `INCRBY c 1`, `HSET h g 2` and `SET kt new KEEPTTL`, stamped 300 ms before the deadline, and **no** `PEXPIREAT`; `c`, `h` and `kt` exist with `PTTL == -1` and are still there 2 s later, DBSIZE counting them; `sweep` waits until the sweep has deleted the due keys first, `access_only` (`--hz=0`) asserts they are all still in the table; decision 31, interim: flips under Tasks 2.8 and 2.9) | Serving a due key as live (the same gate change as above): `access_only` fails with `c is '6': the replica applied INCR to the old key`, `sweep` with `DBSIZE is 5: the sweep did not delete the due keys` (nothing deletes them, so the setup fails first) |
+| `test_fake_master_send_stream_lands_behind_the_scripted_stream` (no drakeydb: a bare socket against `FakeClassicMaster` with a `stream_delay`: a `send_stream()` during the delay is refused, and one after it arrives behind the scripted bytes) | Setting the stream writer before the delay again: `Failed: DID NOT RAISE AssertionError`, the early bytes would have landed ahead of the scripted stream |
 | `test_keydb_onboarding_keeps_up_under_load` (`slow`; release bar under `DRAKEYDB_PERF=1`, smoke otherwise) | n/a measurement; control = per-command path made artificially slow must fail the smoke's ratio |
 | `ClassicAuthorMapTest.*` (distinct idx and hash on every proactor, link uuid, memoization, `CapFallsBackToLinkIdxAndCounts`, `CapIgnoresLinkUuid`, `DedupStillWorksForOverCapAuthor`); `ClassicApplyFamilyTest.PeerEnvelopeStampsKey...`; `test_keydb_restart_consumes_one_author_slot` | Not registering the origin hash (`IncomingStamp` DCHECK); not setting `repl_mvcc` (stamp is a local mint); counting link uuids against the cap; overflow stamped `kSelfIdx` |
 | `AuthorDedupTest.*` (`ConcurrentSameEnvelopeAppliesOnce`: two fibers on `pp_->at(0)`/`at(1)`, the dispatch stub sleeps 10 ms before `Commit`, exactly one `kApply`; `ReleaseLetsSecondLinkApply`; `CancelledWaiterReturnsNotConsumed`; `NestedOuterAdvancesWhenInnerDeduped`; `EvictionSkipsInflight`; `ClearResetsAppliedKeepsInflight`); `test_keydb_mesh_forwarded_duplicates_deduped` (KeyDB A and B forwarding, drakeydb on both, pipelined `INCR` x N at full rate must equal N) | Setting `inflight` without ever waiting (two `kApply`; the pytest ends in (N, 2N], statistical, the gtest is the deterministic proof); disabling dedup (2N) |
@@ -960,11 +1333,15 @@ still pass under if the feature were removed.
 | `ClassicApplyFamilyTest.EvalStampedWithEnvelopeMvccUnguardedNoDfatal`, `.EvalAppliesEvenWhenLocalIsNewer` | Dispatching `EVAL` with the guard on (the tripwire fires); with `repl_mvcc = 0` (the stamp assertion fails) |
 | `test_keydb_writes_not_forwarded_to_peers` (KeyDB master, two `--active_replica --multi_master` drakeydb nodes that are each other's peers **and** both attached to it: each ends at exactly N after N `INCR`s; `assert_no_command_storm`) | Stamping classic authors with `kSelfIdx` (2N; a plain sub-replica instead of the second peer would make this vacuous) |
 | `test_keydb_clock_skew_estimate_from_envelopes` (fake master: an envelope minted 60 s ahead gives `clock_skew_ms` near +60000 and the skew warning; real KeyDB on the same host stays within -2000 and +100); `ClassicApplyFamilyTest.SkewSample*` | Reading `mvcc` instead of `mvcc >> 20` (a ~10^6x skew) |
+| `ClassicReplayTest.EnvelopeTimeMs*` (table: 0, all ones, bit 63, now, and +-59'999, +-60'000, +-60'001 ms, the counter bits ignored, a `now` below 60'000 so that the window cannot wrap; a usable stamp gives its milliseconds less one); `ClassicApplyFamilyTest.EnvelopeTime*` (shards in replica mode with the flag on, `--hz=0`, a key due by `SET .. PXAT`: a refresh stamped before the deadline keeps the key, one after it finds none, a stamp of `E` is live and `E + 1` is due (`m - 1`, KeyDB's `>`), a raw refresh keeps the local clock, the outermost layer of a nest decides, `SET .. PX` is anchored on the envelope's time less one millisecond (`PEXPIRETIME`), the override ends with its command, plain and peer links alike, a peer stamp stays the envelope's mvcc when the time falls back); a direct `Transaction` test that `InitTxTime()` after `SetReplTime()` keeps the override (Task 2.8) | Never setting the field, not copying it in `PrepareTransaction`, `SetReplTime` not updating `time_now_ms_` (the flips fail); not clearing it (a raw command runs at the last envelope's time); reading `mvcc` instead of `mvcc >> 20` (every stamp is out of window); no window, or one side of it; the innermost layer's stamp; no `- 1` (a stamp of `E` is due); `InitTxTime` ignoring the override (only the direct test fails) |
+| `test_plain_replica_honours_an_envelope_time_only_within_a_minute_of_its_own` (fake master, `--hz=0`, crafted mvcc values: a key due locally and a refresh stamped 45 s ago survives, 75 s ago falls back and is gone, mvcc 0 is local; a key live locally and a refresh stamped 45 s ahead is gone, 75 s ahead falls back and survives) and the flips named in the two rows above (Task 2.8) | Honouring any stamp (the 75 s cases fail), one side of the window only, ignoring the stamp (the 45 s cases fail) |
+| `ClassicReplayTest.SweepClock*` (table: no stream clock gives the local one; a clock within 60 s of now is kept, an older one gives `now - 60 s`, a clock ahead of now is kept, a `now` below 60 s gives the stream clock and not a wrapped floor); `ClassicApplyFamilyTest.StreamClock*` (a publishing applier: an enveloped `PING` stamped within the window moves the clock to the stamp less one before the control command is skipped, a stamp 61 s off either way does not, the clock only moves forward, a nest moves it to the outermost layer's stamp, an envelope that is not consumed (`running()` false), a self-authored one and a non-publishing applier (a peer or `ADDREPLICAOF` link) leave it alone); `ReplicaActiveExpiryTest.TheSweepWaitsForTheStreamClockButNotBeyondTheFloor` (a published clock behind the deadline: heartbeats reap nothing; `AdvanceTime(61'000)` and the floor passes it: they reap), `.ReadsHideADueKeyUntilTheStreamClockReachesIt` (`GET`, `EXISTS`, `TTL` find nothing, a miss is counted, DBSIZE does not drop; once the clock reaches the deadline the next read deletes it), `.TheHideLeavesTheMutablePathAlone` (a `SET` over a hidden key replies `OK` and leaves one key, no duplicate entry), `.ScansHideADueKeyUntilTheStreamClockReachesIt` (decision 33: `SCAN`, `KEYS` and `RANDOMKEY` of a key due locally but not on the stream clock neither return nor delete it, DBSIZE does not drop; once the clock reaches the deadline the next scan deletes it); the fixture resets the clock before and after (Task 2.9) | The sweep on the local clock (the sweep test's first half fails; the hide tests run no sweep and pass); no floor (its second half fails) or no guard on its subtraction (the small-clock row); the hide on the mutable path (the `SET` collides with the entry, a `DCHECK` or a duplicate); the hide removed from `ScanCb` (the scan test: `KEYS` returns the key, or `SCAN` deletes it and DBSIZE drops); the stamp stored without the window, or any layer's but the outermost's, or without the forward-only rule (the `StreamClock*` rows); a non-publishing applier publishing; the advance before the `running()` check or before the self-author check |
+| `test_plain_replica_sweeps_on_the_stream_clock_that_an_enveloped_ping_moves`, `test_plain_replica_hides_a_due_key_from_clients_until_the_stream_clock_reaches_it`, `test_plain_replica_stream_clock_ignores_a_stamp_outside_a_minute_of_its_own`, `test_plain_replica_stream_clock_follows_the_outermost_envelope`, `test_plain_replica_reports_the_stream_clock_lag` (fake master, default `--hz`, `SET .. PXAT` enveloped at `t0` with a deadline `E` 3 s ahead: a key due locally stays while the clock is behind it, goes when an enveloped `ping` stamped after `E` arrives; a client `GET` of it is nil, `KEYS *` and `SCAN 0` neither list nor delete it, and DBSIZE does not drop, and an enveloped refresh stamped before `E` revives it; a `ping` stamped 90 s ahead leaves it; a nest whose outer stamp is after `E` and inner before deletes it; INFO shows `replica_stream_clock_lag_ms` at 0 before any envelope; a first stamp 59 s old, then 2 s more, at most 60'000 with the floor warning in the log (the clock only moves forward, so this comes before the next step); a stamp 5 s old after it, at least 5000 and growing with the silence; the same master reconnecting, which keeps it; a second fake master (another uuid and replication id), which resets it to 0; and nothing for a master that is not active); `test_plain_replica_of_active_keydb_survives_a_rate_limiter_window_rollover` (real KeyDB behind a proxy that holds the link across the counter's deadline: after `INCR` before it and `EXPIRE`, the replica holds no `rl` once the next `PING` has passed); the flips of the rows above (Task 2.9) | The sweep on the local clock (the first, second and last fail); an unrecorded enveloped `PING` (the first fails: nothing moves the clock); no floor; the innermost layer (the nest test); no window (the 90 s test); no reset (the second master's 0); a reset on every `Greet()` (the same master's reconnect loses the lag); the field not rendered, or rendered for a plain master |
 | `ClassicReplayTest.TranslateMvccRestore*` (table-driven: `<expire>` mapping, own-mvcc extraction, arity, payload pre-checks incl. `size <= 10` and type 64 as a drop class, byte-exact output) | Passing `INVALID_EXPIRE` through; taking the envelope's mvcc; dropping the type-byte check |
 | `ClassicApplyFamilyTest.MvccRestore*` (stamp is own mvcc + author hash; a stale restore loses to a newer local write; plain link applies verbatim and unstamped; a non-DF, non-64 type leaves the resident key and counts `keydb_mvccrestore_failed`; a type-64 payload counts `keydb_cmds_dropped`) | Envelope mvcc; guard bit off; pre-checks removed (D-31 deletes the key) |
 | `test_keydb_mvccrestore_from_keydb_mesh_merge_applies` (KeyDB B with a peer and a plain drakeydb attached merge-syncs from KeyDB A: keys and TTLs arrive; the peer keeps a newer local write, the plain replica takes A's) | Envelope mvcc or guard off (the peer takes A's stale value); `INVALID_EXPIRE` passthrough (TTL-less keys gain a TTL); no translation (keys never arrive) |
 | `test_keydb_mvccrestore_unloadable_payload_skipped_and_counted` (fake master) | Removing the pre-checks (resident key deleted); not counting; counting type 64 as a failure |
-| `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored |
+| `test_classic_partial_psync_*` (exact INCR count, master `sync_partial_ok == 1`, `sync_full == 1`, `sync_partial_err == 0`), flag-off, mid-load drop, new-replid, KeyDB envelope variant, coalesced leftover, selected db across the resume (writes in db 3, drop, `+CONTINUE`, more writes with no fresh `SELECT`: all in db 3) | Fresh `io_buf` (lost bytes); `+0` offset; flag ignored; the apply context restarted in db 0 on `+CONTINUE` (the resumed writes land in db 0) |
 | `RdbKeyDbTest.*`, **all under `--active_replica`** (type 64 skip + next key unstamped, subexpire, aux once, bit-63 throttle, opcode 221 beats aux, each with a control key proving stamps are observable) | Not calling `settings.Reset()` (cron stamp leaks); making the aux branch first-wins or opcode 221 non-overwriting (precedence flips) |
 | `EvalReplicatedApplyNoConnNoCrash` | Removing the `conn() != nullptr` guard (null deref) |
 | `ReplicatedApplyDuringTakeoverNoCrash` | Removing the null-`conn()` allowance in the `TAKEN_OVER` branch (null deref) |
@@ -973,14 +1350,16 @@ still pass under if the feature were removed.
 ## Byte-identity exceptions
 
 **`--active_replica` off stays byte-identical to upstream on the journal wire and RDB output.** P7
-changes neither (`kDrakeydbReplVersion` stays 68). What a *non-KeyDB* master or sub-replica can
-observe changes only here:
+changes neither (`kDrakeydbReplVersion` stays 68), apart from the `SORT .. STORE` entry of item 2;
+the fork's earlier, ungated `SORT ... STORE` journal entries are listed in ISSUE-REGISTER D-5 and
+`docs/UPSTREAM-SYNC.md`. What a *non-KeyDB* master or sub-replica can observe changes only here:
 
 1. **Partial PSYNC** (flag-gated by `--classic_partial_psync`, default true): a reconnecting classic
    replica sends `PSYNC <id> <offset+1>` instead of `<id> -1`. The one real exception to the slogan;
    `=false` restores today's bytes.
-2. **Ungated crash, abort and refusal fixes** (P7-0). None changes a byte on the journal wire or in
-   RDB output; in each, upstream crashed, aborted or refused the link:
+2. **Ungated crash, abort, data-loss and refusal fixes** (P7-0 and P7-1). None changes a byte on the
+   journal wire or in RDB output, except the `SORT .. STORE` entry below, which says what it adds; in
+   each, upstream crashed, aborted, stalled, silently lost streamed writes (U-18) or refused the link:
    - **`+OK <suffix>` acceptance** (Task 0.4): a master that answers `REPLCONF capa` with `OK`, a
      space and words (`+OK keydb-fastsync-save`) is accepted. Upstream refused the link (`Bad
      response`, `REPLICAOF` failed). Any other reply is still refused. An active KeyDB's `+OK
@@ -990,6 +1369,96 @@ observe changes only here:
      stream. Upstream read the first byte of the empty name (`replica.cc`, `ConsumeRedisStream`):
      SIGABRT in a debug build, a 1-byte out-of-bounds read in a release one. It is now dispatched
      as the unknown command it is and its bytes are counted exactly.
+   - **U-14** (P7-1 review round): a command whose name is an array, `*0\r\n` or `*-1\r\n`, in a
+     classic master's stream. Upstream read the name as a string, which throws
+     `std::bad_variant_access` out of `RespExpr::GetView` and terminates the process. It is now
+     skipped like `MULTI`/`EXEC`, with a rate-limited warning, its bytes counted exactly. Ungated:
+     it is reachable from any classic master, not only a KeyDB one.
+   - **U-15** (P7-1 Task 1.3 review round and its re-review): a connection-oriented command (`INFO`,
+     `CLIENT SETNAME|GETNAME|INFO|ID|KILL`, `AUTH`, `HELLO`, `REPLCONF`, `QUIT`, `DFLY THREAD`,
+     `MONITOR`, `SUBSCRIBE`, `SSUBSCRIBE`, `PSUBSCRIBE`, `WATCH`) in a classic master's stream, raw or
+     inside an envelope. The apply context has no connection, and upstream dereferenced the null
+     `conn()`: SIGSEGV at once, or (`MONITOR`, `SUBSCRIBE`) at the next client command, or (`WATCH`)
+     a store through a dangling pointer into the dead stream context when the key is next written or
+     its db flushed, which a debug build does not notice. Each now replies `No connection` and the
+     stream carries on (`QUIT` replies `OK`). The same guards cover an `EVAL` body, because
+     `redis.call` runs its command on the context of the `EVAL` (`CallFromScript`) and `INFO`,
+     `HELLO` and `QUIT` are not `NOSCRIPT`, and the other two places that apply on a context without
+     a connection, `JournalExecutor` and the RDB-load search-aux path (`LoadSearchCommandFromAux`,
+     whose command name is fixed, so nothing there reaches a guarded handler today). Ungated; the
+     guards live in `server_family.cc`, `main_service.cc` and `dflycmd.cc`. Two guards reach beyond the
+     commands that crashed; what a stock master can observe of it is log-only:
+     - `REPLCONF` is guarded at the top of its handler, so every variant now replies `No
+       connection`, including `REPLCONF GETACK *`, which is real stock traffic. The text of the
+       discarded reply changes (`Replicating a replica is unsupported` on a plain replica, `syntax
+       error` past that refusal). Where `IsMaster()` is true (a peer-mode node), or
+       `--experimental_cascaded_partial_sync` is on for a non-active node, the `LOG(ERROR) "Error in
+       receiving command"` that every `GETACK` used to write also disappears.
+     - `CLIENT` has one guard for every subcommand, so `LIST`, `PAUSE`, `UNPAUSE`, `TRACKING`,
+       `CACHING`, `MIGRATE`, `HELP` and an unknown one are refused too. No stock master propagates
+       `CLIENT`, and it is `NOSCRIPT`.
+
+     The P7-1 close (adversarial finding I3) adds a twelfth guard, in `cluster_family.cc`: under
+     `--cluster_mode=emulated`, `CLUSTER INFO|SLOTS|NODES|SHARDS` on a context without a connection
+     reply `No connection` (upstream died with SIGSEGV in `Connection::LocalBindAddress`). Other
+     subcommands and other cluster modes are untouched, and a client always has a connection. The
+     close's re-review (finding I-1) adds a thirteenth and a fourteenth, for hidden commands that
+     `COMMAND` does not list and the first fuzz therefore never sent: `DFLYMIGRATE FLOW`
+     (`cluster_family.cc`; upstream named its connection before it looked up the migration, SIGSEGV in
+     any cluster mode) and `DFLY FLOW` (`dflycmd.cc`; SIGSEGV once a live preparation session matches).
+     A sweep of every hidden command and subcommand (70 cases, raw and enveloped, three cluster modes)
+     found nothing else that reads the connection. ISSUE-REGISTER U-15 has its results, and why a
+     filter at the stream boundary was rejected.
+   - **U-17** (P7-1 close): `REPLICAOF`, `SLAVEOF`, `ADDREPLICAOF` and `REPLTAKEOVER` in a classic
+     master's stream, raw or inside an envelope, reply `No connection` and the stream carries on.
+     Upstream joined the replication fiber from itself (`Check failed: active != this`, SIGABRT in
+     release builds too), parked that fiber on its own socket (`REPLTAKEOVER`), or opened a second
+     link (`ADDREPLICAOF`). Client-issued commands and the `--replicaof` boot path are unchanged.
+   - **U-18** (P7-1 close): a client `REPLTAKEOVER` on a replica whose last completed handshake found
+     a classic master is refused with an error, before a journal is started and before anything is
+     sent to the master. Upstream sent `DFLY TAKEOVER` on the replication socket and read the next
+     streamed command as its reply, losing that command for good. A takeover from a Dragonfly
+     master, and `REPLTAKEOVER` on a master or an active node, are byte-identical.
+   - **U-19** (P7-1 close, re-review M-1): `ROLE`, `DEBUG REPLICA PAUSE|RESUME|OFFSET` and `DEBUG
+     REPLDIAG` in a classic master's stream, raw or inside an envelope, reply `No connection` and the
+     stream carries on. They take `replicaof_mu_` on the replication fiber, which a client's
+     `REPLICAOF NO ONE` holds while `Replica::Stop` waits for that fiber to end: upstream deadlocked
+     both (the client never got its reply, `ROLE`, `CLIENT LIST` and `REPLTAKEOVER` hung after it,
+     SIGTERM did not stop the process), and `DEBUG REPLICA PAUSE` from the stream left the link
+     unable to reconnect after a drop. Client-issued `ROLE` and `DEBUG` are unchanged.
+   - **U-21** (P7-1 close, found by the hidden-command sweep): `DFLYMIGRATE ACK` on a node without a
+     cluster config (every cluster mode until a config is pushed) read the config through a null
+     pointer, SIGSEGV for a client and for a stream alike, and a bare `DFLYMIGRATE` failed a debug
+     build's parser-destructor assert. They answer `UNKNOWN_MIGRATION` and `syntax error` now.
+   - **U-22** (P7-1, decision 40, found while testing `SORT`): `SADD` replied only the members added
+     after an integer set converted to a string set in the middle of the call (past 256 entries, or at
+     a non-integer): 300 integers to a new key replied 43, Redis 300. The reply is the only change, as
+     Redis answers it; the set, the journal and the RDB output were right and are untouched. `SADDEX`,
+     `SMOVE` and the store commands never had it.
+   - **`SORT` ordering, `LIMIT`, `GET`, numbers and RESP3** (P7-1, decisions 34, 36, 37 and 38,
+     ISSUE-REGISTER D-34 and U-20): `SORT` now orders as Redis and KeyDB do (a `BY` tie breaks on the
+     element, a missing `ALPHA BY` weight sorts first, a SET under `BY nosort` that is stored or
+     scripted is sorted, `BY nosort DESC` walks a list or zset backwards, and `ALPHA BY` ties keep
+     the fetch order of a list or an integer set), so a classic master's verbatim `SORT .. STORE`
+     re-runs to the same `dst`. Also as Redis does, and client-visible: `LIMIT` is parsed as an
+     integer is (no `+` or leading zero; the Redis error) and clamped (a negative offset is 0, a
+     negative count is the rest, so `LIMIT 0 -1` is all), `GET` of a missing key or of a pattern
+     without `*` is nil in a reply and `""` in `STORE`, only the first `*` of a pattern is replaced,
+     a numeric element or weight loads with `strtod` (`"5 "` and `1e400` are refused, a NUL ends the
+     number), and a `SORT` of a set or zset replies a RESP3 array, not the set type. A client sees a
+     different reply than upstream for all of these; no journal or RDB byte changes, but a same-shard
+     `SORT .. STORE` is journaled as the command (D-13), so a replica on an older build re-runs it in
+     the old order (or fails on a form it does not know). `LIMIT` sums beyond `uint32`, which replied
+     garbage or crashed, are 64-bit. Upstream's `SortNegativeLimit`, `SortBy` and `SortGet` tests
+     changed with it. Round 2b (decisions 35 and 41, ISSUE-REGISTER D-35 and D-34): `BY w_*->field`
+     and `GET h_*->field` read a field of the hash at the key the first `*` names, as KeyDB's
+     `lookupKeyByPattern` does (upstream took the `->` as part of the key name), and the integer-set
+     limit of the `ALPHA BY` tie rule is the flag `--sort_set_max_intset_entries` (default 512, the
+     Redis and KeyDB `set-max-intset-entries` default; every drakeydb node must run the same value).
+     Both are client-visible; no RDB byte changes, and the journal changes only as an `HGET` changes
+     it (the derived `DEL` of a hash this read's lazy field expiry emptied). The older-build caveat
+     above applies to a `->` form as well. One hunk in each of `hset_family.h` and `hset_family.cc`
+     (`HSetFamily::GetFieldValue`, the `HGET` read of a field).
    - **U-9, U-10** (Task 0.5) and **U-12** (review round): null-`conn()` guards in `EvalInternal`'s
      migration, in `VerifyCommandState`'s `TAKEN_OVER` branch and in `DispatchCommand`'s close after
      a throwing handler. Upstream died with SIGSEGV on a replicated apply. U-10 also decides a
@@ -1010,14 +1479,31 @@ observe changes only here:
    - **EOF-token size and tail errors** (Task 0.6): a `$EOF:` token that is not 40 bytes, and a tail
      that disagrees with its header, are a logged error that reconnects. Upstream aborted on a
      `CHECK`.
+   - **`SORT .. STORE`** (P7-1 review round, decision 32, ISSUE-REGISTER D-33). The one fix of
+     this item that adds a journal entry. Against the fork's `main` its behaviour changes only where
+     `main` aborted or replied wrongly. A source that is missing, or a set emptied by its own member
+     expiry, used to abort the server when `STORE`'s destination was on another shard (a P4-0
+     regression: a hop returned its failure status into a `CHECK`, and a wrong-type or non-numeric
+     source aborted the same way) and to reply an empty array and keep the destination when it was
+     not. It now deletes the destination and replies 0, as Redis does, and journals a `DEL <dst>`
+     for a destination that was there (upstream main's `OpStore` journals the same entry). On one
+     shard that `DEL` is all it journals, and with no destination nothing is: the verbatim `SORT`
+     stays out of the journal (M-4 of the review of `f281564`; the merge base journals the `SORT`
+     there, upstream main the `DEL`). A wrong-type or non-numeric source replies the error it
+     always did and leaves the destination alone, and no line of the success path changes.
+     Ungated.
 3. **Loader** accepts KeyDB type 64 and subexpire aux, quiets noisy aux: strictly more permissive.
 4. **Raw-path KeyDB-only drop** (ungated, D-7): `PEXPIREMEMBERAT` and the rest of
    `IsKeyDbOnlyCommand` are dropped and counted on the raw path instead of being dispatched as
    unknown commands. Reachable from a **non-active** KeyDB master (it sends `PEXPIREMEMBERAT` raw).
-5. **Reachable only from an active KeyDB** (the one master that answers `active-replica` and sends
-   RREPLAY; upstream cannot even complete that handshake): `REPLCONF capa activeExpire`, RREPLAY
-   unwrap with its rewrites, EVAL stamping and dedup,
-   `KEYDB.MVCCRESTORE` translation, replica active expiry (and its journaled expiry `DEL`s).
+5. **Reached in practice only from an active KeyDB** (the one master that answers `active-replica`
+   and sends RREPLAY; upstream cannot even complete that handshake): `REPLCONF capa activeExpire`
+   and replica active expiry (and its journaled expiry `DEL`s), which are gated on the master's
+   capa reply, and the RREPLAY unwrap with its rewrites, EVAL stamping and dedup and the
+   `KEYDB.MVCCRESTORE` translation, which are **not**. `ConsumeRedisStream` unwraps every `RREPLAY`
+   command it reads, whatever the master advertised, so a classic master that streamed one without
+   saying `active-replica` would be unwrapped too. No stock master sends the command (upstream
+   treated it as an unknown command), so nothing a stock master can observe changes.
 6. **Observability** (additive; INFO is already outside byte identity, ISSUE-REGISTER D-5.1):
    classic INFO fields and Prometheus `_total` series render only when the master answered
    `active-replica` or a counter is nonzero (D-13), so a stock Redis master's INFO and `/metrics`
@@ -1035,41 +1521,58 @@ rebased onto `origin/main` after the predecessor squash-merges; each PR is opene
 |---|---|---|
 | **P7-0** | `feat/phase7-0-closeout-and-harness` | P4 close-out docs (U-8 withdrawn), baseline gate on unmodified main, this spec and plan, `Greet()` accepts `+OK <suffix>` but refuses active-KeyDB links until P7-1 (decision 23), U-9, U-13, graceful PSYNC `CHECK`s and the full-sync tail hand-off (Task 0.6), KeyDB harness + fake classic master + smoke tests (done), `drakeydb-ci.yml` (done), a load-robust reaper-resume test (Task 0.9) |
 | **P7-1** | `feat/phase7-1-rreplay-unwrap` | Envelope parse, unwrap in `ConsumeRedisStream`, KeyDB-only/unknown drop and counters, `capa activeExpire` + replica active expiry, throughput bar (conditional micro-batch task) |
-| **P7-2** | `feat/phase7-2-author-stamps-dedup-guard` | Author map and cap, per-command stamps, author dedup (reservation), guard ON + classic rewrites, EVAL stamping, skew estimate, D-1 closed, `KEYDB.MVCCRESTORE` applied (decision 22) |
+| **P7-2** | `feat/phase7-2-author-stamps-dedup-guard` | Author map and cap, per-command stamps, author dedup (reservation), guard ON + classic rewrites, EVAL stamping, skew estimate, D-1 closed, `KEYDB.MVCCRESTORE` applied (decision 22), envelope-time apply at the outermost layer's time (decisions 27 and 30), sweep clock and read-path hide (decision 29), which close the option-A orphan (decision 31) |
 | **P7-3** | `feat/phase7-3-classic-partial-psync` | `--classic_partial_psync`, leftover hand-off, peer partial skips merge |
 | **P7-4** | `feat/phase7-4-keydb-rdb-extras-docs-exit` | Type 64 skip, subexpire/aux noise, D-8 precedence test, operator docs, phase exit gate |
 
-Order: P7-0 makes anything testable against real KeyDB; P7-1 makes data flow without loss; P7-2
+Order: P7-0 makes anything testable against real KeyDB; P7-1 makes data flow, not yet without
+loss: until P7-2 the D-9 window orphans or loses data (the TTL-keeping orphan, the movers and the
+STORE commands) and a peer attached to several forwarding masters double-applies deltas; P7-2
 makes it convergent; P7-3 and P7-4 are independent of each other and land last because both touch
 `replica.cc` / `rdb_load.cc` regions P7-1/P7-2 reshape.
 
 **The P7-1 PR description must say** that until P7-2's dedup lands a peer attached to two or more
-forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), and that
-`KEYDB.MVCCRESTORE` is unhandled (counted as an unknown command) until P7-2.
+forwarding KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...), that `KEYDB.MVCCRESTORE`
+is unhandled (counted as an unknown command) until P7-2, and that a plain replica of an active
+KeyDB keeps a permanent TTL-less orphan of any TTL-keeping write the master ran before a key's
+deadline and the replica applies after it, and a permanent stale key where a `RENAME` or `COPY ..
+REPLACE` onto a live destination found its source due (D-9, ISSUE-REGISTER D-32, owner decision
+31), until P7-2's Tasks 2.8 and 2.9.
 
 ## File map
 
 | Path | Change | PR |
 |---|---|---|
-| `src/server/classic_replay.{h,cc}` **(new)** | `CapaReply`/`ParseCapaReply`; `RreplayEnvelope`/`ParseRreplayEnvelope`; `ClassicApplier`; `ClassicApplyRewrites`; `TranslateMvccRestore`; `IsKeyDbOnlyCommand`; `ClassicAuthorMap` (+ `--classic_author_cap`); `AuthorDedup`; `ClassicLinkStats`/process counters; `--classic_partial_psync` (split into a second pair if it passes ~800 lines) | 0, 1, 2, 3 |
+| `src/server/classic_replay.{h,cc}` **(new)** | `CapaReply`/`ParseCapaReply`; `RreplayEnvelope`/`ParseRreplayEnvelope`; `ClassicApplier`; `ClassicApplyRewrites`; `TranslateMvccRestore`; `IsKeyDbOnlyCommand`; `ClassicAuthorMap` (+ `--classic_author_cap`); `AuthorDedup`; `ClassicLinkStats`/process counters; `EnvelopeTimeMs` and the per-command time (Task 2.8); the stream clock, `SweepClockMs`, `StreamClockHides` (the one test of the hide, shared by `FindInternal` and `ScanCb`) and the applier's `publish_clock` (Task 2.9); `--classic_partial_psync` (split into a second pair if it passes ~800 lines) | 0, 1, 2, 3 |
 | `src/server/classic_replay_test.cc` **(new)** | Pure units and `ClassicApplyFamilyTest` | 0-3 |
-| `src/server/replica.{h,cc}` | Capa parse + activeExpire send; stream-prefix buffer and graceful `CHECK`s (0); unwrap hook and batch-flush lambda; expiry flag set/clear; dedup `Clear()` at the flush point; PSYNC offset/CONTINUE; counters | 0-3 |
-| `src/server/replica_types.h` | `ReplicaSummary` classic fields | 1, 2, 3 |
-| `src/server/engine_shard.{h,cc}` | `replica_active_expiry_`, `expire_only` split (authorized exception to the "untouched" list; ~15 lines) | 1 |
-| `src/server/db_slice.cc` | One-line `ExpireIfNeeded` gate (`:2097-2098`) | 1 |
-| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards | 0 |
-| `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract) | 2 |
+| `src/server/replica.{h,cc}` | Capa parse + activeExpire send (once per `Greet()`); stream-prefix buffer and graceful `CHECK`s (0); unwrap hook and batch-flush lambda; `ApplyReplicaActiveExpiry` (three call sites) and the `SetMainLink()` marker; dedup `Clear()` at the flush point; PSYNC offset/CONTINUE; counters; for Task 2.9 `publish_clock` at the applier's construction, the stream-clock reset in `ApplyReplicaActiveExpiry`, the floor warning in the acks fiber and the lag in `GetSummary` | 0-3 |
+| `src/server/replica_types.h` | `ReplicaSummary` classic fields; `stream_clock_lag_ms` (Task 2.9) | 1, 2, 3 |
+| `src/server/engine_shard.{h,cc}` | `replica_active_expiry_` and the heartbeat gate, `eviction_goal` kept 0 on a replica (authorized exception to the "untouched" list; ~20 lines, no `expire_only` parameter); `friend class ReplicaActiveExpiryTest` (1); the sweep's clock on a flagged shard, `SweepClockMs(now)` in `RetireExpiredAndEvict` (2, Task 2.9) | 1, 2 |
+| `src/server/db_slice.cc` | One-expression `ExpireIfNeeded` gate (`!owner_->ReplicaActiveExpiry()`) (1); the read-path hide in `FindInternal` (2, Task 2.9) | 1, 2 |
+| `src/server/generic_family.cc` | `SortGeneric`'s multi-shard fetch hop and its two `SortStoreNothing` call sites (P7-1 review round, decision 32); the read-path hide in `ScanCb` (2, Task 2.9, decision 33) | 1, 2 |
+| `src/server/hset_family.{h,cc}` | `HSetFamily::GetFieldValue`, the `HGET` read of one field, for `SORT`'s hash-field patterns (P7-1, decision 35) | 1 each |
+| `src/server/set_family.cc` | `OpAdd` adds the string set's count to the intset loop's instead of assigning it, so `SADD` replies the members added when an integer set converts mid-call (P7-1, decision 40, U-22) | 1 |
+| `src/server/main_service.cc` | U-9, U-10 and U-12 null-`conn()` guards (0); U-15 guards in `Quit`, `Monitor`, `Subscribe`, `PSubscribe`, `Watch` (1, review round and re-review); the `SetReplTime` copy beside `SetReplOrigin` in `PrepareTransaction` (2, Task 2.8) | 0, 1, 2 |
+| `src/server/conn_context.h` | `repl_time_ms`, the per-command envelope time beside `repl_origin_idx` (Task 2.8) | 2 |
+| `src/server/dflycmd.cc` | U-15 null-`conn()` guards in `DFLY THREAD` (review round) and `DFLY FLOW` (P7-1 close) | 1 |
+| `src/server/debugcmd.cc` | U-19 null-`conn()` guards in `DebugCmd::Replica` and `DebugCmd::ReplDiag` (P7-1 close) | 1 |
+| `src/server/cluster/cluster_family.cc` | U-15 null-`conn()` guards in emulated `CLUSTER` and `DflyMigrateFlow`; U-21 null-config and parse-error fixes in `DflyMigrateAck` and `DflyMigrate` (P7-1 close) | 1 |
+| `src/server/transaction.cc`, `src/server/multimaster_lww.cc` | Comments only (`:1628-1648` tripwire; `ApplyLwwRewrites` contract); in `transaction.{h,cc}` also `repl_time_ms_`, `SetReplTime` and the `InitTxTime` read of it (Task 2.8) | 2 |
 | `src/server/rdb_load.{h,cc}` | First-read clamp (0); type 64 skip, subexpire/aux handling, counters (4) | 0, 4 |
-| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch) | 1, 2, 3, 4 |
+| `src/server/server_family.cc`, `multi_master.{h,cc}`, `metrics.cc` | INFO fields and gating, peer line, boot warning, Prometheus (incl. the replica-side branch); U-15 guards in `ServerFamily::Client`, `Auth`, `Info`, `Hello`, `ReplConf` (1); U-17, U-18 and U-19 guards in `ReplicaOf`, `AddReplicaOf`, `ReplTakeOver` and `Role` (1, P7-1 close); `replica_stream_clock_lag_ms` in the link block (2, Task 2.9) | 1, 2, 3, 4 |
 | `src/server/CMakeLists.txt` | `classic_replay.cc` in `dragonfly_lib` (`:109-125`); `classic_replay_test` (`:200`, `:202-207`) | 0 |
 | `src/server/dragonfly_test.cc` | `EvalReplicatedApplyNoConnNoCrash`, `ReplicatedApplyDuringTakeoverNoCrash`, `ReplicatedApplyHandlerThrowNoConnNoCrash` | 0 |
 | `tests/dragonfly/keydb_onboarding_test.py` **(new)**, `fake_classic_master.py` **(new)** | KeyDB and fake-master suites | 0-4 |
-| `tests/dragonfly/{instance,conftest,proxy}.py`, `tests/pytest.ini`, `keydb_harness_test.py`, `data/`, `tools/` | Harness, fixtures, marker, captures (delivered by Tasks 0.7, 0.8); request capture (1) | 0, 1 |
+| `tests/dragonfly/{instance,conftest,proxy}.py`, `tests/pytest.ini`, `keydb_harness_test.py`, `data/`, `tools/` | Harness, fixtures, marker, captures (delivered by Tasks 0.7, 0.8); P7-1 adds `KeyDBServer.log_text` to `instance.py` and no `proxy.py` change (request capture is `FakeClassicMaster.requests`) | 0, 1 |
 | `.github/workflows/drakeydb-ci.yml` **(new)** | KeyDB build + suite | 0 |
 | `docs/{PLAN,README,UPSTREAM-SYNC,ISSUE-REGISTER,multi-master,differences,build-from-source}.md` | Close-out, KeyDB recipe, operator docs | 0, 4 |
 
 **Newly exposed to upstream churn:** `replica.{h,cc}` (heaviest), `engine_shard.{h,cc}`,
-`db_slice.cc` (one line), `rdb_load.cc`. All additions are small hooks into the new files.
+`db_slice.cc` (one line, and from Task 2.9 the hide, one more hunk), `generic_family.cc` (the SORT
+hunks of the P7-1 review round, and from Task 2.9 the `ScanCb` hide, one more hunk), `rdb_load.cc`,
+and, from Task 2.8, `transaction.{h,cc}`, `conn_context.h` and `main_service.cc` (a field, a copy
+and a read each); Task 2.9 adds one line to `engine_shard.cc`. All additions are small hooks into
+the new files.
 
 ## Global constraints
 
@@ -1129,9 +1632,10 @@ PLAN.md. The phase exit also records the D-12 release-build measurement (`DRAKEY
 | 5 | **Partial-PSYNC leftover hand-off** (silent loss), the full-sync tail hand-off (Task 0.6) and the FULLRESYNC header overwrite | D-8, D-10; fake master makes the coalesced cases deterministic; repeat x10 |
 | 6 | **Dedup watermark** can evict at 4096 (never an in-flight entry) and is cleared by a flushing full sync | KeyDB shares the exposure; D-5; documented |
 | 7 | **`PeerRegistry` indices are append-only and KeyDB mints a new uuid at every start** (`server.cpp:4082`, not persisted): every restart of a KeyDB master is a new link uuid (one new index, outside the cap), every restart of a forwarding KeyDB a new author; a flapping forwarder eats the cap until drakeydb restarts | `--classic_author_cap` (default 4096, forwarded authors only) with link-idx fallback, counter and warning; `classic_link_uuid_changes` and `multimaster_peer_registry_size` make the growth visible; no reclamation (indices live in journaled entries); documented |
-| 8 | **Expiry split touches `engine_shard.cc`/`db_slice.cc`**, upstream-hot files | ~15 lines + one gate; watchlist rows; eviction provably unreachable on replicas |
+| 8 | **Expiry split touches `engine_shard.cc`/`db_slice.cc`**, upstream-hot files | ~20 lines + one gate expression; watchlist rows; eviction unreachable on replicas (`ReapsExpiredKeysButNeverEvicts`, with its master control) |
 | 9 | **Author-hash divergence** between RDB-aux stamps (sender) and stream stamps (author) on exact mvcc ties | Documented residual |
 | 10 | **Fake master / KeyDB test cost and flakiness** on a 4-core runner | `slow` marker; the release perf bar has fixed bounds and the CI smoke loose ones (D-12); x10 pass rates |
 | 11 | **CI build time** for KeyDB | Cache keyed on the v6.3.4 tag |
 | 12 | **Author-dedup reservation** (C1): a lost `Commit`/`Release` would stall every link that carries that author | `Reserve` waits in 100 ms slices and re-checks `running()`; an RAII reservation in the applier covers every exit of the leaf; `AuthorDedupTest.*` incl. the cancelled waiter; falsified by dropping the wait |
 | 13 | **The release-build perf bar needs a quiet, pinned box**; a shared 4-core container is noisy | cpusets, x3 median, KeyDB-replica comparator; CI and debug run only the smoke; the bar is gated on `DRAKEYDB_PERF=1` |
+| 14 | **The replica expiry window** (decision 24, D-9): a band of `lag + skew` around each expiry in which a command the master ran before the deadline finds no key on the replica; for the TTL-keeping writes the outcome is a **permanent TTL-less orphan** (decision 31: interim in P7-1, ISSUE-REGISTER D-32); envelope-time apply (decisions 27 and 30, Task 2.8) closes it only while the key is still in the table, because the sweep and the client reads keep the replica's clock, and Task 2.9 (decisions 29 and 33) puts the sweep and the client reads, `SCAN`/`KEYS`/`RANDOMKEY` included, on a stream clock | The outcome table in D-9 and `PLAN.md`, pinned by `ReplicaActiveExpiryTest` and the pytests of D-15 (the residual measured by their `-sweep` cases, the orphan by its own pytest); the P7-1 PR description names the orphan; closed in P7-2 by Tasks 2.8 and 2.9, which flip the pins; what stays open (`DFLY EXPIRE` and the insert-time garbage collection on the local clock, a hidden key lingering up to a ping period, 60 s with the link down, the `ADDREPLICAOF` keys on the main link's clock) is in D-9; the operator page in P7-4 |
