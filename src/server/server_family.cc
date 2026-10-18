@@ -1762,7 +1762,7 @@ void ServerFamily::ConfigureMetrics(util::HttpListenerBase* http_base) {
     uint64_t uptime = time(NULL) - start_time_;
     auto metrics = GetMetrics(&namespaces->GetDefaultNamespace(), MetricsCollectOpts{});
     metrics.Print(uptime, service_.mutable_registry(), dfly_cmd_.get(), &resp,
-                  legacy_format_metrics_);
+                  legacy_format_metrics_, peer_registry_.Size());
     return send->Invoke(std::move(resp));
   };
 
@@ -3178,6 +3178,11 @@ string ServerFamily::FormatInfoMetrics(
         // Same gate as its siblings above: the guard can only engage on an active-replica peer
         // link, so this stays exactly 0 -- never printed -- on a non-active node.
         append("multimaster_lww_dropped", m.coordinator_stats.multimaster_lww_dropped);
+        // drakeydb: P7-2 -- the process-wide classic author values, see ClassicProcessWideValues.
+        for (const ClassicCounterValue& value : ClassicProcessWideValues(
+                 ClassicAuthorOverflowTotal(), peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
+          append(value.name, value.value);
+        }
       }
     } else {
       append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
@@ -3211,6 +3216,11 @@ string ServerFamily::FormatInfoMetrics(
       // Special case, when multiple masters replicate to a single replica.
       for (const auto& summary : info.cl_repl_summary) {
         replication_info_cb(summary);
+      }
+      // drakeydb: P7-2 -- once, after the per-link fields: the values are the process's.
+      for (const ClassicCounterValue& value : ClassicProcessWideValues(
+               ClassicAuthorOverflowTotal(), peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
+        append(value.name, value.value);
       }
     }
   };

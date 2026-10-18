@@ -2552,6 +2552,7 @@ CLASSIC_COUNTERS = [
     "keydb_cmds_dropped",
     "classic_unknown_cmds_dropped",
     "classic_apply_errors",
+    "classic_link_uuid_changes",
 ]
 
 
@@ -2670,6 +2671,81 @@ async def test_info_and_metrics_show_classic_counters(
         assert series[name] >= fields[name], (name, series, fields)
 
 
+@pytest.mark.keydb
+async def test_keydb_restart_consumes_one_author_slot(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A reconnect to the same KeyDB is not a new author, but a KeyDB restart is: it mints a new
+    uuid at every start.
+
+    Asserted: after the KeyDB drops its replica connection (`CLIENT KILL TYPE replica`) and the
+    link re-attaches with a second full sync, `master0:node_uuid` is the same,
+    `classic_link_uuid_changes` is still 0 and `multimaster_peer_registry_size` still 2. After each
+    of two KeyDB restarts `node_uuid` has changed, `classic_link_uuid_changes` is the number of
+    restarts, and the append-only peer registry (`multimaster_peer_registry_size`, in INFO and
+    /metrics) has grown by exactly one per restart.
+
+    Falsifying: not keeping the uuid of the previous Greet() across the per-Greet clear leaves
+    classic_link_uuid_changes at 0 after the restarts; bumping on any completed re-Greet (the
+    comparison dropped) makes it 1 after the same-uuid reconnect.
+    """
+    keydb = keydb_server_factory(active_replica=True)
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), active_replica="true")
+    node.start()
+    c = node.client()
+    assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+    await wait_for_peer_link(c)
+
+    async def link_and_size():
+        info = await c.info("replication")
+        series = (await node.metrics())["dragonfly_multimaster_peer_registry_size"]
+        assert [sample.value for sample in series.samples] == [
+            int(info["multimaster_peer_registry_size"])
+        ], (series, info)
+        return info["master0"], int(info["multimaster_peer_registry_size"])
+
+    link, size = await link_and_size()
+    uuid = link["node_uuid"]
+    assert link["classic_link_uuid_changes"] == 0, link
+    assert size == 2, size  # this node, and the KeyDB
+
+    async with keydb.client() as k:
+        full_syncs = (await k.info("stats"))["sync_full"]
+        await k.execute_command("CLIENT", "KILL", "TYPE", "replica")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def reattached_same_uuid():
+            assert (await k.info("stats"))["sync_full"] > full_syncs
+            link, _ = await link_and_size()
+            assert link["link_status"] == "up" and link["sync_in_progress"] == 0, link
+
+        await reattached_same_uuid()
+    link, size = await link_and_size()
+    assert link["node_uuid"] == uuid, link
+    assert link["classic_link_uuid_changes"] == 0, link
+    assert size == 2, size
+
+    for restarts in (1, 2):
+        keydb.stop()
+        keydb.start()
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def reattached():
+            link, _ = await link_and_size()
+            assert link["node_uuid"] != uuid, link
+            assert link["link_status"] == "up" and link["sync_in_progress"] == 0, link
+
+        await reattached()
+        link, size = await link_and_size()
+        uuid = link["node_uuid"]
+        assert link["classic_link_uuid_changes"] == restarts, link
+        assert size == 2 + restarts, size
+        totals = (await node.metrics())["dragonfly_classic_link_uuid_changes"]
+        assert [sample.value for sample in totals.samples] == [restarts], totals
+
+
 async def attach_scripted_master(df_factory, tmp_path, master, peer_mode):
     """A node (a peer node if `peer_mode`) replicating from `master`, with its client."""
     args = {"active_replica": "true"} if peer_mode else {}
@@ -2738,6 +2814,7 @@ async def test_scripted_active_master_exact_classic_counters(
             "keydb_cmds_dropped": 2,
             "classic_unknown_cmds_dropped": 2,
             "classic_apply_errors": 1,
+            "classic_link_uuid_changes": 0,
         }, info
         assert list(classic_fields(info, peer_mode)) == CLASSIC_COUNTERS
         if peer_mode:
@@ -2749,6 +2826,7 @@ async def test_scripted_active_master_exact_classic_counters(
             "keydb_cmds_dropped": 2,
             "classic_unknown_cmds_dropped": 2,
             "classic_apply_errors": 1,
+            "classic_link_uuid_changes": 0,
         }
 
 
@@ -2960,7 +3038,19 @@ async def assert_no_classic_fields(node, c, peer_mode, has_master=True):
     link = info["master0"] if peer_mode else info
     for name in CLASSIC_COUNTERS + ["repl_offset"]:
         assert name not in link, (name, info)
-    assert classic_series(await node.metrics()) == {}
+    metrics = await node.metrics()
+    assert classic_series(metrics) == {}
+    # The two process-wide series: the overflow counter is never shown here, and the registry
+    # gauge only on a node that has a peer link (the registry holds the node and its master).
+    assert "multimaster_keydb_author_overflow" not in info, info
+    assert "dragonfly_multimaster_keydb_author_overflow" not in metrics
+    if not peer_mode:
+        assert "multimaster_peer_registry_size" not in info, info
+        assert "dragonfly_multimaster_peer_registry_size" not in metrics
+    elif has_master:
+        assert int(info["multimaster_peer_registry_size"]) == 2, info
+        gauge = metrics["dragonfly_multimaster_peer_registry_size"]
+        assert [sample.value for sample in gauge.samples] == [2], gauge
     assert not any("rreplay" in name or "classic" in name or "keydb" in name for name in link), link
     if has_master:
         assert list(link)[-1] == ("clock_skew_ms" if peer_mode else "psync_successes"), link

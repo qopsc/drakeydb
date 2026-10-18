@@ -441,6 +441,7 @@ TEST(PeerReplicationInfo, ShowsClassicFieldsOnlyForClassicLinks) {
   keydb.classic.keydb_cmds_dropped = 2;
   keydb.classic.classic_unknown_cmds_dropped = 3;
   keydb.classic.classic_apply_errors = 4;
+  keydb.classic.classic_link_uuid_changes = 5;
 
   // A DFLY peer whose summary holds the same numbers (it cannot, but the fields are not read).
   ReplicaSummary dfly = keydb;
@@ -452,7 +453,8 @@ TEST(PeerReplicationInfo, ShowsClassicFieldsOnlyForClassicLinks) {
       "master0:host=keydb,port=6379,link_status=up,last_io_seconds_ago=1,sync_in_progress=0,"
       "node_uuid=01234567-89ab-4cde-8f01-23456789abcd,clock_skew_ms=0,"
       "rreplay_unwrapped=7,rreplay_malformed=0,rreplay_self_dropped=1,keydb_cmds_dropped=2,"
-      "classic_unknown_cmds_dropped=3,classic_apply_errors=4,repl_offset=1234\r\n"
+      "classic_unknown_cmds_dropped=3,classic_apply_errors=4,classic_link_uuid_changes=5,"
+      "repl_offset=1234\r\n"
       "master1:host=dfly,port=6379,link_status=up,last_io_seconds_ago=1,sync_in_progress=0,"
       "node_uuid=01234567-89ab-4cde-8f01-23456789abcd,clock_skew_ms=0\r\n",
       RenderPeerReplicationInfo({keydb, dfly}, true, true));
@@ -488,7 +490,7 @@ TEST(PeerReplicationInfo, OmitsClassicFieldsWhenMasterNotActiveAndCountersZero) 
   EXPECT_EQ(kHeader + kLine +
                 ",rreplay_unwrapped=0,rreplay_malformed=0,rreplay_self_dropped=0,"
                 "keydb_cmds_dropped=0,classic_unknown_cmds_dropped=0,classic_apply_errors=0,"
-                "repl_offset=0\r\n",
+                "classic_link_uuid_changes=0,repl_offset=0\r\n",
             RenderPeerReplicationInfo({quiet}, false, true));
 }
 

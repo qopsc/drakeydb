@@ -3,6 +3,7 @@
 
 #include "server/classic_replay.h"
 
+#include <absl/container/flat_hash_set.h>
 #include <absl/flags/flag.h>
 #include <absl/strings/ascii.h>
 #include <absl/strings/escaping.h>
@@ -20,9 +21,20 @@
 #include "facade/reply_capture.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
+#include "server/engine_shard_set.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
+#include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/node_identity.h"
+#include "util/fibers/synchronization.h"
+
+ABSL_FLAG(uint32_t, classic_author_cap, 4096,
+          "Upper bound, process-wide, on the distinct authors of RREPLAY envelopes forwarded by "
+          "an active KeyDB (not its own) that get an origin index of their own. Each takes a slot "
+          "of the append-only peer registry for the life of the process; beyond the cap the "
+          "writes of further authors are stamped as the forwarding link's. The link's own uuid "
+          "never counts.");
 
 namespace dfly {
 
@@ -100,6 +112,10 @@ constexpr ClassicCounterDef kClassicCounters[] = {
     {"classic_apply_errors",
      "Commands inside RREPLAY envelopes that did not apply: rejected, or replied an error.",
      &ClassicLinkStats::classic_apply_errors, &ClassicLinkCounts::classic_apply_errors},
+    {"classic_link_uuid_changes",
+     "Completed handshakes of a classic link whose master presented a different uuid than the "
+     "previous one (a KeyDB restart).",
+     &ClassicLinkStats::classic_link_uuid_changes, &ClassicLinkCounts::classic_link_uuid_changes},
 };
 
 // The commands only a KeyDB has (spec D-7), besides `PERSIST key subkey`. KEYDB.MVCCRESTORE is not
@@ -111,6 +127,39 @@ constexpr string_view kKeyDbOnlyCommands[] = {"PEXPIREMEMBERAT", "EXPIREMEMBER",
 
 // Set by NoteActiveKeyDbMaster, never cleared.
 atomic<bool> active_keydb_master_seen{false};
+
+// Resolutions of a forwarded author that --classic_author_cap refused, process-wide.
+atomic<uint64_t> author_overflow{0};
+
+// The forwarded authors counted against --classic_author_cap: process-wide, because the registry
+// slots they take are. A fiber mutex whose critical section never yields.
+class ForwardedAuthors {
+ public:
+  // Whether `uuid` is, or can now become, one of the counted authors.
+  bool Admit(string_view uuid) {
+    util::fb2::LockGuard lk(mu_);
+    if (authors_.contains(uuid))
+      return true;
+    if (authors_.size() >= absl::GetFlag(FLAGS_classic_author_cap))
+      return false;
+    authors_.emplace(uuid);
+    return true;
+  }
+
+  void Clear() {
+    util::fb2::LockGuard lk(mu_);
+    authors_.clear();
+  }
+
+ private:
+  util::fb2::Mutex mu_;
+  absl::flat_hash_set<string> authors_;
+};
+
+ForwardedAuthors& GetForwardedAuthors() {
+  static ForwardedAuthors authors;
+  return authors;
+}
 
 bool AnyCounterMoved(const ClassicLinkCounts& counts) {
   return ranges::any_of(kClassicCounters,
@@ -205,6 +254,11 @@ ClassicLinkStats& ClassicTotals() {
   return totals;
 }
 
+void NoteClassicLinkUuidChange(ClassicLinkStats* link) {
+  link->classic_link_uuid_changes.fetch_add(1, memory_order_relaxed);
+  ClassicTotals().classic_link_uuid_changes.fetch_add(1, memory_order_relaxed);
+}
+
 void NoteActiveKeyDbMaster() {
   active_keydb_master_seen.store(true, memory_order_relaxed);
 }
@@ -228,6 +282,65 @@ vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
   return CounterValues(totals, active_master_seen);
 }
 
+vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t overflow, size_t registry_size,
+                                                     bool active_master_seen) {
+  vector<ClassicCounterValue> out;
+  if (active_master_seen || overflow != 0) {
+    out.push_back({"multimaster_keydb_author_overflow",
+                   "Resolutions of an RREPLAY author forwarded by a KeyDB that "
+                   "--classic_author_cap refused; stamped as the forwarding link's.",
+                   overflow, false});
+  }
+  if (active_master_seen || registry_size > 1) {
+    out.push_back({"multimaster_peer_registry_size",
+                   "Nodes the append-only peer registry holds, this one included.", registry_size,
+                   true});
+  }
+  return out;
+}
+
+uint64_t ClassicAuthorOverflowTotal() {
+  return author_overflow.load(memory_order_relaxed);
+}
+
+void ResetClassicForwardedAuthorsForTest() {
+  GetForwardedAuthors().Clear();
+}
+
+ClassicAuthorMap::ClassicAuthorMap(PeerRegistry* registry, string link_uuid, uint32_t link_idx)
+    : registry_(registry), link_uuid_(std::move(link_uuid)), link_idx_(link_idx) {
+}
+
+uint32_t ClassicAuthorMap::IdxFor(string_view uuid) {
+  if (registry_ == nullptr || uuid == link_uuid_)
+    return link_idx_;
+  if (auto it = resolved_.find(uuid); it != resolved_.end())
+    return it->second;
+
+  // A uuid the registry already holds (another link's own, forwarded to this one) costs no new
+  // slot, so it does not count against the cap.
+  const optional<uint32_t> known = registry_->FindIdx(uuid);
+  if (!known && !GetForwardedAuthors().Admit(uuid)) {
+    author_overflow.fetch_add(1, memory_order_relaxed);
+    LOG_EVERY_T(WARNING, 60) << "More than --classic_author_cap="
+                             << absl::GetFlag(FLAGS_classic_author_cap)
+                             << " distinct authors forwarded by KeyDB masters; the writes of "
+                             << uuid << " and later authors are stamped as the link's ("
+                             << link_uuid_ << "), counted in multimaster_keydb_author_overflow";
+    return link_idx_;
+  }
+
+  const uint32_t idx = known ? *known : registry_->AddOrGet(uuid);
+  // Before anything is stamped with idx: the LWW guard needs its hash on the thread it runs on.
+  // AwaitBrief, like Replica::Greet's registration of the link's own hash: the callback neither
+  // blocks nor needs a shard.
+  const uint64_t hash = NodeUuidHash(uuid);
+  shard_set->pool()->AwaitBrief(
+      [idx, hash](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(idx, hash); });
+  resolved_.emplace(uuid, idx);
+  return idx;
+}
+
 bool ClassicApplier::SkipKeyDbOnly(const facade::RespVec& args) {
   if (!IsKeyDbOnlyCommand(args))
     return false;
@@ -246,13 +359,15 @@ void ClassicApplier::Count(atomic<uint64_t> ClassicLinkStats::*counter, uint64_t
 }
 
 ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string self_uuid,
-                               string link, ClassicLinkStats* stats, function<bool()> running)
+                               string link, ClassicLinkStats* stats, function<bool()> running,
+                               ClassicAuthorMap authors)
     : service_(service),
       cntx_(cntx),
       self_uuid_(std::move(self_uuid)),
       link_(std::move(link)),
       stats_(stats),
       running_(std::move(running)),
+      authors_(std::move(authors)),
       reply_(make_unique<facade::CapturingReplyBuilder>(facade::ReplyMode::ONLY_ERR)) {
 }
 

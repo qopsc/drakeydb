@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -24,6 +26,7 @@ namespace dfly {
 
 class CommandContext;
 class ConnectionContext;
+class PeerRegistry;
 class Service;
 
 // What a classic (Redis-protocol) master said in reply to a `REPLCONF capa ...` command. A stock
@@ -103,6 +106,11 @@ struct ClassicLinkStats {
   // Inner commands that did not apply: the dispatcher rejected them before they ran (wrong arity,
   // out of memory, ...) or they ran and replied an error (WRONGTYPE after a divergence, ...).
   std::atomic<uint64_t> classic_apply_errors{0};
+  // Completed handshakes of the link whose master presented a different uuid than the previous
+  // completed one did: a KeyDB restart (it mints a new uuid at every start), which is a new author
+  // and, on a peer link, Greet()'s admission registers it: one more PeerRegistry slot for the life
+  // of the process.
+  std::atomic<uint64_t> classic_link_uuid_changes{0};
 
   ClassicLinkCounts Snapshot() const;
 };
@@ -114,6 +122,10 @@ struct ClassicLinkStats {
 // INFO or /metrics run on different threads, and a per-thread counter would not follow a link (nor
 // merge for a Replica that is gone).
 ClassicLinkStats& ClassicTotals();
+
+// Counts one `classic_link_uuid_changes` on `link` and on the process-wide totals: Replica::Greet
+// calls it when a completed handshake presents a different master uuid than the one before.
+void NoteClassicLinkUuidChange(ClassicLinkStats* link);
 
 // Records that a master which answered `active-replica` (an active KeyDB) has completed a handshake
 // with this process: Replica::Greet calls it. It is never undone. With a counter's own value it
@@ -130,6 +142,8 @@ struct ClassicCounterValue {
   std::string_view name;
   std::string_view help;
   uint64_t value;
+  // A gauge, not a counter: /metrics keeps its name instead of adding `_total`.
+  bool gauge = false;
 };
 
 // Whether INFO shows the classic fields of `link`, the counters and (on a peer line) repl_offset:
@@ -154,6 +168,57 @@ std::vector<ClassicCounterValue> ClassicLinkFields(const ReplicaSummary& link);
 // unlike ClassicLinkFields (spec D-13, owner decision 25).
 std::vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
                                                     bool active_master_seen);
+
+// The process-wide values beside `multimaster_lww_dropped`, which INFO and /metrics show:
+// `multimaster_keydb_author_overflow` (a counter, ClassicAuthorMap) and the gauge
+// `multimaster_peer_registry_size` (PeerRegistry::Size(): its growth is the append-only cost of
+// every author, spec D-4). Each renders once an active KeyDB master has been seen
+// (`active_master_seen`, ActiveKeyDbMasterSeen() in production) or when it has moved: the counter
+// when nonzero, the gauge when the registry holds more than the local node.
+std::vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t author_overflow,
+                                                          size_t peer_registry_size,
+                                                          bool active_master_seen);
+
+// How many resolutions of a forwarded author --classic_author_cap refused
+// (multimaster_keydb_author_overflow).
+uint64_t ClassicAuthorOverflowTotal();
+
+// Forgets the forwarded authors counted against the cap, for tests: the registry they were
+// registered in belongs to the test, and the set is process-wide. The overflow total is
+// monotonic and stays.
+void ResetClassicForwardedAuthorsForTest();
+
+// Resolves the author of an envelope to the PeerRegistry index its writes are stamped with, one
+// map per link (spec D-4). Single fiber: the link's replication fiber owns it.
+//
+// The link's own uuid maps to the index Greet() registered for it (`link_idx`), and never counts
+// against --classic_author_cap, and neither does another link's own uuid that this link forwards:
+// the registry already holds it, so it takes no new slot. Any other uuid is a forwarded author (a
+// KeyDB mesh forwards what it replays, wrapped in the envelope of its author): it goes through
+// PeerRegistry::AddOrGet, and its hash is registered with MvccStamper on every proactor before
+// IdxFor returns, so the LWW guard finds it. The registry is append-only and journaled entries
+// carry the indices, so a registered author costs a slot for the process lifetime; the cap bounds
+// the distinct forwarded authors, process-wide. Beyond it the link's idx is returned (never
+// kSelfIdx: a foreign author stamped as self would be forwarded to the node's peers), and the
+// caller keeps the envelope's mvcc.
+//
+// A null registry (tests) turns stamping off: every author maps to `link_idx`.
+class ClassicAuthorMap {
+ public:
+  ClassicAuthorMap() = default;
+  ClassicAuthorMap(PeerRegistry* registry, std::string link_uuid, uint32_t link_idx);
+
+  // `uuid` is normalized, as RreplayEnvelope::uuid is.
+  uint32_t IdxFor(std::string_view uuid);
+
+ private:
+  PeerRegistry* registry_ = nullptr;
+  std::string link_uuid_;
+  uint32_t link_idx_ = 0;
+  // Forwarded authors this link has resolved. Overflowed ones are not kept: asking again asks the
+  // cap again, and counts again.
+  absl::flat_hash_map<std::string, uint32_t> resolved_;
+};
 
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
@@ -195,12 +260,19 @@ class ClassicApplier {
   // selected db is the one the envelopes move (see the class comment) and the raw commands of the
   // stream run in. `self_uuid` is this node's normalized uuid, whose envelopes are dropped.
   // `link` names the master in logs. `running` tells whether the link is still running.
+  // `authors` resolves an envelope's author to its origin index; stamping is off unless it was
+  // built with a registry. Nothing calls it for a command yet.
   ClassicApplier(Service* service, ConnectionContext* cntx, std::string self_uuid, std::string link,
-                 ClassicLinkStats* stats, std::function<bool()> running);
+                 ClassicLinkStats* stats, std::function<bool()> running,
+                 ClassicAuthorMap authors = {});
   ~ClassicApplier();
 
   ClassicApplier(const ClassicApplier&) = delete;
   ClassicApplier& operator=(const ClassicApplier&) = delete;
+
+  ClassicAuthorMap& authors() {
+    return authors_;
+  }
 
   // Whether a command of the stream is an envelope (a case-insensitive RREPLAY).
   static bool IsRreplay(const facade::RespExpr& name);
@@ -254,6 +326,7 @@ class ClassicApplier {
   std::string link_;
   ClassicLinkStats* stats_;
   std::function<bool()> running_;
+  ClassicAuthorMap authors_;
 
   // The replies to the envelopes' commands: errors only. `ReplyMode::NONE` records nothing, and
   // the dispatcher consumes the builder's last error itself (InvokeCmd), so a command that failed

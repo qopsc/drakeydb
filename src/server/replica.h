@@ -325,6 +325,11 @@ class Replica : ProtocolClient {
   // (RREPLAY envelopes unwrapped, malformed, self-authored, commands that did not apply).
   ClassicLinkStats classic_stats_;
 
+  // drakeydb: P7-2 -- the uuid of the master of the previous completed Greet() of a classic link.
+  // Greet() clears master_context_.master_node_uuid before the REPLCONF UUID exchange, which wipes
+  // what the new one is compared with, so it is kept here. Same threads as master_active_replica_.
+  std::string last_greeted_master_uuid_;
+
   // drakeydb: P7 -- replication stream bytes already read from the master but not yet applied: what
   // follows a correct classic full sync (InitiatePSync), and the hand-off point for any later
   // phase that over-reads. ConsumeRedisStream parses them before it reads the socket, so they are

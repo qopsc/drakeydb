@@ -113,7 +113,7 @@ void AppendPipelineLatencySummary(string_view name, string_view help, const base
 }  // namespace
 
 void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* dfly_cmd,
-                    util::http::StringResponse* resp, bool legacy) {
+                    util::http::StringResponse* resp, bool legacy, size_t peer_registry_size) {
   bool is_master = ServerState::tlocal()->is_master;
   const Metrics& m = *this;
 
@@ -536,6 +536,18 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
        ClassicTotalSeries(ClassicTotals().Snapshot(), ActiveKeyDbMasterSeen())) {
     AppendMetricWithoutLabels(StrCat(series.name, "_total"), series.help, series.value,
                               MetricType::COUNTER, &resp->body());
+  }
+  // drakeydb: P7-2 -- the process-wide author values: the overflow counter, and the registry size
+  // gauge, which keeps its name.
+  for (const ClassicCounterValue& series : ClassicProcessWideValues(
+           ClassicAuthorOverflowTotal(), peer_registry_size, ActiveKeyDbMasterSeen())) {
+    if (series.gauge) {
+      AppendMetricWithoutLabels(series.name, series.help, series.value, MetricType::GAUGE,
+                                &resp->body());
+    } else {
+      AppendMetricWithoutLabels(StrCat(series.name, "_total"), series.help, series.value,
+                                MetricType::COUNTER, &resp->body());
+    }
   }
 
   AppendMetricWithoutLabels("fiber_switch_total", "", m.fiber_switch_cnt, MetricType::COUNTER,

@@ -14,6 +14,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -27,11 +28,14 @@
 #include "server/engine_shard.h"
 #include "server/engine_shard_set.h"
 #include "server/generic_family.h"
+#include "server/multi_master.h"
+#include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/test_utils.h"
 
 ABSL_DECLARE_FLAG(int32_t, hz);
 ABSL_DECLARE_FLAG(bool, replica_delete_expired);
+ABSL_DECLARE_FLAG(uint32_t, classic_author_cap);
 
 namespace dfly {
 
@@ -501,7 +505,7 @@ TEST(ClassicReplayTest, IsKeyDbOnlyCommandTable) {
 namespace {
 
 ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, uint64_t keydb,
-                         uint64_t unknown, uint64_t errors) {
+                         uint64_t unknown, uint64_t errors, uint64_t uuid_changes = 0) {
   ClassicLinkCounts counts;
   counts.rreplay_unwrapped = unwrapped;
   counts.rreplay_malformed = malformed;
@@ -509,6 +513,7 @@ ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, 
   counts.keydb_cmds_dropped = keydb;
   counts.classic_unknown_cmds_dropped = unknown;
   counts.classic_apply_errors = errors;
+  counts.classic_link_uuid_changes = uuid_changes;
   return counts;
 }
 
@@ -536,16 +541,17 @@ TEST(ClassicReplayTest, ClassicLinkFieldsFollowTheRenderPredicate) {
   using Fields = vector<pair<string, uint64_t>>;
 
   // An active KeyDB master: every counter, in the order of spec D-13, zeros included.
-  ReplicaSummary active = ClassicLink(true, Counts(7, 0, 1, 2, 3, 4));
+  ReplicaSummary active = ClassicLink(true, Counts(7, 0, 1, 2, 3, 4, 5));
   EXPECT_TRUE(ClassicLinkShown(active));
   EXPECT_EQ(NamesAndValues(ClassicLinkFields(active)), (Fields{{"rreplay_unwrapped", 7},
                                                                {"rreplay_malformed", 0},
                                                                {"rreplay_self_dropped", 1},
                                                                {"keydb_cmds_dropped", 2},
                                                                {"classic_unknown_cmds_dropped", 3},
-                                                               {"classic_apply_errors", 4}}));
+                                                               {"classic_apply_errors", 4},
+                                                               {"classic_link_uuid_changes", 5}}));
   EXPECT_EQ(NamesAndValues(ClassicLinkFields(ClassicLink(true, Counts(0, 0, 0, 0, 0, 0)))).size(),
-            6u);
+            7u);
 
   // Any other master with every counter zero: nothing.
   ReplicaSummary stock = ClassicLink(false, Counts(0, 0, 0, 0, 0, 0));
@@ -579,7 +585,7 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
   using Fields = vector<pair<string, uint64_t>>;
 
   EXPECT_TRUE(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), false).empty());
-  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), true)).size(), 6u);
+  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), true)).size(), 7u);
   EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), false)),
             (Fields{{"rreplay_unwrapped", 5}, {"classic_unknown_cmds_dropped", 2}}));
   EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), true)),
@@ -588,7 +594,39 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
                     {"rreplay_self_dropped", 0},
                     {"keydb_cmds_dropped", 0},
                     {"classic_unknown_cmds_dropped", 2},
-                    {"classic_apply_errors", 0}}));
+                    {"classic_apply_errors", 0},
+                    {"classic_link_uuid_changes", 0}}));
+}
+
+TEST(ClassicReplayTest, ClassicProcessWideValuesFollowTheRenderPredicate) {
+  using Values = vector<tuple<string, uint64_t, bool>>;
+  auto shown = [](uint64_t overflow, size_t registry, bool active_seen) {
+    Values out;
+    for (const ClassicCounterValue& value :
+         ClassicProcessWideValues(overflow, registry, active_seen)) {
+      EXPECT_FALSE(value.help.empty()) << value.name;
+      out.emplace_back(string(value.name), value.value, value.gauge);
+    }
+    return out;
+  };
+
+  // Nothing for a node that never met an active KeyDB: a registry of the node itself, no overflow.
+  EXPECT_TRUE(shown(0, 1, false).empty());
+  // Once one has completed a handshake: both, zeros included, the gauge keeping its name.
+  EXPECT_EQ(shown(0, 1, true), (Values{{"multimaster_keydb_author_overflow", 0, false},
+                                       {"multimaster_peer_registry_size", 1, true}}));
+  // Without it, each on its own movement: the counter when nonzero, the gauge past the local node.
+  EXPECT_EQ(shown(3, 1, false), (Values{{"multimaster_keydb_author_overflow", 3, false}}));
+  EXPECT_EQ(shown(0, 5, false), (Values{{"multimaster_peer_registry_size", 5, true}}));
+}
+
+TEST(ClassicReplayTest, NoteClassicLinkUuidChangeFeedsTheLinkAndTheTotals) {
+  const uint64_t before = ClassicTotals().Snapshot().classic_link_uuid_changes;
+  ClassicLinkStats link;
+  NoteClassicLinkUuidChange(&link);
+  NoteClassicLinkUuidChange(&link);
+  EXPECT_EQ(link.Snapshot().classic_link_uuid_changes, 2u);
+  EXPECT_EQ(ClassicTotals().Snapshot().classic_link_uuid_changes - before, 2u);
 }
 
 // The process-wide flag Replica::Greet sets once an active KeyDB master has completed a handshake.
@@ -1695,6 +1733,194 @@ TEST_F(ClassicApplyFamilyTest, ReplicatedWatchLeavesNoRegistrationBehind) {
   EXPECT_EQ(WatchedKeyCount(), 0u);
   EXPECT_EQ(Run({"set", "k", "v"}), "OK");
   EXPECT_EQ(Run({"flushdb"}), "OK");
+}
+
+// ClassicAuthorMap on a registry in a running service: the registrations it makes on every proactor
+// are what the tests read back. The set of authors counted against the cap is process-wide, so each
+// test starts and ends with it empty.
+class ClassicAuthorMapTest : public BaseFamilyTest {
+ protected:
+  static constexpr string_view kLinkUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  static constexpr string_view kAuthorC = "33333333-3333-4333-8333-333333333333";
+  static constexpr string_view kAuthorD = "44444444-4444-4444-8444-444444444444";
+
+  void SetUp() override {
+    BaseFamilyTest::SetUp();
+    ResetClassicForwardedAuthorsForTest();
+  }
+
+  void TearDown() override {
+    ResetClassicForwardedAuthorsForTest();
+    BaseFamilyTest::TearDown();
+  }
+
+  // The registry the node would hold: itself, and the link's master, which Greet() registers.
+  struct Registry {
+    Registry() {
+      registry.Init(kSelfUuid);
+      link_idx = registry.AddOrGet(kLinkUuid);
+    }
+    PeerRegistry registry;
+    uint32_t link_idx = 0;
+  };
+
+  // Runs `body` on a fiber of proactor 0, where the replication fiber would run.
+  template <typename F> void OnFiber(F body) {
+    pp_->at(0)->LaunchFiber(std::move(body)).Join();
+  }
+
+  // What each proactor's MvccStamper holds for `idx`.
+  vector<uint64_t> HashesOf(uint32_t idx) {
+    vector<uint64_t> hashes(pp_->size(), 12345);
+    pp_->AwaitBrief([&](unsigned i, auto*) { hashes[i] = MvccStamper::tlocal()->OriginHash(idx); });
+    return hashes;
+  }
+
+  void SetHashOnEveryProactor(uint32_t idx, uint64_t hash) {
+    pp_->AwaitBrief([&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(idx, hash); });
+  }
+
+  absl::FlagSaver saver_;
+};
+
+TEST_F(ClassicAuthorMapTest, DistinctUuidsGetDistinctIdxAndRegisteredHashOnEveryProactor) {
+  ASSERT_GT(pp_->size(), 1u);
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint32_t a = map.IdxFor(kAuthorA);
+    const uint32_t b = map.IdxFor(kAuthorB);
+
+    for (uint32_t idx : {a, b}) {
+      EXPECT_NE(idx, PeerRegistry::kSelfIdx);
+      EXPECT_NE(idx, node.link_idx);
+    }
+    EXPECT_NE(a, b);
+    EXPECT_EQ(node.registry.GetUuid(a), kAuthorA);
+    EXPECT_EQ(node.registry.GetUuid(b), kAuthorB);
+    EXPECT_EQ(node.registry.Size(), 4u);  // the node, the link's master, the two authors
+
+    // The hash is on every proactor before IdxFor returns, and it is the author's.
+    EXPECT_EQ(HashesOf(a), vector<uint64_t>(pp_->size(), NodeUuidHash(kAuthorA)));
+    EXPECT_EQ(HashesOf(b), vector<uint64_t>(pp_->size(), NodeUuidHash(kAuthorB)));
+    EXPECT_NE(NodeUuidHash(kAuthorA), 0u);
+  });
+}
+
+TEST_F(ClassicAuthorMapTest, LinkUuidMapsToPeerIdx) {
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    EXPECT_EQ(map.IdxFor(kLinkUuid), node.link_idx);
+    EXPECT_NE(node.link_idx, PeerRegistry::kSelfIdx);
+    // Nothing was added to the registry, and nothing registered: Greet() did that for the link.
+    EXPECT_EQ(node.registry.Size(), 2u);
+    EXPECT_EQ(HashesOf(node.link_idx), vector<uint64_t>(pp_->size(), 0));
+  });
+}
+
+TEST_F(ClassicAuthorMapTest, MemoizesPerLink) {
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap first(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint32_t a = first.IdxFor(kAuthorA);
+
+    // A second ask of the same map answers from the map: it registers nothing again. Wiping the
+    // registered hash shows it.
+    SetHashOnEveryProactor(a, 0);
+    EXPECT_EQ(first.IdxFor(kAuthorA), a);
+    EXPECT_EQ(HashesOf(a), vector<uint64_t>(pp_->size(), 0));
+
+    // Another link resolves the same author to the same index (the registry is idempotent) and
+    // registers its hash for itself: the memo is per link.
+    ClassicAuthorMap second(&node.registry, string(kLinkUuid), node.link_idx);
+    EXPECT_EQ(second.IdxFor(kAuthorA), a);
+    EXPECT_EQ(HashesOf(a), vector<uint64_t>(pp_->size(), NodeUuidHash(kAuthorA)));
+    EXPECT_EQ(node.registry.Size(), 3u);
+  });
+}
+
+// An author past the cap is stamped as the link, never as the node itself: kSelfIdx would make the
+// node forward a foreign write to its own peers. The envelope's mvcc is the caller's and is not
+// touched here. Authors already counted keep their own index, in this map and in a fresh one.
+TEST_F(ClassicAuthorMapTest, CapFallsBackToLinkIdxAndCounts) {
+  absl::SetFlag(&FLAGS_classic_author_cap, 2);
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint32_t a = map.IdxFor(kAuthorA);
+    const uint32_t b = map.IdxFor(kAuthorB);
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+    ASSERT_NE(a, node.link_idx);
+    ASSERT_NE(b, node.link_idx);
+
+    EXPECT_EQ(map.IdxFor(kAuthorC), node.link_idx);
+    EXPECT_NE(map.IdxFor(kAuthorC), PeerRegistry::kSelfIdx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 2u);  // once per resolution
+    // Not registered: the registry did not grow, and no proactor learned a hash for it.
+    EXPECT_EQ(node.registry.Size(), 4u);
+    EXPECT_FALSE(node.registry.FindIdx(kAuthorC).has_value());
+
+    // The counted authors are still themselves, here and from another link.
+    EXPECT_EQ(map.IdxFor(kAuthorA), a);
+    ClassicAuthorMap other(&node.registry, string(kLinkUuid), node.link_idx);
+    EXPECT_EQ(other.IdxFor(kAuthorB), b);
+    EXPECT_EQ(other.IdxFor(kAuthorD), node.link_idx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 3u);
+  });
+}
+
+// The cap counts forwarded authors. The link's own uuid maps to its own index however many authors
+// were counted, even with a cap of zero.
+TEST_F(ClassicAuthorMapTest, CapIgnoresLinkUuid) {
+  absl::SetFlag(&FLAGS_classic_author_cap, 0);
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+    EXPECT_EQ(map.IdxFor(kLinkUuid), node.link_idx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+
+    // Cap of one, taken by a forwarded author: the link's uuid still resolves to itself, uncounted.
+    absl::SetFlag(&FLAGS_classic_author_cap, 1);
+    ASSERT_NE(map.IdxFor(kAuthorA), node.link_idx);
+    EXPECT_EQ(map.IdxFor(kLinkUuid), node.link_idx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+    EXPECT_EQ(map.IdxFor(kAuthorB), node.link_idx);  // the cap does hold for the others
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 1u);
+  });
+}
+
+// A mesh: link B's own uuid reaches this link as a forwarded author. The registry holds it already
+// (Greet() of B registered it), so it costs no slot and the cap does not apply to it.
+TEST_F(ClassicAuthorMapTest, AnotherLinksOwnUuidDoesNotConsumeTheCap) {
+  absl::SetFlag(&FLAGS_classic_author_cap, 0);
+  OnFiber([&] {
+    Registry node;
+    const uint32_t other_link_idx = node.registry.AddOrGet(kAuthorA);
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+
+    EXPECT_EQ(map.IdxFor(kAuthorA), other_link_idx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+    EXPECT_EQ(node.registry.Size(), 3u);
+    // Its hash is registered on every proactor all the same.
+    EXPECT_EQ(HashesOf(other_link_idx), vector<uint64_t>(pp_->size(), NodeUuidHash(kAuthorA)));
+    // It took no slot of the cap: a stranger is still refused.
+    EXPECT_EQ(map.IdxFor(kAuthorB), node.link_idx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 1u);
+  });
+}
+
+TEST_F(ClassicAuthorMapTest, NullRegistryTurnsStampingOff) {
+  OnFiber([&] {
+    ClassicAuthorMap map(nullptr, string(kLinkUuid), 7);
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+    EXPECT_EQ(map.IdxFor(kAuthorA), 7u);
+    EXPECT_EQ(map.IdxFor(kLinkUuid), 7u);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+    EXPECT_EQ(ClassicAuthorMap{}.IdxFor(kAuthorB), 0u);
+  });
 }
 
 // A plain replica of an active KeyDB expires keys itself, because that master propagates no DEL for

@@ -157,8 +157,10 @@ struct Metrics {
   // and oldest_pending_send_ts the min.
   void Merge(const Metrics& src);
 
+  // drakeydb: P7-2 -- `peer_registry_size` is PeerRegistry::Size(), which Metrics cannot hold (its
+  // size is static_asserted) and the registry's owner knows.
   void Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* dfly_cmd,
-             util::http::StringResponse* resp, bool legacy);
+             util::http::StringResponse* resp, bool legacy, size_t peer_registry_size);
 };
 
 }  // namespace dfly

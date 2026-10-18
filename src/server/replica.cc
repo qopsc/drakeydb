@@ -680,6 +680,15 @@ error_code Replica::Greet() {
     classic_master_was_active_ = true;
     NoteActiveKeyDbMaster();
   }
+  // drakeydb: P7-2 -- a KeyDB mints a new uuid at every start (spec D-1.16): a different one than
+  // the previous completed handshake presented is a restart, and a new author.
+  if (classic_master_ && !master_context_.master_node_uuid.empty()) {
+    if (!last_greeted_master_uuid_.empty() &&
+        last_greeted_master_uuid_ != master_context_.master_node_uuid) {
+      NoteClassicLinkUuidChange(&classic_stats_);
+    }
+    last_greeted_master_uuid_ = master_context_.master_node_uuid;
+  }
   return error_code{};
 }
 
@@ -1214,9 +1223,11 @@ error_code Replica::ConsumeRedisStream() {
   // on its own, in the envelope's db. It shares conn_context with the raw path, so the db an
   // envelope selects is the one a raw command after it runs in, as for KeyDB's own master client
   // (see ClassicApplier).
-  ClassicApplier classic_applier(&service_, &conn_context, service_.server_family().node_uuid(),
-                                 server().Description(), &classic_stats_,
-                                 [this] { return exec_st_.IsRunning(); });
+  ClassicApplier classic_applier(
+      &service_, &conn_context, service_.server_family().node_uuid(), server().Description(),
+      &classic_stats_, [this] { return exec_st_.IsRunning(); },
+      ClassicAuthorMap(peer_mode_ ? peer_mode_->registry : nullptr,
+                       master_context_.master_node_uuid, peer_origin_idx_));
   ResetParser(RedisParser::Mode::SERVER);
 
   // Master waits for this command in order to start sending replication stream.
