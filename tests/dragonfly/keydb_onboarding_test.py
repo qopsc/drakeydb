@@ -43,10 +43,22 @@ from .utility import assert_eventually, skip_if_not_in_github, wait_available_as
 PRE_STRINGS = {f"pre:{i}": f"v{i}" for i in range(100)}
 
 # DEBUG POPULATE adds BULK_KEYS keys to KeyDB, and its RDB child sleeps RDB_KEY_SAVE_DELAY_US per
-# key (rdb-key-save-delay), so the full sync lasts at least BULK_KEYS * RDB_KEY_SAVE_DELAY_US = 2s:
-# long enough to write into the sync window, whatever the machine's speed.
-BULK_KEYS = 5000
-RDB_KEY_SAVE_DELAY_US = 400
+# key (rdb-key-save-delay) to open a sync window long enough to write into. KeyDB slices that delay
+# into usleep(100) calls (rdb.cpp:1175-1181), so a key costs ceil(delay / 100) sleeps and the sync
+# lasts about (BULK_KEYS + 105 seeded keys) * ceil(delay / 100) * t, t being the host's real
+# usleep(100): ~0.15 ms on a fast-timer host, ~2.2 ms on an arm64 OrbStack VM. With 1 sleep per key
+# and 2000 keys:
+#   fast host:   2105 * 1 * 0.15 ms = ~0.3 s  -> ~100 writes at one per ~3 ms (WRITE_PAUSE_S), >= 20
+#   coarse host: 2105 * 1 * 2.2 ms  = ~4.6 s  -> the 1000-write cap; sync wait stays far below 120 s
+# The two hosts differ 15x, so no single size gives 2-5 s on both; this one gives ~4.6 s on the
+# coarse host and a window with 5x margin on the fast one. (The old 5000 keys * 4 sleeps took ~50 s
+# on the coarse host, longer than the 44 s the waits allowed.)
+BULK_KEYS = 2000
+RDB_KEY_SAVE_DELAY_US = 100
+WRITE_PAUSE_S = 0.002
+
+# Upper bound for a wait that spans a full sync, like wait_available_async's.
+SYNC_WAIT_TIMEOUT_S = 120
 
 # A live write counts as made during the full sync only if KeyDB still reported the sync running
 # after it. A test needs this many of them, so that a sync window that closed early fails the test
@@ -84,6 +96,7 @@ async def write_during_full_sync(k):
         assert "slave0" in await k.info("replication")
 
     await replica_attached()
+    started = time.monotonic()
     live = {}
     in_window = 0
     for i in range(MAX_LIVE_WRITES):
@@ -95,8 +108,11 @@ async def write_during_full_sync(k):
         if slave["state"] == "online":
             break
         in_window += 1
-        await asyncio.sleep(0.01)
-    assert in_window >= MIN_WRITES_IN_SYNC_WINDOW, f"only {in_window} writes inside the sync window"
+        await asyncio.sleep(WRITE_PAUSE_S)
+    assert in_window >= MIN_WRITES_IN_SYNC_WINDOW, (
+        f"the sync took {time.monotonic() - started:.1f} s with {in_window} writes inside its "
+        f"window, need {MIN_WRITES_IN_SYNC_WINDOW}"
+    )
     return live
 
 
@@ -117,7 +133,7 @@ def retry_while_loading(check):
     return wrapper
 
 
-@assert_eventually(times=300)
+@assert_eventually(timeout=SYNC_WAIT_TIMEOUT_S)
 @retry_while_loading
 async def assert_full_sync_arrived(c):
     """Peer mode reports its link up before the full sync's data is visible, so this polls."""
@@ -137,7 +153,7 @@ async def wait_for_peer_link(c):
     before the full sync has begun, and the node is then LOADING for all of it. The assert_* checks
     below poll for the data and retry through that (retry_while_loading)."""
 
-    @assert_eventually(times=300)
+    @assert_eventually(timeout=SYNC_WAIT_TIMEOUT_S)
     async def link_up():
         info = await c.info("replication")
         assert info["connected_masters"] == 1, info
