@@ -306,6 +306,29 @@ Task 2.1: complete (commit `29c0759a`, ledger `a1ca84a1`, clean after 1 fix roun
   waits, duration in the failure message; whole `keydb_onboarding_test.py` **172 passed, 3 skipped, 0
   failed** (370 s) here; the old constants reproduce the peer-mode failure.
 - Task 2.2: dispatched (fresh Sonnet; `task-2.2-brief.md`).
+- Branch pushed to origin as a backup (no PR) after Task 2.1.
+- Task 2.2: implementer DONE (`task-2.2-report.md`; 4 files, +369/−8; `CommandScope` RAII in
+  `ApplyCommand`, stamp set after the unknown check and before `Dispatch`, peer mode = `stamping()` =
+  registry present; `classic_replay_test` 108 → 114; 6 falsifications + the pytest one). Rulings: R6
+  mvcc-0 envelope keeps the author's origin with a local mint (D-4.1 literal); R7 test-name fixture
+  switch accepted unless the reviewer finds a ≤30-line second fixture; R8 reviewer runs the full
+  pytest file. Review dispatched (fresh Opus; `task-2.2-review-brief.md`).
+- Task 2.2: review **Needs fixes** (`task-2.2-review.md`): 0 Critical; I1 second fixture instead of
+  `NeedsPeerNode()` by test name (reviewer probed it: 30 lines, 114/114); I2 "skipped commands never
+  resolve their author" unpinned (EARLY mutant survives); m1–m5 comments, an R6 pin, report wording.
+  Probes (a)–(e) correct; whole `keydb_onboarding_test.py` 173 passed / 3 skipped (R8). Ruling R9: fix
+  all as the reviewer suggests. Fix round 1 dispatched to the same implementer (`task-2.2-fix1.md`).
+- Task 2.2: fix round 1 DONE (report §Fix round 1): `ClassicPeerApplyFamilyTest` fixture, two new tests
+  (`SkippedCommandsNeverResolveTheirAuthor`, EARLY now fails; `PeerEnvelopeWithoutMvccIsALocalMintOfTheAuthor`,
+  falsified), comments; `classic_replay_test` 116; pre-commit clean (host-verified). Scoped re-review
+  dispatched (Opus, same reviewer; also asked for a `--gtest_shuffle` flag-leak check).
+- Task 2.2: re-review **Clean** (EARLY and the reviewer's TOP mutant both caught; `--active_replica` does
+  not leak across suites, shown with seed 2 and a removed-reset control). Notes n1–n3 non-blocking
+  (n1: only the overflow assertion catches the mutants at cap 0; n3: the "why the other tests stay
+  plain" reason lives in this ledger). For 2.3: reservation sits with the stamp after the
+  unknown-command check, keyed on the same innermost (uuid, mvcc); mvcc-0 is never deduped.
+Task 2.2: complete (clean after 1 fix round).
+- Task 2.3: dispatched (fresh Sonnet; `task-2.3-brief.md`).
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
