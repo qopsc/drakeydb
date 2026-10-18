@@ -293,6 +293,19 @@ Planning session 2026-10-17 (Fable 5.1; decisions 42–46). Implementer Sonnet 5
   gtest `AnotherLinksOwnUuidDoesNotConsumeTheCap` (falsified); m1/m2/m3/m5/m6 wording/marker.
   `classic_replay_test` 108, `multi_master_test` 229+1 skip, reviewer's pytest selection 17 passed,
   pre-commit clean (also verified by the orchestrator on the host). Scoped re-review dispatched (Opus).
+- Task 2.1: re-review **Clean** (every finding fixed as ruled; reviewer's own hash-skip mutant caught by
+  2 tests; `CLIENT KILL` reconnect ×5 stable). Notes for 2.2: call `IdxFor` only after the self drop,
+  guard `kSelfIdx`; for P7-3: the restart pytest's `sync_full` wait needs a `+CONTINUE`-aware variant.
+Task 2.1: complete (commit `29c0759a`, ledger `a1ca84a1`, clean after 1 fix round).
+- Sync-window test hardening (R4): dispatched (Sonnet; `task-sync-window-brief.md`), sequenced before
+  Task 2.2 because both edit `keydb_onboarding_test.py`.
+- Side item (c) done by the orchestrator: commit `02e48e1d` (ci.yml `large-tests-arm`, fuzz-pr.yml `fuzz-pr`
+  gated on `repository_owner == 'dragonflydb'`; UPSTREAM-SYNC row). pre-commit clean.
+- Sync-window hardening DONE and committed (`task-sync-window-report.md`): `BULK_KEYS` 2000,
+  `RDB_KEY_SAVE_DELAY_US` 100, `WRITE_PAUSE_S` 0.002, `SYNC_WAIT_TIMEOUT_S` 120 on the two sync-spanning
+  waits, duration in the failure message; whole `keydb_onboarding_test.py` **172 passed, 3 skipped, 0
+  failed** (370 s) here; the old constants reproduce the peer-mode failure.
+- Task 2.2: dispatched (fresh Sonnet; `task-2.2-brief.md`).
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
