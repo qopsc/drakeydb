@@ -329,6 +329,30 @@ Task 2.1: complete (commit `29c0759a`, ledger `a1ca84a1`, clean after 1 fix roun
   unknown-command check, keyed on the same innermost (uuid, mvcc); mvcc-0 is never deduped.
 Task 2.2: complete (clean after 1 fix round).
 - Task 2.3: dispatched (fresh Sonnet; `task-2.3-brief.md`).
+- Task 2.3: implementer DONE (`task-2.3-report.md`; 7 files, +1106/−46; `AuthorDedup::Instance()`,
+  `Reservation` RAII inside `CommandScope`, layer-level `IsApplied` early-out, `Clear()` at the two
+  classic flush sites only; `classic_replay_test` 116 → 134; falsifications (a)–(f) + `Clear()`; mesh
+  pytest under (a) gave 2001 vs 2000 ×5, not 2N: statistical, the gtest is the deterministic proof).
+  Rulings: R10 a rejected leaf advances no layer (D-5 to be amended in Task 2.5); R11 reserve before
+  stamp; R12 reviewer runs the whole pytest file; R13 `Clear()` may erase idle entries. Review
+  dispatched (fresh Opus; `task-2.3-review-brief.md`).
+- Task 2.3: review **Needs fixes** (`task-2.3-review.md`): 0 Critical; I1 R11 (reserve before stamp)
+  unpinned (mutant survives 134/134); I2 "no Clear() on a peer merge" unpinned (mutant survives the
+  whole pytest file); M1–M9 (needless fixture flag, an untested db-select-failure skip, comment
+  accuracy, mvcc-0 Release unpinned, misplaced comment, namespaces, a timing-dependent test, the
+  FreshMvcc trap, hot-path lock cost → gate item). Whole `keydb_onboarding_test.py` **175 passed, 3
+  skipped** (R12). Probes (a)–(h) clean; R10 diverges from KeyDB (its outer advances on a rejected
+  leaf) — Task 2.5's spec amendment says so. Ruling R14: a db-select-failure skip advances no layer
+  (same reasoning as R10). Fix round 1 dispatched to the same implementer (`task-2.3-fix1.md`).
+- Task 2.3: fix round 1 DONE (report §Fix round 1): I1 `ReservedAuthorCostsNoSlotAndNoOverflow` (r11
+  mutant fails, plus two older tests), I2 pytest `test_resync_keeps_author_dedup_on_a_peer_merge_and_
+  resets_it_on_a_flush` (peer_clear → ('2',0); flush-clear removed → (None,1)), M2 `FailedSelectAdvances
+  NoLayer`, M4 mvcc-0 Release pin (first version vacuous, fixed), M7 latch, M8 `1<<40`; 137 gtests;
+  pre-commit clean (host-verified). Scoped re-review dispatched (Opus, same reviewer).
+- Task 2.3: re-review **Clean** (r11 and peer_clear reproduced; M7 latch 400/400 and 200/200 fails under
+  (a); new pytest ×5 stable). Nit N1 (a ruling ID in a test comment) fixed by the orchestrator.
+Task 2.3: complete (clean after 1 fix round).
+- Task 2.4: dispatched (fresh Sonnet; `task-2.4-brief.md`).
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
