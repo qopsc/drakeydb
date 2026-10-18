@@ -421,6 +421,28 @@ row, 25 plan checkboxes ticked, Task 1.6 status, spec D-5 amendment, decisions 4
   release binary rebuilt 18:07Z. perf binary: `/usr/lib/linux-tools/6.8.0-147-generic/perf`.
   **Step 2 (design note) pending**: candidate = do not encode a journal entry for an applied write
   when no consumer is attached, or encode lazily; owner call on the peer bar still open.
+- Task 1.6 Step 2 design note written (`task-1.6-step2-design.md`): the squasher idea is moot (cost
+  is per applied write); options O1 (encode lazily until a consumer ever attached), O2 (cheaper
+  encode), O3 (fused lookup, a P4 follow-up); recommendation: a stated peer ceiling (≥ 70 % of
+  KeyDB's max, no drop, operator doc on `client-output-buffer-limit replica`), O2 then O1 after 2.9,
+  register the residual. **Owner decisions pending**; P7-2 continues meanwhile.
+- Task 2.6: implementer DONE (`task-2.6-report.md`; 7 files + golden vector + capture tool,
+  +761/−28; `classic_replay_test` 148 → 167; whole pytest file 187 passed / 4 skipped; probes (a)–(c)
+  verbatim; falsifications (a)–(f); mesh-merge resync 0.55 s). Rulings: R18 the garbage-bodied
+  valid-footer payload losing the resident key is the documented D-31 residual (no CRC check); R19
+  the plain-fixture deviation accepted. Review dispatched (fresh Opus; `task-2.6-review-brief.md`).
+- Task 2.6: review **Needs fixes** (`task-2.6-review.md`): 0 Critical; I-1 `keydb_mvccrestore_failed`
+  rendered after `classic_apply_errors` instead of D-13's slot after `keydb_cmds_dropped`; I-2 the
+  plain test's `repl_mvcc == 0` read happens after the scope's restore (vacuous; mutant M7 survives);
+  M-1–M-6 comments, the raw path unpinned, README frame order, copies on the burst path, parser
+  leniency. Probes (a)–(h) clean (mesh-merge pytest ×3 stable); R18 confirmed (D-31 already describes
+  it). Ruling R20: fix all. Fix round 1 dispatched to the same implementer (`task-2.6-fix1.md`).
+- Task 2.6: fix round 1 DONE (report §Fix round 1): I-1 counter order per D-13 with the four pins
+  reordered; I-2 dispatch-time `repl_mvcc` capture (M7 now fails exactly that test); M-1–M-6; 167
+  gtests; pre-commit clean (host-verified). Scoped re-review dispatched (Opus, same reviewer).
+- Task 2.6: re-review **Clean** (M7 reproduced against the fixed test; all pins and suites green).
+Task 2.6: complete (clean after 1 fix round).
+- Task 2.7: dispatched (fresh Sonnet; `task-2.7-brief.md`).
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
