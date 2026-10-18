@@ -3,7 +3,7 @@
 > **Continue here.** This is the approved, living plan and canonical copy for the drakeydb fork.
 > Update the status block below as phases land.
 
-## Current status (last updated 2026-10-03)
+## Current status (last updated 2026-10-18)
 
 | Phase | Status | Where |
 |---|---|---|
@@ -14,10 +14,19 @@
 | **P4 — MVCC store + stamping + wire** | ✅ **complete** — P4-0 [#5](https://github.com/darkspadez/drakeydb/pull/5), P4-1 [#6](https://github.com/darkspadez/drakeydb/pull/6), P4-2 [#7](https://github.com/darkspadez/drakeydb/pull/7), P4-3 [#8](https://github.com/darkspadez/drakeydb/pull/8), P4-4 [#9](https://github.com/darkspadez/drakeydb/pull/9) all merged (last: `c60dfdb`, 2026-09-24) | see [Phase 4](#phase-4); P4-4's own exit gate was partial, so the full Phase-4 gate is re-run as P7-0 Task 0.2's baseline |
 | P5 — Streaming LWW guard | ✅ **superseded by P4-4** | see [Phase 5](#phase-5) |
 | P6 — Merge-on-full-sync LWW | ✅ **delivered by P4-3** (PR #8) | see [Phase 6](#phase-6) |
-| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** — P7-0 [#10](https://github.com/darkspadez/drakeydb/pull/10) and P7-1 [#11](https://github.com/darkspadez/drakeydb/pull/11) open (stacked); P7-2..P7-4 pending | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
+| **P7 — KeyDB one-way onboarding** | 🚧 **in progress** — P7-0 [#10](https://github.com/darkspadez/drakeydb/pull/10) and P7-1 [#11](https://github.com/darkspadez/drakeydb/pull/11) **merged** (`0f79bf5a`); P7-2 `feat/phase7-2-author-stamps-dedup-guard` in progress (Tasks 2.1–2.5 done; Task 1.6 reopened by 2.4's peer-mode perf bar); P7-3, P7-4 pending | see [Phase 7](#phase-7) and `docs/superpowers/specs/2026-10-03-phase7-keydb-onboarding-design.md` |
 | P8–P9 | not started | — |
 
-The design spec's planned P4-5 (tombstones) shipped inside P4-3, so there is no separate P4-5.
+The design spec's planned P4-5 (tombstones) shipped inside P4-3 as far as the *wire and merge*
+go; the **tombstone-lifecycle phase** (owner of D-14, D-16, D-20, D-27, D-29) is separate work that
+**resumes from `feat/phase4-5-tombstone-lifecycle` @ `369fb09a`** (63 commits on `c60dfdb0`,
+pushed to origin 2026-10-17 as a backup, no PR), not from scratch. It is paused inside its task
+B15 fix round 5 (ruling R56 of its ledger, `.superpowers/sdd/p4-3-is-done-lets-drifting-duckling/`
+in the P4-5 worktree); remaining: B15 fix 5, B15b, B16, B17, B18, whole-branch review, adversarial
+pass, gate, PR. Scheduled after the upstream sync. At resume: rebase onto `main` (17 files overlap
+with P7-1, incl. `db_slice.cc`, `rdb_load.cc`, `mvcc.h`, `generic_family.cc`; P4-5's `b86f0372` and
+P7-1's `6a28474d` fix the same RDB byte-scan flake, keep one), recheck repl version 69 and
+`RDB_OPCODE_DF_TOMBSTONES_V2 = 230` against what P7 shipped (`kDrakeydbReplVersion` is 68).
 
 **P0 verification record** (Ubuntu 24.04 arm64 container, OrbStack): debug build produces
 `build-dbg/drakeydb` + `dragonfly` compat symlink; `--version` → `drakeydb dev-…`; live server

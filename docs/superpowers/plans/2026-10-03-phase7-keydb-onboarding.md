@@ -165,7 +165,7 @@ settle the U-8 dispute.
   `GEORADIUS*/STORE*` destinations replicated; `geo_family.cc:654` sets `journal_update` and
   `ZSetFamily::OpAdd` hand-journals, `zset_family.cc:1963`, `:2053-2072`). The active-KeyDB
   handshake failure was also reproduced live and recorded in `progress.md`.
-- [ ] Reviewer pass (spec + quality); fix loop. (Done as part of the P7-0 whole-branch review,
+- [x] Reviewer pass (spec + quality); fix loop. (Done as part of the P7-0 whole-branch review,
   below.)
 
 **Falsification:** docs-only; the live U-8 test is its own evidence (ledger `progress.md`).
@@ -458,9 +458,9 @@ Lands before the P7-0 gate so `multi_master_test` is not a flake source.
 
 ### P7-0 gate and PR
 
-- [ ] Whole-branch review (Opus) and an adversarial pass; fix loops.
-- [ ] Run **the gate** (defined under Global Constraints), `KEYDB_REQUIRED=1`.
-- [ ] Open the PR against `main` (CLAUDE.md PR format), subscribe to its activity, drive to
+- [x] Whole-branch review (Opus) and an adversarial pass; fix loops.
+- [x] Run **the gate** (defined under Global Constraints), `KEYDB_REQUIRED=1`.
+- [x] Open the PR against `main` (CLAUDE.md PR format), subscribe to its activity, drive to
   mergeable; upstream `ci.yml` and `drakeydb-ci.yml` green. The owner merges.
 
 ---
@@ -784,8 +784,13 @@ ratio (0.86 against 0.95), and each comparator and floor flip fails its test.
 Run **only if** the **release-build** bar of Task 1.5 fails (or Task 2.4's peer-mode re-run of it).
 A failure of the CI/debug smoke is a bug in the test or the plumbing, not a trigger. Owner decision
 12: "else optimize within P7".
-**Status: not opened.** Task 1.5's release bar passed (`task-1.5-report.md`); Task 2.4's peer-mode
-re-run can still open it.
+**Status: reopened by Task 2.4 (2026-10-18).** Task 1.5's release bar passed (`task-1.5-report.md`)
+in plain mode; Task 2.4's peer-mode re-run **failed**: KeyDB drops the peer replica at its 256 MB
+output buffer at ~720k ops/s (plain mode keeps up at ratio 1.0 on the same box), and it fails the
+same way with the guard off, the rewrites removed and the stamping compiled out, so the cost is
+what a peer node does per applied write regardless of P7-2 (`task-2.4-report.md` Step 5,
+`task-2.4-review.md` R15). Step 1 (measure) is running as `task-1.6-step1-brief.md`; Step 2 needs
+the owner's call on whether a peer node's bar is the plain one.
 **Goal:** Recover throughput by micro-batching same-author, same-shard envelope commands through
 the squasher **with per-command mvcc**.
 **Files:** Modify `src/server/classic_replay.{h,cc}`, `src/server/replica.cc`, and — only after the
@@ -810,8 +815,8 @@ advisor signs the design — `src/server/main_service.cc`, `src/server/multi_com
 
 ### P7-1 gate and PR
 
-- [ ] Whole-branch review, adversarial pass, fix loops. Gate and PR as in P7-0.
-- [ ] The PR description must say, in so many words: (1) until P7-2's dedup lands, a peer attached
+- [x] Whole-branch review, adversarial pass, fix loops. Gate and PR as in P7-0.
+- [x] The PR description must say, in so many words: (1) until P7-2's dedup lands, a peer attached
   to two or more **forwarding** KeyDB masters double-applies deltas (`INCR`, `APPEND`, ...); (2)
   `KEYDB.MVCCRESTORE` (decision 22, applied in Task 2.6 of P7-2) is unhandled until then: it is
   counted and warned as an unknown command, not applied; (3) (decision 31) a plain replica of an
@@ -845,7 +850,7 @@ warns. No reclamation: the registry is append-only and the indices live in journ
 bumps `classic_link_uuid_changes` when the master presents a different one (a KeyDB restart,
 D-1.16). `multimaster_peer_registry_size` is a gauge over `PeerRegistry::Size()`. A null registry
 (tests) means stamping is off.
-- [ ] **Step 1: Failing tests** (`MultiMasterFamilyTest`-style fixture with proactors):
+- [x] **Step 1: Failing tests** (`MultiMasterFamilyTest`-style fixture with proactors):
   `ClassicAuthorMapTest.DistinctUuidsGetDistinctIdxAndRegisteredHashOnEveryProactor`,
   `.LinkUuidMapsToPeerIdx`, `.MemoizesPerLink`, `.CapFallsBackToLinkIdxAndCounts` (one author past
   a small `--classic_author_cap`: the link's idx, never `kSelfIdx`, the envelope mvcc kept, the
@@ -854,12 +859,12 @@ D-1.16). `multimaster_peer_registry_size` is a gauge over `PeerRegistry::Size()`
   restart KeyDB (a new uuid, D-1.16) and wait for the re-attach: `classic_link_uuid_changes == 1` on
   the link, `master0:node_uuid` changed, and `multimaster_peer_registry_size` grew by exactly one
   (and by one more per further restart — the append-only growth of Risk 7).
-- [ ] **Step 2: Run, observe failure. Step 3: Implement.**
-- [ ] **Step 4: Falsify:** skip `RegisterOriginHash`: `OriginHash(idx) == 0` and the hash assertion
+- [x] **Step 2: Run, observe failure. Step 3: Implement.**
+- [x] **Step 4: Falsify:** skip `RegisterOriginHash`: `OriginHash(idx) == 0` and the hash assertion
   fails; remove the cap: the overflow test fails; count link uuids against the cap:
   `CapIgnoresLinkUuid` fails; stamp the overflow with `kSelfIdx`: `CapFallsBackToLinkIdxAndCounts`
   fails. Restore, record.
-- [ ] **Step 5:** pre-commit; commit `feat: map classic RREPLAY authors to registered origins (P7)`.
+- [x] **Step 5:** pre-commit; commit `feat: map classic RREPLAY authors to registered origins (P7)`.
 
 **Done:** every proactor resolves each registered author's hash; the cap holds; the registry's
 growth is visible.
@@ -869,7 +874,7 @@ growth is visible.
 **Goal:** Peer-mode classic commands carry `{envelope mvcc, author hash}`; plain replicas do not.
 **Files:** Modify `src/server/classic_replay.cc`, `src/server/replica.cc`; Test
 `src/server/classic_replay_test.cc`, `tests/dragonfly/keydb_onboarding_test.py`.
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   `ClassicApplyFamilyTest.PeerEnvelopeStampsKeyWithEnvelopeMvccAndAuthorHash` (peer-mode applier,
   `--active_replica` fixture like `MvccStoreTest`, `StampOf(key)` equals
   `{envelope mvcc, NodeUuidHash(author)}`), `.NestedEnvelopeStampsWithInnerAuthor`,
@@ -878,11 +883,11 @@ growth is visible.
   (`DEBUG MVCC <key>`, `debugcmd.cc:793`): keys written on KeyDB A and B show different `origin:`
   values, same-author keys the same, and the origin differs from drakeydb's own; a key written on A
   arriving through B's nested envelope shows A's origin, not B's.
-- [ ] **Step 2: Run, observe failure. Step 3: Implement** spec D-4 (peer mode only; set before
+- [x] **Step 2: Run, observe failure. Step 3: Implement** spec D-4 (peer mode only; set before
   dispatch, restore after; author = innermost envelope).
-- [ ] **Step 4: Falsify:** do not set `repl_mvcc` (the stamp is a local mint, not the envelope's);
+- [x] **Step 4: Falsify:** do not set `repl_mvcc` (the stamp is a local mint, not the envelope's);
   stamp with the link origin (the nested-author assertion fails). Restore, record.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `feat: stamp classic-applied writes with the envelope mvcc and author (P7)`.
 
 **Done:** `DEBUG MVCC` shows KeyDB-authored stamps; no foreign write is forwarded
@@ -907,7 +912,7 @@ outermost envelope, and a leaf `Reserve` may still return `kCancelled` afterward
 dbs already selected (spec D-5: harmless, the resumed envelope selects them again);
 `Commit`/`Advance` happen **before** `repl_offs_ +=`;
 `ERROR`/`OOM` is `Release` plus `classic_apply_errors` and still consumed.
-- [ ] **Step 1: Failing tests.** `AuthorDedupTest.*` (two fibers on `pp_->at(0)` / `pp_->at(1)`):
+- [x] **Step 1: Failing tests.** `AuthorDedupTest.*` (two fibers on `pp_->at(0)` / `pp_->at(1)`):
   `ConcurrentSameEnvelopeAppliesOnce` (the dispatch stub sleeps 10 ms before `Commit`: exactly one
   `kApply`, the other `kDrop`), `ReleaseLetsSecondLinkApply`, `CancelledWaiterReturnsNotConsumed`
   (`running()` flips while a second link waits: `kCancelled`), `MvccZeroNeverDedupedNeverAdvances`,
@@ -937,11 +942,11 @@ dbs already selected (spec D-5: harmless, the resumed envelope selects them agai
   sync); resume the proxy, so C2 receives the N increments and forwards them nested to D:
   **`c == N`** (without the `Clear()` D's watermark for C1 still holds the old link's mvcc and
   drops them, `c == N - k`).
-- [ ] **Step 2: Run, observe failure** (value 2N; the master-switch test ends below N).
+- [x] **Step 2: Run, observe failure** (value 2N; the master-switch test ends below N).
   **Step 3: Implement**; wire the counter `multimaster_rreplay_deduped` by spec D-13's rendering
   rule; call `Clear()` right after `FlushAll` (`replica.cc:771`) and `FlushSlots` (`:769`) in
   `InitiatePSync`, and neither on a peer merge sync nor on `+CONTINUE`.
-- [ ] **Step 4: Falsify**, one at a time, restore and record: (a) the old check-only shape —
+- [x] **Step 4: Falsify**, one at a time, restore and record: (a) the old check-only shape —
   `Reserve` reads `applied` but never sets `inflight` and never waits (`ShouldDrop`, dispatch,
   `Advance`): `ConcurrentSameEnvelopeAppliesOnce` sees two `kApply` (the deterministic proof) and
   the pytest mesh test ends in (N, 2N] (statistical: record the values over 5 runs, and if it does
@@ -951,7 +956,7 @@ dbs already selected (spec D-5: harmless, the resumed envelope selects them agai
   until after the return: `ReplayAfterCommitBeforeCountIsDeduped` fails; (e) skip `Clear()`: the
   master-switch pytest ends at `N - k` and `ClearResetsAppliedKeepsInflight` fails; (f) disable
   dedup entirely: the mesh test sees 2N.
-- [ ] **Step 5:** pre-commit; commit
+- [x] **Step 5:** pre-commit; commit
   `feat: dedup RREPLAY envelopes per author across classic links (P7)`.
 
 **Done:** exactly-N under forwarding and under simultaneous delivery; the counter moves; a master
@@ -990,7 +995,7 @@ more than 60 s from the local clock, a stream more than 60 s behind) and on a pe
 changed here: keeping `XX KEEPTTL` whole on plain links would need a link-kind parameter on
 `ClassicApplyRewrites` and a second column in its table, for a case the next tasks close, and a
 peer link needs the strip for the guard; revisit if the review asks.
-- [ ] **Step 1: Failing tests.** `ClassicReplayTest.ClassicApplyRewrites*` (table-driven, incl. `NX
+- [x] **Step 1: Failing tests.** `ClassicReplayTest.ClassicApplyRewrites*` (table-driven, incl. `NX
   KEEPTTL`, `XX KEEPTTL`, `NX GET`, lower case, `MSETNX`; non-SET and unrelated args untouched);
   `ClassicApplyFamilyTest.StaleKeyDbSetLosesToNewerLocalWrite`, `.NxSetAppliesAsGuardedSet`,
   `.MsetnxAppliesAsGuardedMset`, `.PlainApplierRewritesConditionalSet` (a plain link: `SET k v NX`
@@ -1010,22 +1015,22 @@ peer link needs the strip for the guard; revisit if the review asks.
   after N `INCR`s on KeyDB each node holds exactly N, and `assert_no_command_storm`
   (`multimaster_test.py:1407`) passes. (A plain sub-replica of the first node would make the
   `kSelfIdx` falsification vacuous: it receives the journal either way.)
-- [ ] **Step 2: Run, observe failure** (stale KeyDB write overwrites; NX is skipped).
-- [ ] **Step 3: Implement.** Rewrite the `RunSquashedMultiCb` comment (`transaction.cc:1628-1648`),
+- [x] **Step 2: Run, observe failure** (stale KeyDB write overwrites; NX is skipped).
+- [x] **Step 3: Implement.** Rewrite the `RunSquashedMultiCb` comment (`transaction.cc:1628-1648`),
   the `ApplyLwwRewrites` contract comment and `docs/multi-master.md:311-381`: classic links are now
   guarded when they carry a real envelope mvcc; raw classic commands (mvcc 0) stay unguarded and
   `EVAL` is stamped but unguarded.
-- [ ] **Step 4: Falsify:** guard bit off (the stale write wins); remove `ClassicApplyRewrites` (the
+- [x] **Step 4: Falsify:** guard bit off (the stale write wins); remove `ClassicApplyRewrites` (the
   NX test fails because NX evaluates against the stale local key); gate the rewrites on
   `LwwGuardActive` (`test_plain_replica_conditional_set_applies_despite_expiry_skew` and
   `.PlainApplierRewritesConditionalSet` fail); keep `KEEPTTL` under `NX` (the table's KEEPTTL rows
   fail); dispatch `EVAL` with the guard on (the tripwire fires) or with `repl_mvcc = 0` (the stamp
   assertion fails); stamp classic authors with `kSelfIdx` (the not-forwarded test sees 2N).
   Restore, record.
-- [ ] **Step 5: Peer-mode perf re-run:** parametrize Task 1.5's test over peer mode (per-link
+- [x] **Step 5: Peer-mode perf re-run:** parametrize Task 1.5's test over peer mode (per-link
   `repl_offset=` makes lag observable); record the release-build numbers. A failing peer-mode
   **release** bar re-opens Task 1.6.
-- [ ] **Step 6:** pre-commit; commit
+- [x] **Step 6:** pre-commit; commit
   `feat: LWW-guard KeyDB writes on classic peer links, rewrite conditionals (P7)`.
 
 **Done:** stale KeyDB writes lose, fresh ones win, "which value survived" is asserted; conditional
@@ -1034,7 +1039,7 @@ commands replay as their effect on plain links too.
 ### Task 2.5: Close ISSUE-REGISTER D-1
 
 **Files:** `docs/ISSUE-REGISTER.md`, `docs/PLAN.md`.
-- [ ] Mark D-1 ("No mvcc half for Redis-protocol / KeyDB peer links") resolved by Tasks 2.1-2.4,
+- [x] Mark D-1 ("No mvcc half for Redis-protocol / KeyDB peer links") resolved by Tasks 2.1-2.4,
   stating what remains (RDB-aux stamps carry the sender's origin hash; raw Redis links stay
   unstamped). Commit `docs: close D-1 now that KeyDB writes carry real stamps (P7)`.
 

@@ -930,14 +930,26 @@ reply is the only change, no journal or RDB byte moves.
 
 ## Part 2 — drakeydb deferred work
 
-### D-1. No mvcc half for Redis-protocol / KeyDB peer links (P7)
+### D-1. No mvcc half for Redis-protocol / KeyDB peer links -- resolved (P7-2)
 
 `serializer.cc` writes `mvcc` only under `extended_framing_`, i.e. `IsActiveReplica()`, and the
 plain-Redis wire has no slot for it. Genuinely needs a wire mechanism that does not exist; the
 design spec assigns it to P7. The `origin_hash` half **is** implemented. Never tested
 end-to-end — three separate agents independently said so.
 
-**Owner:** P7. **From:** P4-1.
+**Resolved by P7-2 Tasks 2.1-2.4** (`classic_replay.{h,cc}`): the wire mechanism is KeyDB's own
+RREPLAY envelope. On a peer-mode link every dispatched envelope command runs with `repl_mvcc` = the
+innermost envelope's mvcc and `repl_origin_idx` = the index `ClassicAuthorMap` registers for the
+innermost envelope's author uuid (its hash registered on every proactor before the dispatch), so a
+KeyDB-authored key carries `{KeyDB mvcc, author hash}` in `DEBUG MVCC`, the streaming LWW guard
+compares it like a DFLY peer's, and `PassesPeerEchoFilter` refuses to forward it. What remains:
+a **raw** classic command (a stock Redis master, or a non-active KeyDB) still has mvcc 0 and a
+local mint; a plain replica stamps nothing (it has no side table); an RDB-aux `mvcc-tstamp` stamp
+carries the sender's hash, not the author's (D-7a); an author past `--classic_author_cap` keeps
+its mvcc but takes the forwarding link's origin. Tests: `ClassicPeerApplyFamilyTest.*`,
+`test_keydb_write_stamped_with_author_hash`, `test_keydb_lww_concurrent_set_converges`.
+
+**Owner:** none (resolved). **From:** P4-1.
 
 ### D-4. `origin_hash` residual on an expiry-swept sibling key -- resolved
 

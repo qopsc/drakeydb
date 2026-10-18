@@ -615,6 +615,20 @@ drop, an unknown-command drop, a rejected or type-64 `KEYDB.MVCCRESTORE`) are co
 or self-authored envelope; a malformed inner of a nested envelope does not advance itself but its
 outer still does (D-3.6).
 
+**Amendment (P7-2 Task 2.3, rulings R10 and R14).** A leaf the dispatcher **rejected before it ran**
+(wrong arity, OOM, or a command that reported OOM) advances **no layer**, its enclosing ones
+included, and so does a leaf skipped because its layer's db **could not be selected**. Reason: an
+advanced outer would make `B(A(m))` hit B's `IsApplied` early-out on the other link that carries it,
+and the rejected `A(m)` would never get the retry the "replayed by another link still applies once"
+sentence above promises. This **diverges from KeyDB**, whose outer layer advances whenever its inner
+`RREPLAY` was called, a rejected leaf included (`replication.cpp:5476-5493`, `fExec` from
+`commandsExecuted`): the divergence only delays an author's watermark until its next envelope, and
+buys the retry. Pinned by `RejectedDispatchCountsBytesDoesNotAdvance` and `FailedSelectAdvancesNoLayer`.
+Also as built: the layer-level `IsApplied` early-out drops the whole layer, inner included, before
+the inner is parsed (KeyDB does the same, `replication.cpp:5456-5461`); the reservation is taken
+**before** the author is resolved, so a dropped or cancelled duplicate costs no registry slot and no
+`multimaster_keydb_author_overflow` count (R11); `Clear()` erases idle entries outright (R13).
+
 **Cancellation and offsets (I1).** There are two not-consumed outcomes, both before the first
 command of the envelope is dispatched: `running()` being false before the outermost envelope's
 first touch of the context (D-3.2), checked **once** per outermost envelope; and a leaf `Reserve`
