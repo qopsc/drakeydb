@@ -208,8 +208,15 @@ class ClassicAuthorMap {
   ClassicAuthorMap() = default;
   ClassicAuthorMap(PeerRegistry* registry, std::string link_uuid, uint32_t link_idx);
 
-  // `uuid` is normalized, as RreplayEnvelope::uuid is.
+  // `uuid` is normalized, as RreplayEnvelope::uuid is. Never `self_uuid`: ClassicApplier drops
+  // this node's own envelopes before it asks, and this node's own index is not an answer here
+  // (with a registry, kSelfIdx is never returned; the link's idx stands in for it).
   uint32_t IdxFor(std::string_view uuid);
+
+  // Whether writes are stamped at all: false without a registry (a plain replica, and tests).
+  bool stamping() const {
+    return registry_ != nullptr;
+  }
 
  private:
   PeerRegistry* registry_ = nullptr;
@@ -261,7 +268,9 @@ class ClassicApplier {
   // stream run in. `self_uuid` is this node's normalized uuid, whose envelopes are dropped.
   // `link` names the master in logs. `running` tells whether the link is still running.
   // `authors` resolves an envelope's author to its origin index; stamping is off unless it was
-  // built with a registry. Nothing calls it for a command yet.
+  // built with a registry (a peer-mode link, see ClassicAuthorMap): then each dispatched command
+  // runs with the mvcc of its innermost envelope and that envelope's author as the origin
+  // (spec D-4). The link's origin index is the one `cntx` holds when the applier is built.
   ClassicApplier(Service* service, ConnectionContext* cntx, std::string self_uuid, std::string link,
                  ClassicLinkStats* stats, std::function<bool()> running,
                  ClassicAuthorMap authors = {});
@@ -302,8 +311,9 @@ class ClassicApplier {
 
   // Runs the unwrapped command, `args[0]` of which is a string, in the db the context has
   // selected. Control commands and KeyDB-only ones are skipped, and so is a command this server
-  // has none for (counted, and not dispatched into the error builder).
-  void ApplyCommand(const facade::RespVec& args);
+  // has none for (counted, and not dispatched into the error builder). `author` (normalized) and
+  // `mvcc` belong to the innermost envelope, the one the command came out of.
+  void ApplyCommand(const facade::RespVec& args, std::string_view author, uint64_t mvcc);
 
   // Dispatches the already filled `cmd` and returns the text of its failure, if it failed: the
   // dispatcher rejected it, or it replied an error.
@@ -327,6 +337,11 @@ class ClassicApplier {
   ClassicLinkStats* stats_;
   std::function<bool()> running_;
   ClassicAuthorMap authors_;
+  // What the context's repl_origin_idx was when the applier was built (the link's own origin,
+  // set by ConsumeRedisStream): where ApplyCommand's scope puts it back. In production it equals
+  // ClassicAuthorMap's link idx (both are peer_origin_idx_); it is read from the context because a
+  // default map, a plain link's, has no link idx.
+  uint32_t link_origin_idx_;
 
   // The replies to the envelopes' commands: errors only. `ReplyMode::NONE` records nothing, and
   // the dispatcher consumes the builder's last error itself (InvokeCmd), so a command that failed

@@ -287,8 +287,8 @@ vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t overflow, size_t r
   vector<ClassicCounterValue> out;
   if (active_master_seen || overflow != 0) {
     out.push_back({"multimaster_keydb_author_overflow",
-                   "Resolutions of an RREPLAY author forwarded by a KeyDB that "
-                   "--classic_author_cap refused; stamped as the forwarding link's.",
+                   "Envelopes whose forwarded author --classic_author_cap refused, one per "
+                   "dispatched command; their writes are stamped as the forwarding link's.",
                    overflow, false});
   }
   if (active_master_seen || registry_size > 1) {
@@ -320,6 +320,10 @@ uint32_t ClassicAuthorMap::IdxFor(string_view uuid) {
   // A uuid the registry already holds (another link's own, forwarded to this one) costs no new
   // slot, so it does not count against the cap.
   const optional<uint32_t> known = registry_->FindIdx(uuid);
+  // This node's own uuid is known, at kSelfIdx. A foreign write stamped as self would be forwarded
+  // to the node's peers: the caller never asks, and if it did the link's idx stands in.
+  if (known == PeerRegistry::kSelfIdx)
+    return link_idx_;
   if (!known && !GetForwardedAuthors().Admit(uuid)) {
     author_overflow.fetch_add(1, memory_order_relaxed);
     LOG_EVERY_T(WARNING, 60) << "More than --classic_author_cap="
@@ -368,6 +372,7 @@ ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string
       stats_(stats),
       running_(std::move(running)),
       authors_(std::move(authors)),
+      link_origin_idx_(cntx->repl_origin_idx),
       reply_(make_unique<facade::CapturingReplyBuilder>(facade::ReplyMode::ONLY_ERR)) {
 }
 
@@ -431,7 +436,7 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
 
     if (!IsRreplay(inner_args[0])) {
       if (db_selected)
-        ApplyCommand(inner_args);
+        ApplyCommand(inner_args, env.uuid, env.mvcc);
       break;
     }
     current = &inner_args;
@@ -460,10 +465,43 @@ bool ClassicApplier::ParseSingleCommand(string_view bytes, facade::RespVec* args
   return args->front().type == facade::RespExpr::STRING;
 }
 
-void ClassicApplier::ApplyCommand(const facade::RespVec& args) {
+namespace {
+
+// Sets `repl_mvcc` and `repl_origin_idx` on the stream's apply context for one dispatch, and on
+// every exit after it is built puts back the link's values (mvcc 0, the link's origin), which the
+// raw commands of the stream run with.
+class CommandScope {
+ public:
+  CommandScope(ConnectionContext* cntx, uint32_t link_origin_idx)
+      : cntx_(cntx), link_origin_idx_(link_origin_idx) {
+  }
+  ~CommandScope() {
+    cntx_->repl_mvcc = 0;
+    cntx_->repl_origin_idx = link_origin_idx_;
+  }
+
+  CommandScope(const CommandScope&) = delete;
+  CommandScope& operator=(const CommandScope&) = delete;
+
+  // The command that is about to be dispatched is authored at `origin_idx` and carries `mvcc`.
+  void Stamp(uint64_t mvcc, uint32_t origin_idx) {
+    cntx_->repl_mvcc = mvcc;
+    cntx_->repl_origin_idx = origin_idx;
+  }
+
+ private:
+  ConnectionContext* cntx_;
+  uint32_t link_origin_idx_;
+};
+
+}  // namespace
+
+void ClassicApplier::ApplyCommand(const facade::RespVec& args, string_view author, uint64_t mvcc) {
   const string_view name = args[0].GetView();
   if (IsControlCommand(name) || SkipKeyDbOnly(args))
     return;
+
+  CommandScope scope(cntx_, link_origin_idx_);
 
   CommandContext cmd;
   cmd.Init(reply_.get(), cntx_);
@@ -480,6 +518,11 @@ void ClassicApplier::ApplyCommand(const facade::RespVec& args) {
                              << "; the drops are counted in classic_unknown_cmds_dropped";
     return;
   }
+  // Only a command that is dispatched resolves its author (a skipped one costs no registry slot),
+  // so the cap counts dispatched commands. `author` is never this node's own: HandleRreplay dropped
+  // those.
+  if (authors_.stamping())
+    scope.Stamp(mvcc, authors_.IdxFor(author));
   if (optional<string> error = Dispatch(&cmd); error)
     NoteApplyError(name, *error);
 }

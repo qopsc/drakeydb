@@ -2762,6 +2762,74 @@ async def test_keydb_restart_consumes_one_author_slot(
         assert [sample.value for sample in totals.samples] == [restarts], totals
 
 
+def mvcc_origin(reply):
+    """The `origin:` hash of a `DEBUG MVCC <key>` reply (`state:value mvcc:.. origin:<hex16> ..`)."""
+    match = re.search(r"\borigin:([0-9a-f]{16})\b", reply)
+    assert match, reply
+    return match.group(1)
+
+
+@pytest.mark.keydb
+async def test_keydb_write_stamped_with_author_hash(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A peer node stamps what a KeyDB streams with the hash of the node that wrote it, not of the
+    node it came from: KeyDB B is written to, KeyDB A replicates from B and forwards what it replays
+    (so B's writes reach the peer as an RREPLAY of A that holds B's own), and the peer node attaches
+    to A. `DEBUG MVCC` shows B's origin on B's keys (two of them, one origin) arriving nested through
+    A, A's on A's own, and neither is the peer node's own, which its client write shows.
+
+    Falsifying: stamping with the link's origin (the forwarder's) gives B's keys A's origin; not
+    setting the envelope's mvcc on the context makes the stamp a local mint, which the origin of a
+    foreign author would not have (the unit tests pin the mvcc: ClassicApplyFamilyTest).
+    """
+    flags = dict(active_replica=True, multi_master=True, no_forward=False)
+    b = keydb_server_factory(**flags)
+    a = keydb_server_factory(**flags)
+
+    async with a.client() as ka, b.client() as kb:
+        await ka.execute_command("REPLICAOF", "localhost", b.port)
+
+        @assert_eventually(times=300)
+        async def a_synced_from_b():
+            assert (await ka.info("replication"))["master_link_status"] == "up"
+
+        await a_synced_from_b()
+
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), active_replica="true"
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF localhost {a.port}") == "OK"
+        await wait_for_peer_link(c)
+
+        await kb.set("from:b1", "v")
+        await kb.set("from:b2", "v")
+        await ka.set("from:a1", "w")
+        await ka.set("from:a2", "w")
+        await c.set("own", "x")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def arrived():
+            for key in ("from:b1", "from:b2", "from:a1", "from:a2"):
+                assert await c.exists(key) == 1, key
+
+        await arrived()
+
+        async def origin(key):
+            return mvcc_origin(await c.execute_command("DEBUG", "MVCC", key))
+
+        from_b = {await origin("from:b1"), await origin("from:b2")}
+        from_a = {await origin("from:a1"), await origin("from:a2")}
+        own = await origin("own")
+        assert len(from_b) == 1, from_b  # one author, one origin, nested or not
+        assert len(from_a) == 1, from_a
+        assert from_b != from_a, (from_b, from_a)  # B's writes carry B's hash, not the forwarder's
+        assert own not in from_b | from_a, (own, from_b, from_a)
+
+
 async def attach_scripted_master(df_factory, tmp_path, master, peer_mode):
     """A node (a peer node if `peer_mode`) replicating from `master`, with its client."""
     args = {"active_replica": "true"} if peer_mode else {}

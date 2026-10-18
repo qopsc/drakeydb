@@ -33,6 +33,7 @@
 #include "server/namespaces.h"
 #include "server/test_utils.h"
 
+ABSL_DECLARE_FLAG(bool, active_replica);
 ABSL_DECLARE_FLAG(int32_t, hz);
 ABSL_DECLARE_FLAG(bool, replica_delete_expired);
 ABSL_DECLARE_FLAG(uint32_t, classic_author_cap);
@@ -665,6 +666,17 @@ string Nest(unsigned levels, string_view command, string_view db = "0") {
 // apply. It dispatches on a proactor thread's fiber, as the replication fiber does.
 class ClassicApplyFamilyTest : public BaseFamilyTest {
  protected:
+  void SetUp() override {
+    BaseFamilyTest::SetUp();
+    ResetClassicForwardedAuthorsForTest();
+  }
+
+  void TearDown() override {
+    ResetClassicForwardedAuthorsForTest();
+    BaseFamilyTest::TearDown();
+    absl::SetFlag(&FLAGS_active_replica, false);
+  }
+
   struct Link {
     Link(Service* service, function<bool()> running)
         : cntx(nullptr, acl::UserCredentials{}),
@@ -765,6 +777,93 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
       }
     });
     return count;
+  }
+};
+
+// The same applier on a peer node. --active_replica is boot-only (DbTable reads it at
+// construction), and the stamp tests read the mvcc side table.
+class ClassicPeerApplyFamilyTest : public ClassicApplyFamilyTest {
+ protected:
+  void SetUp() override {
+    absl::SetFlag(&FLAGS_active_replica, true);
+    ClassicApplyFamilyTest::SetUp();
+  }
+
+  static constexpr string_view kLinkUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  // KeyDB's `ms << 20 | counter`: the envelope's stamp, far from what a local mint gives.
+  static constexpr uint64_t kMvccA = (uint64_t{1700000000000} << 20) | 5;
+  static constexpr uint64_t kMvccB = (uint64_t{1700000000100} << 20) | 9;
+
+  // A peer-mode link: the apply context carries the link's origin index (as ConsumeRedisStream
+  // sets it) before the applier is built, and the applier stamps through a registry.
+  struct PeerLink {
+    PeerLink(Service* service, PeerRegistry* registry, uint32_t link_idx)
+        : cntx(nullptr, acl::UserCredentials{}), link_idx(link_idx) {
+      cntx.is_replicating = true;
+      cntx.journal_emulated = true;
+      cntx.skip_acl_validation = true;
+      cntx.ns = &namespaces->GetDefaultNamespace();
+      cntx.repl_origin_idx = link_idx;
+      applier = make_unique<ClassicApplier>(
+          service, &cntx, string(kSelfUuid), "test-master:1", &stats, [] { return true; },
+          ClassicAuthorMap(registry, string(kLinkUuid), link_idx));
+    }
+
+    EnvelopeResult Apply(string_view wire) {
+      Wire parsed = Wire::FromBytes(wire);
+      return applier->HandleRreplay(parsed.args);
+    }
+
+    uint64_t unwrapped() const {
+      return stats.rreplay_unwrapped.load();
+    }
+    uint64_t apply_errors() const {
+      return stats.classic_apply_errors.load();
+    }
+    uint64_t keydb_dropped() const {
+      return stats.keydb_cmds_dropped.load();
+    }
+    uint64_t unknown_dropped() const {
+      return stats.classic_unknown_cmds_dropped.load();
+    }
+
+    ConnectionContext cntx;
+    uint32_t link_idx;
+    ClassicLinkStats stats;
+    unique_ptr<ClassicApplier> applier;
+  };
+
+  // The node's registry as Replica::Greet leaves it: itself, and the link's master with its hash
+  // registered on every proactor.
+  struct PeerNode {
+    PeerNode(util::ProactorPool* pp) {
+      registry.Init(kSelfUuid);
+      link_idx = registry.AddOrGet(kLinkUuid);
+      const uint64_t hash = NodeUuidHash(kLinkUuid);
+      pp->AwaitBrief(
+          [&](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(link_idx, hash); });
+    }
+    PeerRegistry registry;
+    uint32_t link_idx = 0;
+  };
+
+  // Runs `body` with a node and a peer-mode link on proactor 0's fiber.
+  template <typename F> void OnPeerLink(F body) {
+    pp_->at(0)
+        ->LaunchFiber([&] {
+          PeerNode node(pp_.get());
+          PeerLink link(service_.get(), &node.registry, node.link_idx);
+          body(node, link);
+        })
+        .Join();
+  }
+
+  optional<MvccStamp> StampOf(string_view key) {
+    optional<MvccStamp> out;
+    shard_set->Await(Shard(key, shard_set->size()), [&] {
+      out = namespaces->GetDefaultNamespace().GetCurrentDbSlice().GetMvcc(0, key);
+    });
+    return out;
   }
 };
 
@@ -1162,6 +1261,174 @@ TEST_F(ClassicApplyFamilyTest, KnownCommandErrorReplyCounted) {
 
   EXPECT_EQ(Get("k"), "v");
   EXPECT_EQ(Run({"hget", "h", "f"}), "v");
+}
+
+// The write of a peer link is stamped with the stamp its envelope carried and the hash of the
+// envelope's author, not a local mint and not the link's origin (spec D-4).
+TEST_F(ClassicPeerApplyFamilyTest, PeerEnvelopeStampsKeyWithEnvelopeMvccAndAuthorHash) {
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "a1", "v"}), "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "a2", "v"}), "0", to_string(kMvccB))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorB, Resp({"SET", "b1", "v"}), "0", to_string(kMvccB))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+
+    const uint64_t hash_a = NodeUuidHash(kAuthorA);
+    const uint64_t hash_b = NodeUuidHash(kAuthorB);
+    optional<MvccStamp> a1 = StampOf("a1"), a2 = StampOf("a2"), b1 = StampOf("b1");
+    ASSERT_TRUE(a1 && a2 && b1);
+    EXPECT_EQ(a1->Mvcc(), kMvccA);
+    EXPECT_EQ(a1->origin_hash, hash_a);
+    EXPECT_EQ(a2->Mvcc(), kMvccB);
+    EXPECT_EQ(a2->origin_hash, hash_a);
+    EXPECT_EQ(b1->Mvcc(), kMvccB);
+    EXPECT_EQ(b1->origin_hash, hash_b);
+    // Not the link's, and not this node's own.
+    EXPECT_NE(hash_a, NodeUuidHash(kLinkUuid));
+    EXPECT_EQ(node.registry.Size(), 4u);
+  });
+}
+
+// An author past --classic_author_cap is stamped as the link, with the envelope's mvcc all the
+// same.
+TEST_F(ClassicPeerApplyFamilyTest, PeerEnvelopeOfAnOverCapAuthorKeepsItsMvccAndTakesTheLinkOrigin) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_classic_author_cap, 0);
+  const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    optional<MvccStamp> stamp = StampOf("k");
+    ASSERT_TRUE(stamp);
+    EXPECT_EQ(stamp->Mvcc(), kMvccA);
+    EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kLinkUuid));
+    EXPECT_EQ(node.registry.Size(), 2u);  // the author took no slot
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 1u);
+    EXPECT_EQ(link.cntx.repl_origin_idx, node.link_idx);
+  });
+}
+
+// Of a nested envelope the innermost layer's author and mvcc are the write's: the outer layer is
+// the forwarder's, and its author is not even resolved.
+TEST_F(ClassicPeerApplyFamilyTest, NestedEnvelopeStampsWithInnerAuthor) {
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    const string inner = Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", to_string(kMvccA));
+    EXPECT_EQ(link.Apply(Envelope(kAuthorB, inner, "0", to_string(kMvccB))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.unwrapped(), 2u);
+
+    optional<MvccStamp> stamp = StampOf("k");
+    ASSERT_TRUE(stamp);
+    EXPECT_EQ(stamp->Mvcc(), kMvccA);
+    EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kAuthorA));
+    EXPECT_EQ(node.registry.Size(), 3u);  // the node, the link, kAuthorA. Not kAuthorB
+    EXPECT_FALSE(node.registry.FindIdx(kAuthorB));
+  });
+}
+
+// A plain applier (a replica that is not a peer) stamps nothing of the envelope: the write is a
+// local mint, as for any command, and the context never leaves its raw values.
+TEST_F(ClassicPeerApplyFamilyTest, PlainApplierLeavesMvccZero) {
+  Run({"set", "local", "v"});
+  OnLink([&](Link& link) {
+    EXPECT_FALSE(link.applier.authors().stamping());
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.cntx.repl_mvcc, 0u);
+    EXPECT_EQ(link.cntx.repl_origin_idx, PeerRegistry::kSelfIdx);
+  });
+  optional<MvccStamp> stamp = StampOf("k"), local = StampOf("local");
+  ASSERT_TRUE(stamp && local);
+  EXPECT_NE(stamp->Mvcc(), kMvccA);
+  EXPECT_EQ(stamp->origin_hash, local->origin_hash);
+  EXPECT_NE(stamp->origin_hash, NodeUuidHash(kAuthorA));
+}
+
+// Whatever the envelope's command comes to, the context is the link's again afterwards: no mvcc,
+// and the link's own origin, which is what the raw commands that follow run with.
+TEST_F(ClassicPeerApplyFamilyTest, RestoresRawContextAfterEnvelope) {
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    const auto expect_raw = [&](string_view what) {
+      EXPECT_EQ(link.cntx.repl_mvcc, 0u) << what;
+      EXPECT_EQ(link.cntx.repl_origin_idx, node.link_idx) << what;
+    };
+    expect_raw("fresh");
+
+    const vector<pair<string, string>> exits = {
+        {"dispatched", Resp({"SET", "k", "v"})},
+        {"error reply", Resp({"LPUSH", "k", "x"})},  // k is a string by now
+        {"rejected dispatch", Resp({"SET", "k"})},
+        {"control command", Resp({"PING"})},
+        {"keydb-only command", Resp({"PEXPIREMEMBERAT", "k", "m", "1"})},
+        {"unknown command", Resp({"NOSUCHCOMMAND", "k"})},
+    };
+    for (const auto& [what, command] : exits) {
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "0", to_string(kMvccA))),
+                EnvelopeResult::kConsumed)
+          << what;
+      expect_raw(what);
+    }
+    EXPECT_EQ(link.apply_errors(), 2u);
+    EXPECT_EQ(link.keydb_dropped(), 1u);
+    EXPECT_EQ(link.unknown_dropped(), 1u);
+
+    // The next envelope is stamped by its own author, not by what the one before left behind.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorB, Resp({"SET", "e", "v"}), "0", to_string(kMvccB))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(StampOf("e")->origin_hash, NodeUuidHash(kAuthorB));
+    expect_raw("after the last envelope");
+  });
+}
+
+// A command that is not dispatched resolves no author: it takes no registry slot and counts no
+// overflow, even where the cap would refuse it. Each comes from an author not seen before.
+TEST_F(ClassicPeerApplyFamilyTest, SkippedCommandsNeverResolveTheirAuthor) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_classic_author_cap, 0);
+  const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    const vector<pair<string, string>> skipped = {
+        {"33333333-3333-4333-8333-333333333333", Resp({"NOSUCHCOMMAND", "k"})},
+        {"44444444-4444-4444-8444-444444444444", Resp({"PEXPIREMEMBERAT", "k", "m", "1"})},
+        {"55555555-5555-4555-8555-555555555555", Resp({"PING"})},
+    };
+    for (const auto& [author, command] : skipped) {
+      EXPECT_EQ(link.Apply(Envelope(author, command, "0", to_string(kMvccA))),
+                EnvelopeResult::kConsumed)
+          << command;
+      EXPECT_FALSE(node.registry.FindIdx(author)) << command;
+    }
+    EXPECT_EQ(link.unwrapped(), 3u);
+    EXPECT_EQ(link.unknown_dropped(), 1u);
+    EXPECT_EQ(link.keydb_dropped(), 1u);
+    EXPECT_EQ(node.registry.Size(), 2u);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+  });
+}
+
+// An envelope whose mvcc is 0 carries no stamp of the author's: the write is a local mint,
+// attributed to the author's origin.
+TEST_F(ClassicPeerApplyFamilyTest, PeerEnvelopeWithoutMvccIsALocalMintOfTheAuthor) {
+  Run({"set", "local", "v"});
+  OnPeerLink([&](PeerNode& node, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", "0")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+
+    optional<MvccStamp> stamp = StampOf("k"), local = StampOf("local");
+    ASSERT_TRUE(stamp && local);
+    EXPECT_NE(stamp->Mvcc(), 0u);
+    EXPECT_NE(stamp->Mvcc(), kMvccA);
+    EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kAuthorA));
+    EXPECT_NE(stamp->origin_hash, local->origin_hash);
+    EXPECT_EQ(node.registry.Size(), 3u);  // the author took a slot
+    EXPECT_EQ(link.cntx.repl_mvcc, 0u);
+    EXPECT_EQ(link.cntx.repl_origin_idx, node.link_idx);
+  });
 }
 
 // The dispatcher rejects this before the command runs; it is consumed all the same.
@@ -1816,6 +2083,20 @@ TEST_F(ClassicAuthorMapTest, LinkUuidMapsToPeerIdx) {
     // Nothing was added to the registry, and nothing registered: Greet() did that for the link.
     EXPECT_EQ(node.registry.Size(), 2u);
     EXPECT_EQ(HashesOf(node.link_idx), vector<uint64_t>(pp_->size(), 0));
+  });
+}
+
+// This node's own uuid is in the registry, at kSelfIdx. A foreign write stamped as self would be
+// forwarded to the node's peers, so even if it is asked about, the link's idx is the answer.
+TEST_F(ClassicAuthorMapTest, SelfUuidIsNeverResolvedToSelfIdx) {
+  OnFiber([&] {
+    Registry node;
+    ClassicAuthorMap map(&node.registry, string(kLinkUuid), node.link_idx);
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+    EXPECT_EQ(map.IdxFor(kSelfUuid), node.link_idx);
+    EXPECT_NE(map.IdxFor(kSelfUuid), PeerRegistry::kSelfIdx);
+    EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before);
+    EXPECT_EQ(node.registry.Size(), 2u);
   });
 }
 
