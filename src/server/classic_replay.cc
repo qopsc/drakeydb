@@ -20,6 +20,7 @@
 #include <limits>
 
 #include "base/logging.h"
+#include "common/backed_args.h"
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
 #include "server/command_registry.h"
@@ -28,6 +29,7 @@
 #include "server/generic_family.h"
 #include "server/main_service.h"
 #include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/node_identity.h"
 #include "util/fibers/synchronization.h"
@@ -247,6 +249,81 @@ bool IsKeyDbOnlyCommand(const facade::RespVec& args) {
   }
   // `PERSIST key` is a standard command; KeyDB's `PERSIST key subkey` removes a member's TTL.
   return args.size() == 3 && absl::EqualsIgnoreCase(name, "PERSIST");
+}
+
+namespace {
+
+bool IsSetExpiryOption(string_view token) {
+  return absl::EqualsIgnoreCase(token, "EX") || absl::EqualsIgnoreCase(token, "PX") ||
+         absl::EqualsIgnoreCase(token, "EXAT") || absl::EqualsIgnoreCase(token, "PXAT");
+}
+
+// `SET key value [options]`: the options that state a condition or ask for the old value are
+// dropped, and `KEEPTTL` with them when `NX` was among them.
+bool RewriteSet(cmn::BackedArguments* args) {
+  if (args->size() < 4)
+    return false;
+
+  bool has_nx = false, changed = false;
+  for (size_t i = 3; i < args->size(); ++i) {
+    const string_view opt = args->at(i);
+    if (IsSetExpiryOption(opt)) {
+      ++i;  // the next token is the option's value, not another option
+    } else if (absl::EqualsIgnoreCase(opt, "NX")) {
+      has_nx = changed = true;
+    } else if (absl::EqualsIgnoreCase(opt, "XX") || absl::EqualsIgnoreCase(opt, "GET")) {
+      changed = true;
+    }
+  }
+  // KEEPTTL goes only under NX, which the loop above has already marked.
+  if (!changed)
+    return false;
+
+  vector<string> kept;
+  kept.reserve(args->size());
+  for (size_t i = 0; i < args->size(); ++i) {
+    const string_view tok = args->at(i);
+    if (i >= 3) {
+      if (IsSetExpiryOption(tok)) {
+        kept.emplace_back(tok);
+        if (++i < args->size())
+          kept.emplace_back(args->at(i));
+        continue;
+      }
+      if (absl::EqualsIgnoreCase(tok, "NX") || absl::EqualsIgnoreCase(tok, "XX") ||
+          absl::EqualsIgnoreCase(tok, "GET") ||
+          (has_nx && absl::EqualsIgnoreCase(tok, "KEEPTTL"))) {
+        continue;
+      }
+    }
+    kept.emplace_back(tok);
+  }
+
+  args->Assign(kept.begin(), kept.end(), kept.size());
+  return true;
+}
+
+}  // namespace
+
+bool ClassicApplyRewrites(cmn::BackedArguments* args) {
+  if (args->empty())
+    return false;
+
+  const string_view name = args->Front();
+  if (absl::EqualsIgnoreCase(name, "SET"))
+    return RewriteSet(args);
+
+  if (absl::EqualsIgnoreCase(name, "MSETNX")) {
+    vector<string> kept;
+    kept.reserve(args->size());
+    kept.emplace_back("MSET");
+    for (size_t i = 1; i < args->size(); ++i)
+      kept.emplace_back(args->at(i));
+    args->Assign(kept.begin(), kept.end(), kept.size());
+    return true;
+  }
+
+  return false;
 }
 
 ClassicLinkCounts ClassicLinkStats::Snapshot() const {
@@ -644,17 +721,19 @@ bool ClassicApplier::ParseSingleCommand(string_view bytes, facade::RespVec* args
 
 namespace {
 
-// Sets `repl_mvcc` and `repl_origin_idx` on the stream's apply context for one dispatch, and on
-// every exit after it is built puts back the link's values (mvcc 0, the link's origin), which the
-// raw commands of the stream run with.
+// Sets `repl_mvcc`, `repl_origin_idx` and `repl_lww_guard` on the stream's apply context for one
+// dispatch, and on every exit after it is built puts back the link's values (mvcc 0, the link's
+// origin, the link's guard bit, which ConsumeRedisStream set once and the raw commands of the
+// stream run with).
 class CommandScope {
  public:
   CommandScope(ConnectionContext* cntx, uint32_t link_origin_idx)
-      : cntx_(cntx), link_origin_idx_(link_origin_idx) {
+      : cntx_(cntx), link_origin_idx_(link_origin_idx), link_guard_(cntx->repl_lww_guard) {
   }
   ~CommandScope() {
     cntx_->repl_mvcc = 0;
     cntx_->repl_origin_idx = link_origin_idx_;
+    cntx_->repl_lww_guard = link_guard_;
   }
 
   CommandScope(const CommandScope&) = delete;
@@ -666,9 +745,15 @@ class CommandScope {
     cntx_->repl_origin_idx = origin_idx;
   }
 
+  // The command that is about to be dispatched runs unguarded whatever the link's bit is.
+  void Unguard() {
+    cntx_->repl_lww_guard = false;
+  }
+
  private:
   ConnectionContext* cntx_;
   uint32_t link_origin_idx_;
+  bool link_guard_;
 };
 
 // The leaf's reservation in AuthorDedup: whatever way the leaf is left, it is committed or
@@ -739,11 +824,24 @@ ClassicApplier::Leaf ClassicApplier::ApplyCommand(const facade::RespVec& args, s
   }
   Reservation reservation(&dedup_, author, mvcc);
 
+  // After the reservation, so a duplicate or a cancelled leaf runs no rewrite. On every envelope
+  // link, plain or peer, whether or not the guard is on (spec D-4.3, D-6): the guard only decides
+  // whether the dispatch can be vetoed. The reservation is by the envelope's (author, mvcc) and
+  // the rewrites do not change it.
+  ApplyLwwRewrites(&cmd);
+  ClassicApplyRewrites(&cmd);
+
   // Only a command that is dispatched resolves its author (a skipped one costs no registry slot),
   // so the cap counts dispatched commands. `author` is never this node's own: HandleRreplay dropped
   // those.
   if (authors_.stamping())
     scope.Stamp(mvcc, authors_.IdxFor(author));
+  // A script's inner commands share one stamp; a single-shard script runs them through a
+  // SQUASHED_STUB, where the guard cannot compare per command (the RunSquashedMultiCb tripwire),
+  // so an EVAL is stamped, never vetoed. KeyDB 6.3.4 never sends the _RO variants, but the prefix
+  // covers them.
+  if (absl::StartsWithIgnoreCase(name, "EVAL"))
+    scope.Unguard();
   bool ran = true;
   if (optional<string> error = Dispatch(&cmd, &ran); error)
     NoteApplyError(name, *error);

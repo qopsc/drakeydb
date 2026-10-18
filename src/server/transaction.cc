@@ -1636,11 +1636,15 @@ OpStatus Transaction::RunSquashedMultiCb(RunnableType cb) {
   // it stays non-atomic end to end, building SHARD_LOCAL (not SQUASHED_STUB) per-shard
   // transactions, so every command it squashes dispatches through ordinary RunCallback, where
   // ShouldDropForLww DOES run -- but a classic link's EVAL is a second, independent way to reach
-  // this function, and it does. The tripwire below still never fires either way: the stub
-  // constructor copies repl_lww_guard_ from its own parent, and every transaction on the classic
-  // link -- squashed EVAL stub included -- traces back to the same connection whose
-  // repl_lww_guard is always false, so IsLwwGuarded() reads false here regardless of which route
-  // got a command to this function.
+  // this function, and it does.
+  // drakeydb: P7-2 -- a classic peer link IS guarded now (repl_lww_guard is set once per link, and
+  // its RREPLAY envelopes carry a real mvcc), so the stub copying repl_lww_guard_ from its parent
+  // would trip this on every single-shard script of an envelope. The tripwire stays unreachable
+  // because ClassicApplier (classic_replay.cc, CommandScope::Unguard) dispatches an EVAL/EVALSHA
+  // with the connection's repl_lww_guard false -- stamped with the envelope's mvcc and author,
+  // never vetoed -- and puts the link's bit back after. A script's effects are many keys under one
+  // stamp; the compare here would be batch-level. Raw classic commands carry mvcc 0, which
+  // LwwGuardActive excludes, so a raw EVAL never trips it either.
   if (IsLwwGuarded()) {
     LOG(DFATAL) << "multi-master LWW guard reached RunSquashedMultiCb: repl_mvcc_ is "
                    "batch-level here, not per-command, and cannot be safely compared -- "

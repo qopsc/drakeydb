@@ -117,7 +117,8 @@ class BaseFamilyTest : public ::testing::Test {
   // SetApplyMvcc/SetApplyLwwGuard, executor.h) -- but dispatches through the ordinary
   // service_->DispatchCommand path, never through JournalExecutor::Execute. That matters because
   // ApplyLwwRewrites (multimaster_lww.cc, SETNX->SET/GETSET->SET/GETDEL->DEL/RESTORE->+REPLACE)
-  // lives exclusively inside JournalExecutor::Execute: a test needing the generic single-key veto
+  // lives inside JournalExecutor::Execute (and, unconditionally, in ClassicApplier::ApplyCommand
+  // for envelope commands): a test needing the generic single-key veto
   // (Transaction::ShouldDropForLww) to see an UNREWRITTEN guarded name -- e.g. to prove
   // LogAutoJournalOnShard's own `if (lww_dropped) return;` still does its job, in isolation from
   // the rewrite that makes it unreachable in production -- has no other way to construct that

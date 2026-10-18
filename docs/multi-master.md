@@ -138,8 +138,8 @@ wasteful, steady state, not a fault that should force a resync.
   is `peer_mode_ && IsActiveReplica() && --multi_master_stream_lww`, read exactly once per link, at
   flow setup (`DflyShardReplica`'s constructor, `replica.cc`), never re-read per entry.
 - An entry whose incoming `mvcc` is `0` is never guarded, on any link (`LwwGuardActive`,
-  `multimaster_lww.h`): a classic Redis/KeyDB link never carries an `mvcc` at all, so guarding it
-  would silently drop its entire stream.
+  `multimaster_lww.h`): a raw classic command never carries an `mvcc` (an RREPLAY envelope's does,
+  see below), so guarding it would silently drop its entire stream.
 - A full sync's own concurrent journal blob — writes that arrive *during* that same full sync,
   applied by the RDB loader's own second applier (`RdbLoaderBase::HandleJournalBlob`) — shares the
   identical guard bit with the flow's stable-sync executor (`ConnectionContext::repl_lww_guard`),
@@ -308,65 +308,61 @@ was never atomic across shards under replication even before this guard existed 
 flow with no cross-shard barrier — the per-key split only adds the possibility of a *single
 shard's* own partial application, on top of an atomicity gap that already existed one level up.
 
-**Classic (non-DFLY-protocol) links are never guarded, by construction. A DFLY link to a
-non-active peer is guarded exactly like any other peer link, by construction — but never actually
-drops anything, because every entry it carries fails the guard's own per-entry data check
+**Classic (non-DFLY-protocol) links are guarded only for the commands of an RREPLAY envelope that
+carries a real mvcc, on a peer node. The raw commands of a classic stream are never guarded. A DFLY
+link to a non-active peer is guarded exactly like any other peer link, by construction — but never
+actually drops anything, because every entry it carries fails the guard's own per-entry data check
 instead.** These are two different mechanisms, not one.
 
-`Replica::ConsumeRedisStream` (`replica.cc`) never touches `JournalExecutor` at all: it builds its
-own bare `ConnectionContext` and sets `is_replicating`, `journal_emulated`, `skip_acl_validation`,
-`ns`, and `repl_origin_idx` on it directly — but never calls `SetApplyLwwGuard`, so `repl_lww_guard`
-stays at its default `false` for the whole classic link's lifetime regardless. That is a structural
-property of the link, fixed before a single command ever dispatches (independently, this protocol
-also never carries a per-key `mvcc` at all, so `LwwGuardActive` would exclude it a second way even
-if the bit were somehow true). A non-transactional command with no keys at all (`SELECT`, `PING`)
-never even reaches a `Transaction`'s own callback machinery in the first place, so it is trivially
-"never guarded" too — there is no callback for a veto to skip. Not every keyless command is like
-this, though: `DEBUG POPULATE` (an admin command, `DetermineKeys` returns no keys for it either)
-DOES build its own `Transaction` and reach `RunSquashedMultiCb` (see the `SQUASHED_STUB` producer
-list below) — it is unguarded for the ordinary reason every command on this link is, not because
-it skips the callback machinery: it never runs on a peer link to begin with (an operator-issued
-local command), so the stub it builds inherits an always-`false` `repl_lww_guard` regardless.
+`Replica::ConsumeRedisStream` (`replica.cc`) never touches `JournalExecutor`: it builds its own bare
+`ConnectionContext` and sets `is_replicating`, `journal_emulated`, `skip_acl_validation`, `ns`,
+`repl_origin_idx` and, once for the life of the link, `repl_lww_guard`, to the same expression the
+DFLY flows use (`IsPeerMode() && IsActiveReplica() && --multi_master_stream_lww`; it never calls
+`SetApplyLwwGuard`). A raw command of the stream (a stock Redis master, or whatever a KeyDB sends
+outside an envelope) runs with `repl_mvcc == 0`, which `LwwGuardActive` excludes, so the bit being
+`true` on a peer link changes nothing for it: a zero mvcc must never be guarded
+(`MergeAccepts(stored, {0, h})` is false for every stamped key, which would discard the stream).
+An active KeyDB wraps each command in `RREPLAY <uuid> <command> <db> <mvcc>`; `ClassicApplier`
+(`classic_replay.cc`) unwraps it and, per dispatch, sets `repl_mvcc` to the envelope's mvcc and
+`repl_origin_idx` to the author's origin index (a `CommandScope` puts the link's values back on
+every exit). On a peer link that makes the command's per-key LWW veto live: a write whose envelope
+mvcc is older than the key's stamp is dropped, a newer one applies.
 
-The stream's own batching does not change any of that, even though the batching itself is not
-specific to replication at all: `Service::DispatchSquashedBatch` (`main_service.cc`) is the SAME
-pipeline-squashing mechanism an ordinary client connection's own pipelined command burst uses too
-(`facade::Connection`'s own dispatch loop calls it directly) — `ConsumeRedisStream` is just one of
-its callers, not the reason it builds a non-atomic transaction. It collects a run of commands,
-stopping at the first one it cannot batch at all (an unknown command, `MULTI`/`EXEC`, `EVAL`, a
-blocking command, an admin command, a connection-state command, or a subscribe-family one) and
-returns how many it consumed; `ConsumeRedisStream`'s own loop dispatches whatever it stopped on
-through an ordinary `DispatchCommand` call before retrying the batch from there. Whatever it *did*
-collect gets handed, once per batch, to one **non-atomic** `MultiCommandSquasher` — built over a
-`Transaction` started with `StartMultiNonAtomic(Transaction::DEFAULT)`, which is what
-`DispatchSquashedBatch` always builds, for any caller. Inside it, `TrySquash` rejects any command
-that is not transactional, is `CO::BLOCKING`, is `CO::GLOBAL_TRANS`, or spans more than one shard's
-keys; those run through `ExecuteStandalone`, directly on that same non-atomic `Transaction`.
-Everything `TrySquash` *does* accept is grouped per shard and later dispatched by `SquashedHopCb`,
-which — in non-atomic mode — runs directly on each shard's own thread against a per-shard
-`Transaction` built with `StartMultiNonAtomic(Transaction::SHARD_LOCAL)`.
+The rewrites are done on **every** envelope link, plain or peer, and are not gated on the guard.
+`ApplyLwwRewrites` and then `ClassicApplyRewrites` edit the command before it is dispatched:
+`SETNX`, `GETSET`, `GETDEL` and `RESTORE` as for a guarded DFLY link, and `SET`, which loses
+`NX`/`XX`/`GET` (and `KEEPTTL` when `NX` was there), and `MSETNX`, which becomes `MSET`. KeyDB
+propagates only commands that dirtied its dataset, so a conditional on the wire already succeeded
+on its author, and evaluating its condition again against a different local state would make the
+author's effect a no-op here. (The edit is the author's effect; it runs on a plain link too, where
+it is the only thing that makes the write converge. Spec D-9 has the residual this leaves for
+`SET k v XX KEEPTTL` on a plain link.) On a peer node, `EVAL`/`EVALSHA` are stamped with the
+envelope's mvcc and author like any command, but with `repl_lww_guard` forced `false` for that
+dispatch (the link's bit is restored after): a single-shard script runs its inner commands through a
+`SQUASHED_STUB`, where the guard cannot compare per command. A plain link stamps nothing.
 
-Neither of *those* two transactions is ever a `SQUASHED_STUB`, so neither reaches
-`RunSquashedMultiCb` directly — but the classic link CAN reach that function by a different route.
-`EVAL`/`EVALSHA` is in `DispatchSquashedBatch`'s own break list above, so it falls straight to
-`ConsumeRedisStream`'s ordinary `DispatchCommand` fallback and takes the normal Lua-eval path. When
-a script's declared keys all hash to one shard, `CanRunSingleShardMulti` builds its own stub with
-`new Transaction{tx, real_sid, ...}` — the *other* stub constructor, the one that unconditionally
-sets `SQUASHED_STUB` no matter what mode its parent `tx` (the script's own outer transaction) is
-in — so the script's inner commands DO run through `RunSquashedMultiCb`. (The same constructor
-also backs three other `SQUASHED_STUB` producers, for completeness: `DEBUG POPULATE`'s own stub,
-built directly over an explicitly non-atomic `SHARD_LOCAL` parent — proof by construction that this
-role is not atomic-only — the atomic squasher's own asynchronous `EVAL` command flush, and an
-ATOMIC client `MULTI`/`EXEC` body's own direct squashing (`--multi_exec_squash`, `Service::Exec`'s
-own call into `MultiCommandSquasher::Execute` over the already-atomic top-level transaction
-`StartMulti` built — `MultiCommandSquasher::PrepareShardInfo`'s `IsAtomic()` branch is what all
-three of these share, `multi_command_squasher.cc`.) None of
-this actually changes anything observable on the classic link, though: that constructor also
-copies `repl_lww_guard_` straight from its own parent `tx`, and `tx` itself got that bit from the
-SAME always-`false` connection, the ordinary way any transaction on this link does. So
-`RunSquashedMultiCb`'s `LOG(DFATAL)` tripwire still never fires here — not because the classic link
-cannot reach the function, but because `IsLwwGuarded()` reads `false` there exactly as it does
-everywhere else on this link.
+A command with no keys at all (`SELECT`, `PING`) never reaches a `Transaction`'s callback
+machinery, so there is nothing for a veto to skip. `DEBUG POPULATE` builds its own `SQUASHED_STUB`
+and reaches `RunSquashedMultiCb`, but it is an operator command and never runs on a link.
+
+The stream's own batching does not change any of that. `Service::DispatchSquashedBatch`
+(`main_service.cc`) is the same pipeline-squashing mechanism a client's pipelined burst uses; it
+hands a run of raw commands to one **non-atomic** `MultiCommandSquasher`, whose per-shard
+transactions are `SHARD_LOCAL`, never `SQUASHED_STUB`, so they dispatch through the ordinary
+`RunCallback`, where `ShouldDropForLww` runs. They carry the connection's `repl_mvcc` (0 for raw
+commands). Envelope commands are not batched: the applier dispatches each on its own, so each has
+its own per-command `repl_mvcc`.
+
+The one way a classic link reaches `RunSquashedMultiCb` is a script. `EVAL`/`EVALSHA` is in
+`DispatchSquashedBatch`'s break list, so it takes the normal Lua-eval path, and when a script's
+declared keys all hash to one shard `CanRunSingleShardMulti` builds a stub with the constructor
+that sets `SQUASHED_STUB` whatever its parent's mode is (three other producers share it: `DEBUG
+POPULATE`, the atomic squasher's asynchronous `EVAL` flush, and an atomic `MULTI`/`EXEC` body under
+`--multi_exec_squash`; `MultiCommandSquasher::PrepareShardInfo`'s `IsAtomic()` branch is what they
+share). That stub copies `repl_lww_guard_` from its parent, and the parent got the bit from the
+connection, which is why an `EVAL` of an envelope runs with the bit `false`: `RunSquashedMultiCb`'s
+`LOG(DFATAL)` tripwire stays unreachable on a classic link only because of that override, not
+because the link is never guarded.
 
 A DFLY-protocol peer link to a peer that is itself non-active is a genuinely different case. The
 guard *bit* is set exactly the way it would be for any other peer link — `peer_mode_ &&

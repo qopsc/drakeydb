@@ -38,6 +38,7 @@ from .fake_classic_master import (
     resp_command,
 )
 from .instance import DflyInstanceFactory, RedisServer
+from .multimaster_test import active_args, assert_no_command_storm, wait_for_peers
 from .proxy import Proxy
 from .replication_utils import get_metric_value
 from .utility import assert_eventually, skip_if_not_in_github, wait_available_async
@@ -2372,7 +2373,16 @@ async def test_unwrap_flushes_raw_batch_before_envelope(
     Falsifying: without the flush before the envelope the batch waits behind it and the key ends at
     2 (the envelopes first, `SET a 1` and `INCR a` after them).
     """
-    stream = SET_A + rreplay("SET", "a", 2) + resp_command("INCR", "a") + rreplay("INCR", "a")
+    # The envelopes carry an mvcc an hour ahead: a peer node's link is LWW-guarded, and its raw
+    # `SET a 1` is stamped with the replica's own clock, so an envelope of an older mvcc would lose
+    # to it (a peer node's classic link is LWW-guarded) and the key would end at 3.
+    ahead = now_ms() + 3_600_000
+    stream = (
+        SET_A
+        + rreplay("SET", "a", 2, mvcc=keydb_mvcc(ahead))
+        + resp_command("INCR", "a")
+        + rreplay("INCR", "a", mvcc=keydb_mvcc(ahead))
+    )
     marker = resp_command("SET", "marker", "1")
     args = {"active_replica": "true"} if peer_mode else {}
     async with FakeClassicMaster() as master:
@@ -3863,6 +3873,204 @@ async def test_fake_master_send_stream_lands_behind_the_scripted_stream():
             writer.close()
 
 
+@pytest.mark.keydb
+@pytest.mark.parametrize("stream_lww", [True, False], ids=["guard_on", "guard_off"])
+async def test_keydb_lww_concurrent_set_converges(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, stream_lww
+):
+    """A peer node that wrote `k` after KeyDB did keeps its newer value when KeyDB's older write
+    reaches it late: the link to KeyDB is held by a proxy, KeyDB writes `k` at t1, the node writes
+    `k` at t2 > t1, and the proxy is let through. With `--multi_master_stream_lww=false` the same
+    run applies in arrival order, and the node takes KeyDB's value.
+
+    Falsifying: not setting the link's `repl_lww_guard` (replica.cc, ConsumeRedisStream) makes the
+    guard_on case end with `k == "keydb"`; the envelope's mvcc left out of the context, a local mint
+    newer than the node's own write, does the same.
+    """
+    keydb = keydb_server_factory()
+    async with keydb.client() as kd, Proxy("127.0.0.1", 0, "127.0.0.1", keydb.port) as proxy:
+        node = df_factory.create(
+            proactor_threads=2,
+            dir=str(tmp_path / "df"),
+            active_replica="true",
+            multi_master_stream_lww="true" if stream_lww else "false",
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF localhost {proxy.port}") == "OK"
+        await wait_for_peer_link(c)
+
+        await kd.set("marker:up", "1")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def stream_flowing():
+            assert await c.get("marker:up") == "1"
+
+        await stream_flowing()
+
+        proxy.pause()
+        await kd.set("flush", "1")  # the read in flight when the proxy paused delivers this
+        await asyncio.sleep(0.3)
+        await kd.set("k", "keydb")  # t1: held
+        await asyncio.sleep(0.2)
+        await c.set("k", "local")  # t2 > t1
+        await kd.set("marker:after", "1")
+        proxy.resume()
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def keydb_write_applied_or_dropped():
+            assert await c.get("marker:after") == "1"
+
+        await keydb_write_applied_or_dropped()
+        expected = "local" if stream_lww else "keydb"
+        assert await c.get("k") == expected, (await c.get("k"), stream_lww)
+        await asyncio.sleep(0.5)
+        assert await c.get("k") == expected
+
+
+@pytest.mark.keydb
+async def test_keydb_set_nx_wins_over_stale_local(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """The node holds an older local `k`; a later `SET k v NX` on KeyDB, which succeeded there (it
+    had no `k`), reaches the node as an envelope that must win: `k == "new"`. Run as an NX the
+    command would fail on the node's `k` and the two would differ for good.
+
+    Falsifying: without `ClassicApplyRewrites` the node's NX finds the stale `k` and `k` stays
+    `"old"`.
+    """
+    keydb = keydb_server_factory()
+    async with keydb.client() as kd:
+        node = df_factory.create(
+            proactor_threads=2, dir=str(tmp_path / "df"), active_replica="true"
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await wait_for_peer_link(c)
+
+        await c.set("k", "old")
+        await asyncio.sleep(0.2)
+        assert await kd.set("k", "new", nx=True) is True  # it applied there: KeyDB had no k
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def nx_applied():
+            assert await c.get("k") == "new"
+
+        await nx_applied()
+
+
+async def test_plain_replica_conditional_set_applies_despite_expiry_skew(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """A plain replica of an active KeyDB that is told `SET k old PXAT <far future>` and then
+    `SET k new NX` ends with `k == new`. That is the stream an active KeyDB produces when `k` had
+    expired on it (which it never propagates) and was re-created: on the replica `k` has not
+    expired, and an NX that evaluated its condition again would find `old` and do nothing, so the
+    two would differ until the master's own expiry.
+
+    Falsifying: gating the rewrites on `LwwGuardActive` (a plain link is never guarded) leaves
+    `k == old`.
+    """
+    async with FakeClassicMaster() as master:
+        node, c = await attach_to_stream_live(df_factory, tmp_path, master, "sweep")
+        old = rreplay("SET", "k", "old", "PXAT", now_ms() + 3_600_000)
+        new = rreplay("SET", "k", "new", "NX")
+        await stream_and_wait_applied(master, c, "marker", old, new)
+        assert await c.get("k") == "new"
+        assert master.connection_count == 1, "the replica reconnected"
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_raw_stream_conditional_set_stays_conditional(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """The rewrites are for the commands of an RREPLAY envelope. A raw command of the stream, which
+    no active KeyDB wrote the effect of, is run as sent: a raw `SET k new NX` after a raw
+    `SET k old` finds `k` and does nothing, so `k == old`.
+
+    Falsifying: routing the raw commands through `ClassicApplyRewrites` strips the NX and `k` ends as
+    `new`.
+    """
+    stream = resp_command("SET", "k", "old") + resp_command("SET", "k", "new", "NX")
+    async with FakeClassicMaster() as master:
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(
+            diskless_full_sync(
+                offset=SYNC_OFFSET, tail=EOF_TOKEN + stream + resp_command("SET", "marker", "1")
+            )
+        )
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("marker") == "1"
+
+        await applied()
+        assert await c.get("k") == "old"
+
+
+@pytest.mark.keydb
+async def test_keydb_writes_not_forwarded_to_peers(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """What a KeyDB writes reaches a peer node once, over its own link, and the nodes never forward
+    it to each other: two `--active_replica --multi_master` nodes that are each other's peers and
+    both attached to one KeyDB hold exactly N after N INCRs on it, and neither is in an echo storm.
+    (A plain sub-replica of the first node would not do: it would receive the journal either way.)
+
+    Falsifying: stamping the classic authors with `kSelfIdx` (they would pass the peer echo filter)
+    makes each node forward the INCRs to the other, which holds 2N.
+    """
+    keydb = keydb_server_factory()
+    n = 200
+    async with keydb.client() as kd:
+        n1 = df_factory.create(**active_args(dir=str(tmp_path / "n1")))
+        n2 = df_factory.create(**active_args(dir=str(tmp_path / "n2")))
+        df_factory.start_all([n1, n2])
+        c1, c2 = n1.client(), n2.client()
+
+        # One link at a time: a node that is loading answers the other side's PING with -LOADING.
+        assert await c1.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await wait_for_peers(c1, 1)
+        assert await c2.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await wait_for_peers(c2, 1)
+        assert await c1.execute_command(f"REPLICAOF localhost {n2.port}") == "OK"
+        await wait_for_peers(c1, 2)
+        assert await c2.execute_command(f"REPLICAOF localhost {n1.port}") == "OK"
+        await wait_for_peers(c2, 2)
+
+        await kd.set("marker", "1")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def streams_flowing():
+            for c in (c1, c2):
+                assert await c.get("marker") == "1"
+
+        await streams_flowing()
+
+        await pipelined_incr(kd, "c", n)
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def all_arrived():
+            for c in (c1, c2):
+                assert int(await c.get("c") or 0) >= n
+
+        await all_arrived()
+        await asyncio.sleep(1)  # a forwarded copy would push a node past N
+        for c in (c1, c2):
+            assert int(await c.get("c")) == n
+        await assert_no_command_storm(c1, c2)
+
+
 # The window of owner decision 24 (option A), scripted with the commands an active KeyDB streams:
 # every TTL is absolute (`SET k v PXAT <ms>`, `PEXPIREAT`) and `INCR` is `INCRBY c 1`, as
 # tests/dragonfly/data/README.md shows. A key is due at `deadline`, WINDOW_TTL_MS after it is
@@ -4405,14 +4613,22 @@ def count_writes(stats):
     )
 
 
-async def read_totals(master, replica):
+def master_link(info, peer_mode):
+    """The master link of a replica's INFO replication: (up, offset, envelopes unwrapped). A plain
+    replica reports it at the top level, a peer node on its `master0` line (`repl_offset=` is there
+    for a link to an active KeyDB); each is None for a field the INFO does not have."""
+    link = info.get("master0", {}) if peer_mode else info
+    up = link.get("link_status" if peer_mode else "master_link_status") == "up"
+    offset = link.get("repl_offset" if peer_mode else "slave_repl_offset")
+    return up, None if offset is None else int(offset), link.get("rreplay_unwrapped")
+
+
+async def read_totals(master, replica, peer_mode=False):
     """The writes `master` has executed so far and the envelopes `replica` has unwrapped (None for
     one that reports no such counter: a KeyDB, or a drakeydb that took a raw stream)."""
     writes = count_writes(await master.info("commandstats"))
-    return {
-        "writes": writes,
-        "envelopes": (await replica.info("replication")).get("rreplay_unwrapped"),
-    }
+    info = await replica.info("replication")
+    return {"writes": writes, "envelopes": master_link(info, peer_mode)[2]}
 
 
 def assert_envelopes_unwrapped(writes, envelopes, summary):
@@ -4430,7 +4646,7 @@ def assert_envelopes_unwrapped(writes, envelopes, summary):
     )
 
 
-async def take_sample(started, master, replica, cpu_sources):
+async def take_sample(started, master, replica, cpu_sources, peer_mode=False):
     """One reading of both servers, taken concurrently. Each time stamp is the middle of its own
     request: under load a server can take milliseconds to answer."""
 
@@ -4446,17 +4662,16 @@ async def take_sample(started, master, replica, cpu_sources):
     )
     # KeyDB drops a replica whose output buffer outgrows its limit (256 MB by default), one that
     # has fallen that far behind; INFO then has no offset.
-    assert (
-        r.get("master_link_status") == "up" and "slave_repl_offset" in r
-    ), f"the replica's link is down: {r}"
+    up, offset, envelopes = master_link(r, peer_mode)
+    assert up and offset is not None, f"the replica's link is down: {r}"
     return {
         "tm": tm,
         "tr": tr,
         "m": int(m["master_repl_offset"]),
-        "r": int(r["slave_repl_offset"]),
+        "r": offset,
         "ops": count_writes(stats),
         # drakeydb counts the envelopes it applied; KeyDB has no such field.
-        "envelopes": r.get("rreplay_unwrapped"),
+        "envelopes": envelopes,
         "cpu": {name: source() for name, source in cpu_sources.items()},
     }
 
@@ -4508,7 +4723,7 @@ def bar_bounds(perf, produced):
     return {"min_ratio": 0.5, "max_lag": 32 * MB, "max_drain_s": 10.0}
 
 
-async def wait_drained(master, replica, stopped_at, give_up_s):
+async def wait_drained(master, replica, stopped_at, give_up_s, peer_mode=False):
     """Seconds from `stopped_at` until the replica holds everything KeyDB wrote, None if that takes
     longer than `give_up_s`.
 
@@ -4520,7 +4735,7 @@ async def wait_drained(master, replica, stopped_at, give_up_s):
     while time.monotonic() - stopped_at <= give_up_s:
         polled_at = time.monotonic()
         m = int((await master.info("replication"))["master_repl_offset"])
-        r = (await replica.info("replication")).get("slave_repl_offset")
+        r = master_link(await replica.info("replication"), peer_mode)[1]
         if equal_at is not None and m == equal_offset:
             return equal_at - stopped_at
         equal_at, equal_offset = (polled_at, m) if r is not None and int(r) == m else (None, None)
@@ -4530,13 +4745,14 @@ async def wait_drained(master, replica, stopped_at, give_up_s):
 
 @assert_eventually(times=300)
 @retry_while_loading
-async def assert_idle_synced(master, replica):
+async def assert_idle_synced(master, replica, peer_mode=False):
     """The link is up, KeyDB lists the replica as online, and the replica is at the master's offset."""
     link = await replica.info("replication")
-    assert link["master_link_status"] == "up", link
+    up, offset, _ = master_link(link, peer_mode)
+    assert up, link
     info = await master.info("replication")
     assert info["slave0"]["state"] == "online", info
-    assert int(link["slave_repl_offset"]) == int(info["master_repl_offset"]), (link, info)
+    assert offset == int(info["master_repl_offset"]), (link, info)
 
 
 async def assert_same_keys(master, replica):
@@ -4566,11 +4782,15 @@ def record_throughput(name, result):
             f.write(line + "\n")
 
 
-async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_kind, bar):
+async def run_throughput(
+    df_factory, keydb_server_factory, tmp_path, *, replica_kind, bar, peer_mode=False
+):
     """Writes into an active KeyDB (a plain one for "drakeydb_raw") for a window of PERF_WINDOW_S
     (SMOKE_WINDOW_S without DRAKEYDB_PERF), with a replica attached and idle-synced first:
 
-    - "drakeydb": a plain drakeydb replica, which unwraps every RREPLAY envelope (the path under test),
+    - "drakeydb": a plain drakeydb replica, which unwraps every RREPLAY envelope (the path under
+      test), or, with `peer_mode`, an `--active_replica` peer node whose link is LWW-guarded and
+      whose writes are stamped with the envelope's mvcc and author and LWW-guarded,
     - "keydb": a second active KeyDB, the comparator of the bar,
     - "drakeydb_raw": a plain drakeydb replica of the plain KeyDB, whose raw stream it squashes.
 
@@ -4601,13 +4821,21 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
             # The release bar runs drakeydb with its own defaults, not the harness's (a vmodule
             # that turns VLOG(1) on and per-command latency tracking).
             flags = {"latency_tracking": "false", "vmodule": ""} if perf else {}
+            if peer_mode:
+                flags["active_replica"] = "true"
             node, replica = await attach_plain_replica(df_factory, tmp_path, master, **flags)
+            if peer_mode:
+                await wait_for_peer_link(replica)
             replica_pid = node.proc.pid
-        await assert_idle_synced(k, replica)
+        await assert_idle_synced(k, replica, peer_mode)
         synced = await sync_counts(k)
         assert synced[0] == 1, synced
+        # A peer node exports no replica_reconnect_count: a reconnect there is caught by KeyDB's
+        # sync counters below.
         reconnects = (
-            await get_metric_value(node, "dragonfly_replica_reconnect_count") if node else 0
+            await get_metric_value(node, "dragonfly_replica_reconnect_count")
+            if node and not peer_mode
+            else 0
         )
 
         if perf:
@@ -4625,7 +4853,7 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
             "loader": load.cpu_seconds,
         }
 
-        before = await read_totals(k, replica)
+        before = await read_totals(k, replica, peer_mode)
         load_before = os.getloadavg()[0]
         samples = []
         probe = None
@@ -4637,7 +4865,7 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
                 probe.start()
             for i in range(window + 1):
                 await asyncio.sleep(max(0.0, started + i - time.monotonic()))
-                samples.append(await take_sample(started, k, replica, cpu_sources))
+                samples.append(await take_sample(started, k, replica, cpu_sources, peer_mode))
         finally:
             # Neither stop() raises about what its task died of (see BackgroundTask), so both run
             # and the failure being handled is the one reported.
@@ -4666,26 +4894,28 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
         # no bounds and only the numbers matter; it is recorded before the bounds are asserted, so
         # that a run that fails them still records all its numbers.
         give_up_s = bounds["max_drain_s"] + 3 if bar else 60
-        drain_s = await wait_drained(k, replica, stopped_at, give_up_s)
+        drain_s = await wait_drained(k, replica, stopped_at, give_up_s, peer_mode)
         result["drain_s"] = None if drain_s is None else round(drain_s, 3)
         if drain_s is not None:
             # Drained, the replica holds everything KeyDB wrote: the totals of the whole run, the
             # load's first and last moments and the drain included.
-            after = await read_totals(k, replica)
+            after = await read_totals(k, replica, peer_mode)
             result["writes_total"] = after["writes"] - before["writes"]
             result["envelopes_total"] = (
                 None
                 if after["envelopes"] is None
                 else after["envelopes"] - (before["envelopes"] or 0)
             )
-        record_throughput(f"{replica_kind}:{'perf' if perf else 'smoke'}", result)
+        result["peer_mode"] = peer_mode
+        mode = f"{'peer:' if peer_mode else ''}{replica_kind}"
+        record_throughput(f"{mode}:{'perf' if perf else 'smoke'}", result)
         skipped = ("lag_series", "samples")
         summary = {key: value for key, value in result.items() if key not in skipped}
 
         # (1) The link held: no reconnect, and KeyDB served no other sync than the first.
         link = await replica.info("replication")
-        assert link["master_link_status"] == "up", link
-        if node:
+        assert master_link(link, peer_mode)[0], link
+        if node and not peer_mode:
             assert await get_metric_value(node, "dragonfly_replica_reconnect_count") == reconnects
         assert await sync_counts(k) == synced, "KeyDB served another sync during the load"
         assert (await k.info("replication"))["connected_slaves"] == 1
@@ -4710,8 +4940,9 @@ async def run_throughput(df_factory, keydb_server_factory, tmp_path, *, replica_
 
 @pytest.mark.slow
 @pytest.mark.keydb
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_keydb_onboarding_keeps_up_under_load(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity, peer_mode
 ):
     """A plain replica of an active KeyDB keeps up with a write load that KeyDB takes at full speed
     (owner decision 12, spec D-12). Per-command dispatch of the RREPLAY envelopes gives up the
@@ -4736,6 +4967,10 @@ async def test_keydb_onboarding_keeps_up_under_load(
     half, a lag within 1.5 times of a KeyDB active replica's on the same load, is asserted by
     test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica, which runs both.
 
+    `peer_mode` runs the same load into an `--active_replica` peer node: its link is
+    LWW-guarded, each write is stamped with the envelope's mvcc and author, and the lag is read from
+    its `master0` line's `repl_offset=`.
+
     Falsifying: a 1 ms sleep per enveloped command in ClassicApplier::ApplyCommand caps the replica
     at about 1000 commands a second, and the smoke's ratio assertion fails (0.18). Under
     DRAKEYDB_PERF=1 the same replica falls so far behind that KeyDB drops it, when its output
@@ -4743,15 +4978,21 @@ async def test_keydb_onboarding_keeps_up_under_load(
     per command fails the bar's ratio instead (0.86).
     """
     await run_throughput(
-        df_factory, keydb_server_factory, tmp_path, replica_kind="drakeydb", bar=True
+        df_factory,
+        keydb_server_factory,
+        tmp_path,
+        replica_kind="drakeydb",
+        bar=True,
+        peer_mode=peer_mode,
     )
 
 
 @pytest.mark.slow
 @pytest.mark.keydb
 @pytest.mark.skipif(not perf_mode(), reason="the 1.5x half of the release bar: DRAKEYDB_PERF=1")
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
 async def test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica(
-    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path, restore_cpu_affinity, peer_mode
 ):
     """Owner decision 12 in full: under the release bar's load, drakeydb's max lag is within 1.5
     times of a KeyDB active replica's (comparator_bound).
@@ -4767,7 +5008,12 @@ async def test_keydb_onboarding_lag_within_1_5x_of_a_keydb_replica(
         df_factory, keydb_server_factory, tmp_path, replica_kind="keydb", bar=False
     )
     drakeydb = await run_throughput(
-        df_factory, keydb_server_factory, tmp_path, replica_kind="drakeydb", bar=True
+        df_factory,
+        keydb_server_factory,
+        tmp_path,
+        replica_kind="drakeydb",
+        bar=True,
+        peer_mode=peer_mode,
     )
     # Both legs' INFO sampling is skewed by the output of its own master, so the larger rate sets
     # the floor.

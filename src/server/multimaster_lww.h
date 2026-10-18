@@ -104,6 +104,13 @@ constexpr bool LwwGuardActive(bool link_guard, uint64_t incoming_mvcc) {
 // gate this call on EXACTLY LwwGuardActive(link_guard, incoming_mvcc) -- never on the link bit
 // alone, or an unstamped (mvcc 0) SETNX would be rewritten into an UNGUARDED blind SET that
 // clobbers the key. Returns whether it changed anything.
+//
+// drakeydb: P7-2 -- the one carve-out is the commands of an RREPLAY envelope (ClassicApplier::
+// ApplyCommand, classic_replay.cc), which call this unconditionally, plain link or peer, guarded or
+// not: an enveloped SETNX/GETSET/GETDEL/RESTORE already ran on its author, and what it replays is
+// that effect. There the guard decides only whether the dispatch can be vetoed; raw commands of a
+// classic stream (mvcc 0) are never rewritten, and JournalExecutor keeps the gate above for DFLY
+// links.
 bool ApplyLwwRewrites(cmn::BackedArguments* args);
 
 // The author's stamp for an incoming replicated write, or nullopt when it cannot be formed

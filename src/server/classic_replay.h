@@ -23,6 +23,10 @@ namespace facade {
 class CapturingReplyBuilder;
 }  // namespace facade
 
+namespace cmn {
+class BackedArguments;
+}  // namespace cmn
+
 namespace dfly {
 
 class CommandContext;
@@ -84,6 +88,16 @@ RreplayParse ParseRreplayEnvelope(const facade::RespVec& args, RreplayEnvelope* 
 // it carries data, and is applied (spec D-7a). Names are matched without case. False for a command
 // whose name is not a string.
 bool IsKeyDbOnlyCommand(const facade::RespVec& args);
+
+// Rewrites a conditional command of an RREPLAY envelope into the effect its author already had
+// (spec D-4.3, D-6). KeyDB propagates only commands that dirtied its dataset, so a conditional on
+// the wire succeeded on its author, and evaluating its condition again here against a different
+// local state would turn that effect into a no-op: `SET` loses `NX`, `XX` and `GET` wherever they
+// stand after the value (any case); `PX|PXAT|EX|EXAT <n>` and `KEEPTTL` stay, except that
+// `KEEPTTL` goes when `NX` was present (the key did not exist there, so there was no TTL to keep);
+// `MSETNX` becomes `MSET`. Anything else is untouched. Pure: it reads and edits `args` only.
+// Returns whether it changed anything.
+bool ClassicApplyRewrites(cmn::BackedArguments* args);
 
 // Counters of one classic link. Relaxed atomics: the replication fiber bumps them, an INFO fiber
 // on another thread reads them. Every bump also feeds the process-wide totals (ClassicTotals).

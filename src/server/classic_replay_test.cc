@@ -7,7 +7,10 @@
 #include <absl/flags/flag.h>
 #include <absl/flags/reflection.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_join.h>
 #include <absl/strings/substitute.h>
+#include <absl/time/clock.h>
+#include <absl/time/time.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +25,7 @@
 #include <vector>
 
 #include "base/gtest.h"
+#include "common/backed_args.h"
 #include "facade/facade_test.h"
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
@@ -32,6 +36,7 @@
 #include "server/engine_shard_set.h"
 #include "server/generic_family.h"
 #include "server/multi_master.h"
+#include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/test_utils.h"
@@ -507,6 +512,134 @@ TEST(ClassicReplayTest, IsKeyDbOnlyCommandTable) {
   EXPECT_FALSE(IsKeyDbOnlyCommand(numeric.args));
 }
 
+// The command `words` after ClassicApplyRewrites, and whether it said it changed anything.
+static pair<vector<string>, bool> Rewritten(vector<string> words) {
+  cmn::BackedArguments args;
+  args.Assign(words.begin(), words.end(), words.size());
+  const bool changed = ClassicApplyRewrites(&args);
+  vector<string> out;
+  for (size_t i = 0; i < args.size(); ++i)
+    out.emplace_back(args.at(i));
+  return {out, changed};
+}
+
+// SET loses the conditions and GET wherever they stand after the value, in any case; the expiry
+// options and their values stay; KEEPTTL goes when NX was there (the key did not exist, so there
+// was no TTL to keep) and stays under XX.
+TEST(ClassicReplayTest, ClassicApplyRewritesSet) {
+  using V = vector<string>;
+  struct Case {
+    V in, out;
+  };
+  const vector<Case> cases = {
+      {{"SET", "k", "v", "NX"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "XX"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "GET"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "NX", "GET"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "GET", "NX"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "XX", "GET"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "PX", "5000", "NX"}, {"SET", "k", "v", "PX", "5000"}},
+      {{"SET", "k", "v", "NX", "PXAT", "1700000000000"},
+       {"SET", "k", "v", "PXAT", "1700000000000"}},
+      {{"SET", "k", "v", "EX", "10", "XX", "GET"}, {"SET", "k", "v", "EX", "10"}},
+      {{"SET", "k", "v", "XX", "EXAT", "1700000000"}, {"SET", "k", "v", "EXAT", "1700000000"}},
+      // KEEPTTL: dropped with NX, kept with XX and alone.
+      {{"SET", "k", "v", "NX", "KEEPTTL"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "KEEPTTL", "NX"}, {"SET", "k", "v"}},
+      {{"SET", "k", "v", "XX", "KEEPTTL"}, {"SET", "k", "v", "KEEPTTL"}},
+      {{"SET", "k", "v", "KEEPTTL", "XX"}, {"SET", "k", "v", "KEEPTTL"}},
+      {{"SET", "k", "v", "NX", "GET", "KEEPTTL"}, {"SET", "k", "v"}},
+      // Any case.
+      {{"set", "k", "v", "nx"}, {"set", "k", "v"}},
+      {{"Set", "k", "v", "xX", "keepTTL"}, {"Set", "k", "v", "keepTTL"}},
+      {{"set", "k", "v", "px", "5", "Nx", "keepttl"}, {"set", "k", "v", "px", "5"}},
+      {{"set", "k", "v", "get"}, {"set", "k", "v"}},
+      // The value of an expiry option is not an option, whatever it spells.
+      {{"SET", "k", "v", "PX", "nx", "XX"}, {"SET", "k", "v", "PX", "nx"}},
+      {{"SET", "k", "v", "EX", "get", "NX"}, {"SET", "k", "v", "EX", "get"}},
+      // The key and the value are not options either.
+      {{"SET", "nx", "xx", "NX"}, {"SET", "nx", "xx"}},
+      {{"SET", "get", "keepttl", "XX", "GET"}, {"SET", "get", "keepttl"}},
+  };
+  for (const Case& c : cases) {
+    auto [out, changed] = Rewritten(c.in);
+    EXPECT_EQ(out, c.out) << absl::StrJoin(c.in, " ");
+    EXPECT_TRUE(changed) << absl::StrJoin(c.in, " ");
+  }
+}
+
+TEST(ClassicReplayTest, ClassicApplyRewritesSetWithNothingToDropIsUntouched) {
+  using V = vector<string>;
+  const vector<V> cases = {
+      {"SET", "k", "v"},
+      {"SET", "k", "v", "PX", "5000"},
+      {"SET", "k", "v", "KEEPTTL"},
+      {"SET", "k", "v", "EXAT", "1700000000", "KEEPTTL"},
+      {"SET", "k", "v", "PXAT", "1700000000000"},
+      {"SET", "k"},
+      {"SET"},
+      // An option this table does not know is kept as it is.
+      {"SET", "k", "v", "WHATEVER"},
+      // The value of an expiry option is not an option, even when it spells one.
+      {"SET", "k", "v", "PX", "NX"},
+      {"SET", "k", "v", "EX", "XX"},
+      {"SET", "nx", "xx"},
+  };
+  for (const V& c : cases) {
+    auto [out, changed] = Rewritten(c);
+    EXPECT_EQ(out, c) << absl::StrJoin(c, " ");
+    EXPECT_FALSE(changed) << absl::StrJoin(c, " ");
+  }
+}
+
+TEST(ClassicReplayTest, ClassicApplyRewritesMsetnxBecomesMset) {
+  using V = vector<string>;
+  auto [out, changed] = Rewritten({"MSETNX", "a", "1", "b", "2"});
+  EXPECT_EQ(out, (V{"MSET", "a", "1", "b", "2"}));
+  EXPECT_TRUE(changed);
+
+  tie(out, changed) = Rewritten({"msetnx", "a", "1"});
+  EXPECT_EQ(out, (V{"MSET", "a", "1"}));
+  EXPECT_TRUE(changed);
+
+  // Whatever it is asked, the values are kept verbatim: a key named like the command is a key.
+  tie(out, changed) = Rewritten({"MsetNx", "MSETNX", "nx", "SET", "xx"});
+  EXPECT_EQ(out, (V{"MSET", "MSETNX", "nx", "SET", "xx"}));
+  EXPECT_TRUE(changed);
+
+  // Arity is dispatch's problem; the name alone is rewritten.
+  tie(out, changed) = Rewritten({"MSETNX"});
+  EXPECT_EQ(out, (V{"MSET"}));
+  EXPECT_TRUE(changed);
+}
+
+TEST(ClassicReplayTest, ClassicApplyRewritesLeavesOtherCommandsAlone) {
+  using V = vector<string>;
+  const vector<V> cases = {
+      {"MSET", "a", "1", "b", "2"},
+      {"SETNX", "k", "v"},  // ApplyLwwRewrites' (the guard-independent rewrites run both)
+      {"SETEX", "k", "10", "v"},
+      {"GETSET", "k", "v"},
+      {"INCR", "k"},
+      {"HSET", "h", "f", "v", "NX"},
+      {"ZADD", "z", "NX", "XX", "GET", "1", "m"},
+      {"SADD", "s", "NX"},
+      {"EVAL", "return 1", "0", "NX"},
+      {"RESTORE", "k", "0", "payload", "KEEPTTL"},
+      {"EXPIRE", "k", "10", "NX"},
+      {"SETRANGE", "k", "0", "NX"},
+  };
+  for (const V& c : cases) {
+    auto [out, changed] = Rewritten(c);
+    EXPECT_EQ(out, c) << absl::StrJoin(c, " ");
+    EXPECT_FALSE(changed) << absl::StrJoin(c, " ");
+  }
+
+  cmn::BackedArguments empty;
+  EXPECT_FALSE(ClassicApplyRewrites(&empty));
+  EXPECT_TRUE(empty.empty());
+}
+
 namespace {
 
 ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, uint64_t keydb,
@@ -837,6 +970,8 @@ class ClassicPeerApplyFamilyTest : public ClassicApplyFamilyTest {
       cntx.skip_acl_validation = true;
       cntx.ns = &namespaces->GetDefaultNamespace();
       cntx.repl_origin_idx = link_idx;
+      // As ConsumeRedisStream sets it: this fixture's node is an active replica.
+      cntx.repl_lww_guard = absl::GetFlag(FLAGS_multi_master_stream_lww);
       applier = make_unique<ClassicApplier>(
           service, &cntx, string(kSelfUuid), "test-master:1", &stats, [] { return true; },
           ClassicAuthorMap(registry, string(kLinkUuid), link_idx));
@@ -889,6 +1024,15 @@ class ClassicPeerApplyFamilyTest : public ClassicApplyFamilyTest {
           body(node, link);
         })
         .Join();
+  }
+
+  // An mvcc of an hour from now: newer than any local write of the test, and than the stamps
+  // kMvccA and kMvccB, which are long past. A test applies the stale one of an author first: the
+  // author's dedup watermark is monotone.
+  static uint64_t FutureMvcc() {
+    static uint64_t counter = 0;
+    const uint64_t ms = static_cast<uint64_t>(absl::ToUnixMillis(absl::Now())) + 3'600'000;
+    return (ms << 20) | ++counter;
   }
 
   optional<MvccStamp> StampOf(string_view key) {
@@ -1463,6 +1607,146 @@ TEST_F(ClassicPeerApplyFamilyTest, PeerEnvelopeWithoutMvccIsALocalMintOfTheAutho
     EXPECT_EQ(link.cntx.repl_mvcc, 0u);
     EXPECT_EQ(link.cntx.repl_origin_idx, node.link_idx);
   });
+}
+
+// The guard on a classic peer link (spec D-4.2): a write whose envelope mvcc is older than the
+// key's stamp loses to it, and a newer one wins. The value that survives is what is asserted.
+TEST_F(ClassicPeerApplyFamilyTest, StaleKeyDbSetLosesToNewerLocalWrite) {
+  Run({"set", "k", "local"});
+  const optional<MvccStamp> local = StampOf("k");
+  ASSERT_TRUE(local);
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "stale"}), "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  EXPECT_EQ(StampOf("k"), local);
+
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "fresh"}), "0", to_string(FutureMvcc()))),
+        EnvelopeResult::kConsumed);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "fresh");
+}
+
+// A `SET k v NX` that succeeded on its author applies as the guarded SET it came to: over a stale
+// local key it wins when it is newer and loses when it is older, and it is never skipped for the
+// key being there.
+TEST_F(ClassicPeerApplyFamilyTest, NxSetAppliesAsGuardedSet) {
+  Run({"set", "k", "local"});
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "stale", "NX"}), "0", to_string(kMvccA))),
+        EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "local");  // older than the key: vetoed, as a SET is
+
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "fresh", "NX"}), "0",
+                                  to_string(FutureMvcc()))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "fresh");
+}
+
+// An MSETNX that succeeded on its author applies as the guarded MSET: key by key. Run as an
+// MSETNX it would have failed whole on the key that is there.
+TEST_F(ClassicPeerApplyFamilyTest, MsetnxAppliesAsGuardedMset) {
+  Run({"set", "a", "local-a"});
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    // Older than a: a keeps its value (the per-key veto), and b, which is absent, is written.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"MSETNX", "a", "stale-a", "b", "stale-b"}), "0",
+                                  to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "a"}), "local-a");
+  EXPECT_EQ(Run({"get", "b"}), "stale-b");
+
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"MSETNX", "a", "fresh-a", "c", "fresh-c"}), "0",
+                                  to_string(FutureMvcc()))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "a"}), "fresh-a");
+  EXPECT_EQ(Run({"get", "c"}), "fresh-c");
+}
+
+// An EVAL is stamped with the envelope's mvcc and its author, and is not guarded: its writes
+// are many keys under one stamp. The link's bit is what the context holds again afterwards.
+TEST_F(ClassicPeerApplyFamilyTest, EvalStampedWithEnvelopeMvccUnguardedNoDfatal) {
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    ASSERT_TRUE(link.cntx.repl_lww_guard);
+    EXPECT_EQ(link.Apply(Envelope(
+                  kAuthorA,
+                  Resp({"EVAL", "redis.call('SET', KEYS[1], ARGV[1])", "1", "e", "from-script"}),
+                  "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_TRUE(link.cntx.repl_lww_guard);
+    EXPECT_EQ(link.cntx.repl_mvcc, 0u);
+    // The link is guarded again: a write older than the script's stamp (another author, as the
+    // dedup watermark of kAuthorA is past it) is vetoed.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorB, Resp({"SET", "e", "x"}), "0", to_string(kMvccA - 1))),
+              EnvelopeResult::kConsumed);
+  });
+  EXPECT_EQ(Run({"get", "e"}), "from-script");
+  optional<MvccStamp> stamp = StampOf("e");
+  ASSERT_TRUE(stamp);
+  EXPECT_EQ(stamp->Mvcc(), kMvccA);
+  EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kAuthorA));
+}
+
+// Unguarded, an EVAL applies in arrival order whatever the key's stamp says.
+TEST_F(ClassicPeerApplyFamilyTest, EvalAppliesEvenWhenLocalIsNewer) {
+  Run({"set", "e", "local"});
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(
+                  kAuthorA,
+                  Resp({"EVAL", "redis.call('SET', KEYS[1], ARGV[1])", "1", "e", "from-script"}),
+                  "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "e"}), "from-script");
+}
+
+// With --multi_master_stream_lww=false the link is not guarded: arrival order wins, stale or not.
+TEST_F(ClassicPeerApplyFamilyTest, GuardOffAppliesInArrivalOrder) {
+  absl::FlagSaver saver;
+  absl::SetFlag(&FLAGS_multi_master_stream_lww, false);
+  Run({"set", "k", "local"});
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_FALSE(link.cntx.repl_lww_guard);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "stale"}), "0", to_string(kMvccA))),
+              EnvelopeResult::kConsumed);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "stale");
+}
+
+// The rewrites are the same on a plain link, which has no guard: the conditional replays as the
+// effect its author had.
+TEST_F(ClassicApplyFamilyTest, PlainApplierRewritesConditionalSet) {
+  Run({"set", "k", "old"});
+  Run({"set", "a", "old-a"});
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "new", "NX"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "m", "created", "XX", "GET"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"MSETNX", "a", "new-a", "b", "new-b"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "new");
+  EXPECT_EQ(Run({"get", "m"}), "created");
+  EXPECT_EQ(Run({"get", "a"}), "new-a");
+  EXPECT_EQ(Run({"get", "b"}), "new-b");
 }
 
 // The dispatcher rejects this before the command runs; it is consumed all the same.

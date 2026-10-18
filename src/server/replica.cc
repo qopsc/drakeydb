@@ -1220,6 +1220,12 @@ error_code Replica::ConsumeRedisStream() {
   // by the DflyShardReplica/dfly-stream path), so it needs this same value set independently --
   // see JournalExecutor::SetApplyOrigin's doc comment (journal/executor.h).
   conn_context.repl_origin_idx = peer_origin_idx_;
+  // drakeydb: P7-2 -- the LWW guard's per-link bit, set once like the origin above and with the
+  // DflyShardReplica flow's expression (SetApplyLwwGuard). It only takes effect on the envelope
+  // commands, which carry a real mvcc (LwwGuardActive); the raw commands of the stream have
+  // mvcc 0 and stay unguarded.
+  conn_context.repl_lww_guard =
+      IsPeerMode() && IsActiveReplica() && absl::GetFlag(FLAGS_multi_master_stream_lww);
 
   // we never reply back on the commands.
   facade::CapturingReplyBuilder null_builder{facade::ReplyMode::NONE};

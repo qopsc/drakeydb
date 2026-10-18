@@ -394,7 +394,7 @@ class Transaction {
   }
 
   // drakeydb: P4-4 -- true only on a guarded peer link (repl_lww_guard_) AND a non-zero author
-  // stamp (a zero mvcc -- classic Redis/KeyDB link, or a DFLY link to a non-active node -- is
+  // stamp (a zero mvcc -- a raw classic command, or a DFLY link to a non-active node -- is
   // never guarded). Delegates to multimaster_lww.h's single predicate rather than re-implementing
   // the rule; consulted by ShouldDropForLww (transaction.cc, below) for every kSingleKey command.
   bool IsLwwGuarded() const {
@@ -738,7 +738,7 @@ class Transaction {
 
   // drakeydb: P4-4 -- the streaming LWW guard's per-link bit, mirroring repl_origin_idx_/
   // repl_mvcc_ above (see SetReplOrigin/IsLwwGuarded). False for an ordinary client-issued
-  // transaction and for a non-guarded apply (plain replica, classic link, flag off).
+  // transaction and for a non-guarded apply (plain replica, a raw classic command, flag off).
   bool repl_lww_guard_{false};
 
   std::atomic_uint32_t use_count_{0};  // transaction exists only as an intrusive_ptr
