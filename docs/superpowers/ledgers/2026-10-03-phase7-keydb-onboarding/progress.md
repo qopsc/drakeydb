@@ -251,6 +251,62 @@ in the orchestrator's scratchpad (`gate-p71/`).
   swapped in while the header is written, so a revert fails every run: `6a28474` (the owner chose
   to fix it in this PR). The fail-fast build matrix had cancelled the other five legs.
 
-## P7-2 … P7-4
+## P7-2 `feat/phase7-2-author-stamps-dedup-guard` (cut from `origin/main` @ `0f79bf5a`, #11 merged)
+
+Planning session 2026-10-17 (Fable 5.1; decisions 42–46). Implementer Sonnet 5.5, reviewer Opus 5.5.
+
+### Environment (local, replaces the cloud sandbox of P7-0/P7-1)
+
+- Docker container `drakeydb-p7` (OrbStack, arm64, image `drakeydb-build:deps-p4`, Ubuntu 24.04,
+  gcc 13.3, cmake 3.28, 12 cores, 7 GB RAM, `--security-opt seccomp=unconfined`), the Paseo
+  worktree `~/.paseo/worktrees/2wtglncc/feat-phase7-2-author-stamps-dedup-guard` mounted at
+  **`/home/user/drakeydb`** so the briefs' absolute paths hold. No tarball shim needed.
+- `/root/drakey-venv-pinned` recreated from `tests/dragonfly/requirements.txt` (redis-py 7.4.1,
+  pytest 9.1.1); KeyDB v6.3.4 rebuilt (`make -j4 BUILD_TLS=no USE_SYSTEMD=no MALLOC=libc`) to
+  `/root/keydb-bin/keydb-server` (`KEYDB_SERVER_PATH`).
+- `feat/phase4-5-tombstone-lifecycle` pushed to origin as a backup before any P7-2 work (decision 43).
+
+### Task log
+
+- Step 1: configure (`blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF`) OK; full `ninja -j4` of unmodified
+  `0f79bf5a`: 1016/1016, exit 0, no errors; the only 3 warnings are helio's `examples/redis_dict`
+  `_POSIX_C_SOURCE` redefinition (not fork code). Smoke on the unmodified tree: `classic_replay_test`
+  107/107; `keydb_harness_test.py` 21 passed (`KEYDB_REQUIRED=1`).
+- Task 2.1: brief `task-2.1-brief.md`; implementer dispatched (Paseo agent `600ff356`, Sonnet 5.5).
+- Task 2.1: implementer DONE (`task-2.1-report.md`; 13 files, +530/−17; `classic_replay_test`
+  107, `multi_master_test` 229+1 skip, pytest file 171 passed / 3 skipped / 1 failed, the failure
+  pre-existing on HEAD here). Rulings: R1 gauge predicate `ActiveKeyDbMasterSeen() || Size() > 1`
+  (byte-identity for a stock master; the brief's `value != 0` was wrong for a gauge that is never 0);
+  R2 overflow counted per resolution; R3 cap set process-wide with the test reset hook. Review
+  dispatched (Opus 5.5; `task-2.1-review-brief.md`).
+- Task 2.1: review **Needs fixes** (`task-2.1-review.md`): 0 Critical; I1 the restart pytest does not
+  distinguish a same-uuid reconnect from a restart (mutant M8 passes); I2 nothing pins the two new
+  `/metrics` series absent on a stock master (mutant M9 passes); m1–m6 comment/help/marker wording and
+  the cap counting another link's own forwarded uuid (m4). Probes (a)–(e) clean; R1–R3 implemented.
+  Ruling R5: fix all, m4 by the `FindIdx` short-circuit (spec wording: a link's own uuid never counts).
+  Fix round 1 dispatched to the same implementer (`task-2.1-fix1.md`).
+- Env trap: `paseo send <agent> …` blocks until the agent finishes; run it with `--no-wait`, or
+  under `timeout`, never in a foreground shell with other work behind it.
+- Task 2.1: fix round 1 DONE (report §Fix round 1): I1 same-uuid reconnect via `CLIENT KILL TYPE
+  replica` asserts 0 changes / size 2 (M8 now fails); I2 absence tests pin both new series absent on a
+  stock master and the gauge `== 2` on a peer node (M9 now fails); m4 `FindIdx` short-circuit + new
+  gtest `AnotherLinksOwnUuidDoesNotConsumeTheCap` (falsified); m1/m2/m3/m5/m6 wording/marker.
+  `classic_replay_test` 108, `multi_master_test` 229+1 skip, reviewer's pytest selection 17 passed,
+  pre-commit clean (also verified by the orchestrator on the host). Scoped re-review dispatched (Opus).
+- BASELINE FINDING (this environment, unmodified `0f79bf5a`):
+  `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
+  RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
+  dispatched (`triage-live-write-peer-mode-brief.md`).
+  Triage result (`triage-live-write-peer-mode.md`): **not a fork bug**. `rdb::errc` 5 = the type
+  byte read hit end of stream because pytest teardown SIGTERMed KeyDB after `wait_for_peer_link`'s
+  300×0.1 s budget (~44 s); the sync takes ~50 s here because `usleep(100)` measures ~2.2 ms in the
+  OrbStack arm64 VM and KeyDB slices `rdb-key-save-delay 400` into 4 sleeps per key × 5105 keys.
+  Plain mode passes only because its wait has `timeout=120`. x86_64 sandbox timers (~0.15 ms) hid it.
+  Ruling R4: fix the test in P7-2 as its own commit (after Task 2.1 lands): `wait_for_peer_link` and
+  `assert_full_sync_arrived` on a 120 s timeout like `wait_available_async`, and size the sync window
+  by `BULK_KEYS`/`RDB_KEY_SAVE_DELAY_US` so it lasts a few seconds on both fast and coarse-timer hosts
+  while keeping ≥ 20 in-window writes; the failure message reports the measured sync duration.
+
+## P7-3 … P7-4
 
 Pending (see plan).
