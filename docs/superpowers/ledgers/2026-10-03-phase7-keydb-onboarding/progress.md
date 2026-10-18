@@ -398,7 +398,29 @@ Task 2.3: complete (clean after 1 fix round).
   probe table). Not run yet: `multimaster_test.py`, `keydb_harness_test.py`, `redis_replication_test.py`,
   `ctest -L DFLY` (gate items).
 Task 2.4: complete (clean after 1 fix round). **Task 1.6 reopened** (Step 1 measure, dispatched).
-- Task 2.5 (docs): done by the orchestrator.
+Task 2.5: complete (docs commit by the orchestrator: D-1 closed, PLAN.md P4-5 reconciliation and P7
+row, 25 plan checkboxes ticked, Task 1.6 status, spec D-5 amendment, decisions 47–49).
+- Task 1.6 Step 1: investigator dispatched (Sonnet, `task-1.6-step1-brief.md`); container reserved for
+  its measurements. Task 2.6 brief next; 2.6 starts after the measurement finishes.
+- Task 1.6 Step 1 interim (flag bisection, keydb output-buffer limit lifted so peer runs produce
+  numbers): plain 743–762k ops/s at 82 % replica CPU (~1.1 µs/op); peer 536–562k at 100 % CPU
+  (~1.8 µs/op, ~70–75 % of plain); `--multi_master_stream_lww=false` 514k, `--multi_master_tombstone_ttl=0`
+  543k, both 517k: neither flag helps, so ~0.7 µs/op per applied write is elsewhere (side table /
+  journal / guard lookup: the compile-outs decide). The agent paused when Task 2.6's edits appeared in
+  the tree; ruled to proceed on the current tree with fresh baselines (2.6 touches nothing on the
+  per-write path).
+- Task 2.6: implementer dispatched (fresh Sonnet; `task-2.6-brief.md`) in read/write-only mode until
+  the container is free.
+- Task 1.6 Step 1 DONE (`task-1.6-step1-report.md`): plain 745–758k ops/s at 84 % CPU (1.1 µs/op);
+  peer 519–562k at 100 % (1.8–1.9 µs/op, 69–75 % of plain). Compile-outs: `SetMvcc` no-op 71 % (no
+  change), `ShouldDropForLww` false 69 % (no change), **`RecordEntry` skipped for applied writes 95 %
+  (ratio 0.985, passes the 0.95 bar, 1.41 µs/op)**, all three 88 %. perf (10 s, 9,869 samples):
+  `journal::RecordEntry` 18.9 % inclusive (`AddLogRecord` 15.6 %, `JournalWriter::Write` into a
+  `StringSink` ~9 %), `LogJournalOnShard` 20.5 %; next `FindMutable` 12 % (side-table `FindByFp`
+  4.2 % self), `LaunderIfNeeded` 5.2 %, `clock_gettime` 4.1 %. Diagnostics reverted (`cmp`), real
+  release binary rebuilt 18:07Z. perf binary: `/usr/lib/linux-tools/6.8.0-147-generic/perf`.
+  **Step 2 (design note) pending**: candidate = do not encode a journal entry for an applied write
+  when no consumer is attached, or encode lazily; owner call on the peer bar still open.
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
