@@ -353,6 +353,52 @@ Task 2.2: complete (clean after 1 fix round).
   (a); new pytest ×5 stable). Nit N1 (a ruling ID in a test comment) fixed by the orchestrator.
 Task 2.3: complete (clean after 1 fix round).
 - Task 2.4: dispatched (fresh Sonnet; `task-2.4-brief.md`).
+- Task 2.4: implementer DONE (`task-2.4-report.md`; 8 files, +712/−98; `ClassicApplyRewrites`, the
+  per-link guard bit in `ConsumeRedisStream`, `CommandScope::Unguard` for EVAL, docs; `classic_replay_test`
+  137 → 148; 8 falsifications incl. the tripwire SIGABRT under m5; pytest `-m 'not slow'` 181 passed).
+  **FINDING (Step 5): the peer-mode release perf bar FAILS** — KeyDB drops the peer replica at its
+  256 MB `omem` limit ~9 s into a ~775k ops/s load (plain mode passes at ratio 1.0001 on this box);
+  it fails identically with the guard off, the rewrites removed and stamping compiled out, so it is a
+  pre-existing peer-node limit (an `--active_replica` node journals and side-table-stamps every applied
+  write), not Tasks 2.2–2.4. Per the plan this reopens **Task 1.6** (measure first). Ruling R15: the
+  review proceeds on spec/quality and confirms the attribution with release re-runs; a Task 1.6
+  Step 1 profiling investigation runs after the review (not concurrently: perf numbers). Owner call
+  flagged: whether a peer node's bar is the plain one (decision 12 says "must keep up with KeyDB").
+  Ruling R16: the `test_unwrap_flushes_raw_batch_before_envelope[peer_mode]` mvcc adjustment is
+  accepted if its original falsification still bites. Review dispatched (fresh Opus).
+- **INCIDENT (2026-10-18, found by the Task 2.4 reviewer):** the main checkout's `.git` under
+  `~/Documents` (iCloud) had every packfile and ~400 loose objects offloaded as macOS "dataless"
+  files (the Mac disk is at 99 %); git read "far too short to be a packfile" and hung on reads. The
+  worktree's `.git` was a pointer into that store. `brctl download` materializes files but macOS
+  re-evicts within minutes while the disk stays full. Remedy taken (non-destructive): the P7-2
+  worktree got its own object store (`git init` + `git fetch origin` + `git reset
+  origin/feat/phase7-2-…` with the working tree untouched; the old gitdir pointer and a tarball of
+  the uncommitted Task 2.4 files are in `~/.paseo/rescue/`); helio re-cloned into it. Nothing was
+  lost: every commit was on origin, the modified files live under `~/.paseo`. **Owner follow-ups:**
+  free Mac disk space (Docker reports 22 GB build cache + 29 GB unused images reclaimable), move the
+  main checkout out of iCloud-synced `~/Documents` (or disable Optimize Storage), and `git fsck` it
+  after materializing; the Paseo workspace still points at the same path and keeps working.
+- Env trap: a defunct `classic_replay_` zombie (pid 50327) in `drakeydb-p7` cannot be killed and is
+  harmless; `pgrep` matches it (the ledger's earlier warning).
+- Task 2.4: review **Needs fixes** (`task-2.4-review.md`): 0 Critical; I1 stale invariants outside the
+  diff (`conn_context.h`, `test_utils.h`, `transaction.h`, `multi-master.md:140`) still say a classic link
+  is never guarded / carries no mvcc; M1–M8 (doc precision, `EVAL_RO`, the raw path unpinned, a wasted
+  copy in `RewriteSet`, process text, a table special case, a behavioural guard-restore check).
+  Probes (a)–(e) clean; R16 verified (the adjusted test still fails under its P7-1 mutant). **R15
+  confirmed by the reviewer's own release runs**: peer mode FAILS (omem 256 MB drop) with the guard
+  on and off; plain passes at ratio 1.0 / 721k ops/s. Ruling R17: fix all nine. Fix round 1
+  dispatched to the same implementer (`task-2.4-fix1.md`); Task 1.6 Step 1 brief written
+  (`task-1.6-step1-brief.md`), to run after the 2.4 commit.
+- Task 2.4: fix round 1 DONE (report §Fix round 1): I1 stale invariants retired in four files; M3
+  `StartsWithIgnoreCase("EVAL")`; M4 `test_raw_stream_conditional_set_stays_conditional` (falsified by
+  rewriting the raw path); M5 no copy when nothing to drop; M8 behavioural guard-restore check
+  (falsified with the field read removed); 148 gtests, pytest selection 46 passed; pre-commit clean
+  (host-verified). Scoped re-review dispatched (Opus, same reviewer; no perf runs).
+- Task 2.4: re-review **Clean** (M4 and M8 reproduced; M5 result-identical on the reviewer's 14-row
+  probe table). Not run yet: `multimaster_test.py`, `keydb_harness_test.py`, `redis_replication_test.py`,
+  `ctest -L DFLY` (gate items).
+Task 2.4: complete (clean after 1 fix round). **Task 1.6 reopened** (Step 1 measure, dispatched).
+- Task 2.5 (docs): done by the orchestrator.
 - BASELINE FINDING (this environment, unmodified `0f79bf5a`):
   `test_keydb_active_live_write_during_full_sync[peer_mode]` fails 4/4 (`Internal error when loading
   RDB file 5`, `sync_in_progress` stuck); plain mode passes; P7-1's x86_64 gate had it green. Triage
