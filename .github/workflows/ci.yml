@@ -438,7 +438,9 @@ jobs:
     runs-on: CI-LARGE-ARM
     # Skipped on push-to-main (warm) because its build cache (df_common_bin / Linux-ARM64-Release-
     # gcc-g++) is already warmed on main by the scheduled regression-tests job.
-    if: github.event_name != 'push'
+    # drakeydb: P7-2 -- and skipped on forks, which have no CI-LARGE-ARM runner (the job would wait
+    # a day for one and cancel, leaving the PR UNSTABLE).
+    if: github.event_name != 'push' && github.repository_owner == 'dragonflydb'
 
     permissions:
       id-token: write

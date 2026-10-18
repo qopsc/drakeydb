@@ -46,6 +46,9 @@ concurrency:
 
 jobs:
   fuzz-pr:
+    # drakeydb: P7-2 -- CI-LARGE-86 is dragonflydb's self-hosted runner; a fork has none, and the job
+    # would wait a day for one and cancel, leaving the PR UNSTABLE.
+    if: github.repository_owner == 'dragonflydb'
     runs-on: CI-LARGE-86
     timeout-minutes: 60
 
