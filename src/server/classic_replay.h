@@ -17,6 +17,7 @@
 #include "facade/resp_expr.h"
 #include "server/common_types.h"
 #include "server/replica_types.h"
+#include "util/fibers/synchronization.h"
 
 namespace facade {
 class CapturingReplyBuilder;
@@ -170,14 +171,20 @@ std::vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& tot
                                                     bool active_master_seen);
 
 // The process-wide values beside `multimaster_lww_dropped`, which INFO and /metrics show:
-// `multimaster_keydb_author_overflow` (a counter, ClassicAuthorMap) and the gauge
+// `multimaster_rreplay_deduped` (a counter, AuthorDedup), `multimaster_keydb_author_overflow` (a
+// counter, ClassicAuthorMap) and the gauge
 // `multimaster_peer_registry_size` (PeerRegistry::Size(): its growth is the append-only cost of
 // every author, spec D-4). Each renders once an active KeyDB master has been seen
-// (`active_master_seen`, ActiveKeyDbMasterSeen() in production) or when it has moved: the counter
+// (`active_master_seen`, ActiveKeyDbMasterSeen() in production) or when it has moved: a counter
 // when nonzero, the gauge when the registry holds more than the local node.
-std::vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t author_overflow,
+std::vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t rreplay_deduped,
+                                                          uint64_t author_overflow,
                                                           size_t peer_registry_size,
                                                           bool active_master_seen);
+
+// Envelopes dropped because their author's watermark already covered them
+// (multimaster_rreplay_deduped), process-wide and monotonic.
+uint64_t ClassicRreplayDedupedTotal();
 
 // How many resolutions of a forwarded author --classic_author_cap refused
 // (multimaster_keydb_author_overflow).
@@ -227,6 +234,67 @@ class ClassicAuthorMap {
   absl::flat_hash_map<std::string, uint32_t> resolved_;
 };
 
+// KeyDB's g_mapremote: per author uuid, the highest mvcc of that author applied on this node,
+// shared by every classic link, plain or peer (spec D-5). Process-wide (Instance()), because the
+// links are and because a mesh delivers the same envelope on more than one of them, possibly at the
+// same instant: Reserve makes exactly one of them dispatch it.
+//
+// `mu_` is a leaf lock: never held across a dispatch, a PeerRegistry::AddOrGet, an AwaitBrief, a
+// log call or the caller's running() callback, and never re-entered (fb2::Mutex is not reentrant).
+// The map is not pointer-stable, so every wait looks the entry up again. An mvcc of 0 is "unknown"
+// (KeyDB never dedups it): it is never reserved, applied or advanced.
+inline constexpr size_t kMaxAuthorDedupEntries = 4096;
+
+class AuthorDedup {
+ public:
+  enum class Verdict { kApply, kDrop, kCancelled };
+
+  // `now_ms` stamps Entry::last_seen_ms (eviction order); wall clock when empty.
+  explicit AuthorDedup(size_t max_entries = kMaxAuthorDedupEntries,
+                       std::function<uint64_t()> now_ms = {});
+
+  static AuthorDedup& Instance();
+
+  // kDrop: `mvcc` of `uuid` is already applied. kApply: the caller now holds the author's one
+  // reservation and must Commit or Release it. Waits (100 ms at a time) while another link holds
+  // it, and returns kCancelled once `running()` is false after a wait. `uuid` is normalized.
+  Verdict Reserve(std::string_view uuid, uint64_t mvcc, const std::function<bool()>& running);
+
+  // The reservation's command ran: its mvcc is applied; wakes the waiters.
+  void Commit(std::string_view uuid, uint64_t mvcc);
+  // The reservation's command did not run: nothing is applied; wakes the waiters.
+  void Release(std::string_view uuid);
+  // An envelope the author sent was handled without a reservation (skipped, or it wrapped one).
+  void Advance(std::string_view uuid, uint64_t mvcc);
+  bool IsApplied(std::string_view uuid, uint64_t mvcc);
+
+  // A flushing full sync replaced the dataset: forget what the old one held. Entries with a
+  // reservation in flight stay (another link is mid-dispatch), with applied reset.
+  void Clear();
+  // Tests: forgets everything, reservations included.
+  void ClearAllForTest();
+
+  size_t size();
+
+ private:
+  struct Entry {
+    uint64_t applied = 0;
+    uint64_t inflight = 0;
+    uint64_t last_seen_ms = 0;
+  };
+
+  // Finds or inserts the entry of `uuid`; past the bound, first evicts the idle entry with the
+  // smallest last_seen_ms (an O(n) scan on an insert). Under mu_.
+  Entry& EntryLocked(std::string_view uuid);
+  uint64_t NowMs() const;
+
+  const size_t max_entries_;
+  std::function<uint64_t()> now_ms_;
+  util::fb2::Mutex mu_;
+  util::fb2::CondVarAny cv_;
+  absl::flat_hash_map<std::string, Entry> entries_;
+};
+
 enum class EnvelopeResult {
   // The envelope is dealt with, whatever came of it: the stream offset advances past its bytes.
   kConsumed,
@@ -234,8 +302,8 @@ enum class EnvelopeResult {
   // advance, so that a partial resync resumes at this envelope. The context's selected db may have
   // moved, and that is harmless: selecting is idempotent, and the resumed stream reads this
   // envelope again and its layers select the same dbs in the same order before anything is
-  // dispatched. Today nothing has been selected either, as running() is asked first; the dedup
-  // reservation of the leaf (P7-2) may cancel after a layer selected its db.
+  // dispatched. Nothing is selected when running() was false, but the dedup reservation of the leaf
+  // may cancel after a layer selected its db.
   kNotConsumed,
 };
 
@@ -309,15 +377,27 @@ class ClassicApplier {
   // to an array, a nil array and a nil, none of which is a command to name or dispatch.
   static bool ParseSingleCommand(std::string_view bytes, facade::RespVec* args);
 
+  // What became of the innermost command of an envelope tree (the leaf).
+  enum class Leaf {
+    kSkipped,    // a control, KeyDB-only or unknown command: handled, nothing dispatched
+    kApplied,    // dispatched and ran (it may have replied an error): its mvcc is committed
+    kDeduped,    // the author's watermark already covered it
+    kRejected,   // the dispatch result was not OK (refused before it ran, or it reported OOM):
+                 // consumed, the watermark stays
+    kCancelled,  // the reservation was cancelled: nothing dispatched or counted, not consumed
+  };
+
   // Runs the unwrapped command, `args[0]` of which is a string, in the db the context has
   // selected. Control commands and KeyDB-only ones are skipped, and so is a command this server
   // has none for (counted, and not dispatched into the error builder). `author` (normalized) and
-  // `mvcc` belong to the innermost envelope, the one the command came out of.
-  void ApplyCommand(const facade::RespVec& args, std::string_view author, uint64_t mvcc);
+  // `mvcc` belong to the innermost envelope, the one the command came out of: a dispatched command
+  // runs under that author's reservation in AuthorDedup (spec D-5).
+  Leaf ApplyCommand(const facade::RespVec& args, std::string_view author, uint64_t mvcc);
 
   // Dispatches the already filled `cmd` and returns the text of its failure, if it failed: the
-  // dispatcher rejected it, or it replied an error.
-  std::optional<std::string> Dispatch(CommandContext* cmd);
+  // dispatcher rejected it, or it replied an error. `*ran` (if given) is false iff the dispatch
+  // result was not OK: rejected before running, or the command reported OOM.
+  std::optional<std::string> Dispatch(CommandContext* cmd, bool* ran = nullptr);
 
   // Selects `db` for the context. The first use of a db dispatches a real SELECT (so its tables
   // exist on every shard, as JournalExecutor::SelectDb does); later uses only set the index. False
@@ -337,6 +417,7 @@ class ClassicApplier {
   ClassicLinkStats* stats_;
   std::function<bool()> running_;
   ClassicAuthorMap authors_;
+  AuthorDedup& dedup_ = AuthorDedup::Instance();
   // What the context's repl_origin_idx was when the applier was built (the link's own origin,
   // set by ConsumeRedisStream): where ApplyCommand's scope puts it back. In production it equals
   // ClassicAuthorMap's link idx (both are peer_origin_idx_); it is read from the context because a

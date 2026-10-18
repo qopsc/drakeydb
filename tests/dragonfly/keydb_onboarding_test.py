@@ -10,6 +10,7 @@ tests need no KeyDB.
 import asyncio
 import contextlib
 import functools
+import itertools
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from .fake_classic_master import (
     resp_command,
 )
 from .instance import DflyInstanceFactory, RedisServer
+from .proxy import Proxy
 from .replication_utils import get_metric_value
 from .utility import assert_eventually, skip_if_not_in_github, wait_available_async
 
@@ -883,8 +885,16 @@ async def test_classic_stream_command_with_an_array_for_a_name_does_not_abort(
     assert node.find_in_logs(r"Skipping a command without a name from 127\.0\.0\.1:\d+")
 
 
-def rreplay(*command, uuid="b1198d29-cb88-4110-922a-a6c99bd08471", db=0, mvcc=1):
-    """The RREPLAY envelope an active KeyDB wraps `command` in."""
+# Far above the explicit mvccs the tests spell out: a node drops an envelope at or below the
+# author's watermark, so a default one followed by a lower explicit one would be dropped.
+RREPLAY_MVCC = itertools.count(1 << 40)
+
+
+def rreplay(*command, uuid="b1198d29-cb88-4110-922a-a6c99bd08471", db=0, mvcc=None):
+    """The RREPLAY envelope an active KeyDB wraps `command` in. A node drops an envelope whose
+    (author, mvcc) it has applied, so an mvcc left out is a fresh, higher one on every call: a
+    stream of envelopes of one author is a stream of different writes."""
+    mvcc = next(RREPLAY_MVCC) if mvcc is None else mvcc
     return resp_command("RREPLAY", uuid, resp_command(*command), db, mvcc)
 
 
@@ -2680,7 +2690,16 @@ async def test_info_and_metrics_show_classic_counters(
     if peer_mode:
         assert info["master0"]["repl_offset"] > 0, info
 
-    series = classic_series(await node.metrics())
+    # The process-wide values show once an active KeyDB master has been seen, zeros included.
+    assert int(info["multimaster_rreplay_deduped"]) == 0, info
+    assert int(info["multimaster_keydb_author_overflow"]) == 0, info
+
+    metrics = await node.metrics()
+    for name in ("multimaster_rreplay_deduped", "multimaster_keydb_author_overflow"):
+        process_wide = metrics[f"dragonfly_{name}"]
+        assert process_wide.type == "counter", process_wide
+        assert [sample.value for sample in process_wide.samples] == [0], process_wide
+    series = classic_series(metrics)
     assert list(series) == CLASSIC_COUNTERS, series
     assert series["keydb_cmds_dropped"] == 1, series
     for name in CLASSIC_COUNTERS:  # the process-wide sum is never behind the link's own count
@@ -2828,6 +2847,243 @@ async def test_keydb_write_stamped_with_author_hash(
         assert len(from_a) == 1, from_a
         assert from_b != from_a, (from_b, from_a)  # B's writes carry B's hash, not the forwarder's
         assert own not in from_b | from_a, (own, from_b, from_a)
+
+
+PIPELINED_INCRS = 2000
+
+
+async def pipelined_incr(client, key, n):
+    """`n` INCRs of `key` in one pipeline, i.e. at the rate the connection and the server allow."""
+    pipe = client.pipeline(transaction=False)
+    for _ in range(n):
+        pipe.incr(key)
+    await pipe.execute()
+
+
+@pytest.mark.keydb
+async def test_keydb_mesh_forwarded_duplicates_deduped(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """KeyDB A and B are each other's replica and forward what they replay; one peer node is
+    attached to both. A write of A reaches the node twice: straight from A (an envelope of A's), and
+    from B (an envelope of B's wrapping A's own, nested), over two links whose fibers run at once.
+    N pipelined INCRs on A must leave the counter at exactly N, and the node must have dropped at
+    least N envelopes.
+
+    Falsifying: a dedup that only checks before it dispatches (reads the author's watermark, runs
+    the command, advances after) lets both links through whenever their deliveries overlap, which a
+    pipeline at full rate makes them do: the counter ends in (N, 2N]. How far depends on the
+    box; the unit test AuthorDedupTest.ConcurrentSameEnvelopeAppliesOnce is the deterministic
+    proof. With no dedup at all the counter ends at 2N.
+    """
+    flags = dict(active_replica=True, multi_master=True, no_forward=False)
+    a = keydb_server_factory(**flags)
+    b = keydb_server_factory(**flags)
+
+    async with a.client() as ka, b.client() as kb:
+        await ka.execute_command("REPLICAOF", "localhost", b.port)
+        await kb.execute_command("REPLICAOF", "localhost", a.port)
+
+        @assert_eventually(times=300)
+        async def mesh_up():
+            for k in (ka, kb):
+                assert (await k.info("replication"))["master_link_status"] == "up"
+
+        await mesh_up()
+
+        node = df_factory.create(
+            proactor_threads=2,
+            dir=str(tmp_path / "df"),
+            active_replica="true",
+            multi_master="true",
+        )
+        node.start()
+        c = node.client()
+        assert await c.execute_command(f"REPLICAOF localhost {a.port}") == "OK"
+        assert await c.execute_command(f"REPLICAOF localhost {b.port}") == "OK"
+
+        @assert_eventually(timeout=SYNC_WAIT_TIMEOUT_S)
+        async def both_links_up():
+            info = await c.info("replication")
+            assert info["connected_masters"] == 2, info
+            for name in ("master0", "master1"):
+                link = info[name]
+                assert link["link_status"] == "up" and link["sync_in_progress"] == 0, info
+
+        await both_links_up()
+
+        # "Up" can precede a link's full sync, and a snapshot merged in the middle of the INCRs would
+        # carry counts the stream also delivers. A write that went through each link's stream proves
+        # its sync is over: the marker reaches the node over both links (B forwards A's write).
+        await ka.set("marker", "1")
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def both_streams_flowing():
+            info = await c.info("replication")
+            assert info["master0"]["rreplay_unwrapped"] >= 1, info
+            assert info["master1"]["rreplay_unwrapped"] >= 1, info
+            assert await c.get("marker") == "1"
+
+        await both_streams_flowing()
+
+        await pipelined_incr(ka, "c", PIPELINED_INCRS)
+
+        @assert_eventually(times=300)
+        @retry_while_loading
+        async def converged():
+            assert int(await ka.get("c")) == PIPELINED_INCRS
+            assert int(await kb.get("c")) == PIPELINED_INCRS
+            # Both copies reached the node: the counter below can only be N if one was dropped.
+            info = await c.info("replication")
+            assert int(info["multimaster_rreplay_deduped"]) >= PIPELINED_INCRS, info
+
+        await converged()
+        await asyncio.sleep(0.5)  # a late second copy would push the counter past N
+        assert int(await c.get("c")) == PIPELINED_INCRS
+        info = await c.info("replication")
+        assert int(info["multimaster_rreplay_deduped"]) >= PIPELINED_INCRS, info
+        series = (await node.metrics())["dragonfly_multimaster_rreplay_deduped"]
+        assert series.type == "counter", series
+        assert series.samples[0].value >= PIPELINED_INCRS, series
+
+
+@pytest.mark.keydb
+async def test_master_switch_full_sync_resets_author_dedup(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A plain replica D of KeyDB C1 is moved to C2, the other half of a forwarding mesh, whose link
+    to C1 is stalled by a proxy so that it has none of what C1 took meanwhile. D applied those
+    N INCRs from C1 and holds C1's watermark; REPLICAOF C2 is a flushing full sync, and when the
+    proxy is let through, C2 forwards the same N envelopes of C1's (nested in C2's) to D. They are
+    new to the flushed dataset, so all N must apply: `c == N`.
+
+    Falsifying: without `AuthorDedup::Clear()` at the flush point (replica.cc, InitiatePSync) D's
+    watermark for C1 still covers them and drops them: `c == N - k`, with k the number it held.
+    The unit test AuthorDedupTest.ClearResetsAppliedKeepsInflight pins the Clear itself.
+    """
+    flags = dict(active_replica=True, multi_master=True, no_forward=False)
+    c1 = keydb_server_factory(**flags)
+    c2 = keydb_server_factory(**flags)
+    n = 100
+
+    async with c1.client() as k1, c2.client() as k2:
+        async with Proxy("127.0.0.1", 0, "127.0.0.1", c1.port) as proxy:
+            await k2.execute_command("REPLICAOF", "127.0.0.1", proxy.port)
+            await k1.execute_command("REPLICAOF", "localhost", c2.port)
+
+            @assert_eventually(times=300)
+            async def mesh_up():
+                for k in (k1, k2):
+                    assert (await k.info("replication"))["master_link_status"] == "up"
+
+            await mesh_up()
+
+            node, d = await attach_plain_replica(df_factory, tmp_path, c1)
+
+            proxy.pause()
+            for _ in range(n):
+                await k1.incr("c")
+
+            @assert_eventually(times=300)
+            @retry_while_loading
+            async def d_applied_from_c1():
+                assert int(await d.get("c")) == n
+
+            await d_applied_from_c1()
+            # C2 has not seen most of them: the proxy holds them back (the read in flight when it
+            # was paused still delivers its first chunk).
+            assert int(await k2.get("c") or 0) < n
+
+            assert await d.execute_command(f"REPLICAOF localhost {c2.port}") == "OK"
+            await wait_available_async(d)
+
+            @assert_eventually(times=300)
+            async def d_follows_c2():
+                info = await d.info("replication")
+                assert info["master_port"] == c2.port, info
+                assert info["master_link_status"] == "up", info
+
+            await d_follows_c2()
+            assert int(await d.get("c") or 0) < n  # flushed: C2's snapshot is all D holds
+
+            proxy.resume()
+
+            @assert_eventually(times=300)
+            @retry_while_loading
+            async def c2_forwarded_to_d():
+                assert int(await k2.get("c")) == n
+                assert await d.get("c") == str(n)
+
+            await c2_forwarded_to_d()
+
+
+@pytest.mark.parametrize("peer_mode", [False, True], ids=["plain_replica", "peer_mode"])
+async def test_resync_keeps_author_dedup_on_a_peer_merge_and_resets_it_on_a_flush(
+    df_factory: DflyInstanceFactory, tmp_path, peer_mode
+):
+    """The scripted master streams `INCR c` (author X, mvcc 5), the link is dropped, and the master
+    answers the reconnect with a second full sync whose tail streams the very same envelope again.
+
+    A peer node's full sync is a merge, nothing is flushed, so `c` is still 1 and the watermark of X
+    still holds: the replay is dropped. `c == 1`, `multimaster_rreplay_deduped == 1`. A plain
+    replica flushes: `c` is gone, and the replay is applied to the emptied dataset: `c == 1` again,
+    and nothing was dropped (deduped 0), which is only so because `AuthorDedup::Clear()` ran at the
+    flush (replica.cc, InitiatePSync). The master-switch test above shows the same through KeyDB.
+
+    Falsifying: `Clear()` also on the peer merge makes the peer node apply the replay (`c == 2`,
+    deduped 0); no `Clear()` at the flush makes the plain replica drop it (`c` absent, deduped 1).
+    """
+    envelope = rreplay("INCR", "c", mvcc=5)
+    marker = resp_command("SET", "marker", "1")
+    async with FakeClassicMaster() as master:
+        if peer_mode:
+            master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(
+            diskless_full_sync(offset=SYNC_OFFSET),
+            stream=envelope,
+            stream_delay=SECOND_WRITE_DELAY_S,
+        )
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied_once():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("c") == "1"
+
+        await applied_once()
+
+        # The reconnect: a full sync, and behind it the same envelope.
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + envelope))
+        await master.drop_connections()
+        assert await master.wait_for_connections(2, timeout=30) == 2, "the replica never came back"
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def streaming_again():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            info = await c.info("replication")
+            link = info["master0"] if peer_mode else info
+            link_status = link["link_status"] if peer_mode else link["master_link_status"]
+            assert link_status == "up", info
+            assert master.stream_writer is not None
+
+        await streaming_again()
+        # Whatever the full sync's tail held is applied before this.
+        await master.send_stream(marker)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def marker_arrived():
+            assert await c.get("marker") == "1"
+
+        await marker_arrived()
+        info = await c.info("replication")
+        deduped = int(info.get("multimaster_rreplay_deduped", 0))
+        value = await c.get("c")
+        expected = ("1", 1 if peer_mode else 0)
+        assert (value, deduped) == expected, f"(c, deduped) is {(value, deduped)}, not {expected}"
 
 
 async def attach_scripted_master(df_factory, tmp_path, master, peer_mode):
@@ -3128,6 +3384,8 @@ async def assert_no_classic_fields(node, c, peer_mode, has_master=True):
     # gauge only on a node that has a peer link (the registry holds the node and its master).
     assert "multimaster_keydb_author_overflow" not in info, info
     assert "dragonfly_multimaster_keydb_author_overflow" not in metrics
+    assert "multimaster_rreplay_deduped" not in info, info
+    assert "dragonfly_multimaster_rreplay_deduped" not in metrics
     if not peer_mode:
         assert "multimaster_peer_registry_size" not in info, info
         assert "dragonfly_multimaster_peer_registry_size" not in metrics
@@ -3624,12 +3882,19 @@ async def sleep_until_ms(ms):
     await asyncio.sleep(max(0, ms - now_ms()) / 1000)
 
 
+KEYDB_MVCC_COUNTER = itertools.count(1)  # low bits only: the milliseconds order the mvccs
+
+
 def keydb_mvcc(ms):
     """The mvcc an active KeyDB mints at `ms` on its clock: the milliseconds above the 20 low bits
     of a counter (`MVCC_MS_SHIFT`, `server.h:960`; `incrementMvccTstamp`). The envelopes of
     tests/dragonfly/data/README.md carry the very `mstime()` the same command's `PXAT` was
-    computed from (the mvcc's milliseconds equal the `PXAT` minus the relative TTL asked for)."""
-    return ms << 20
+    computed from (the mvcc's milliseconds equal the `PXAT` minus the relative TTL asked for).
+
+    Every call returns a different one: KeyDB's counter in the low bits makes the mvccs of the
+    commands it runs in one millisecond differ, and a node drops an envelope whose (author, mvcc) it
+    has applied."""
+    return (ms << 20) | (next(KEYDB_MVCC_COUNTER) & 0xFFFFF)
 
 
 def stream_command(framing, *command, master_ms=0):

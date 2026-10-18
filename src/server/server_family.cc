@@ -3179,8 +3179,9 @@ string ServerFamily::FormatInfoMetrics(
         // link, so this stays exactly 0 -- never printed -- on a non-active node.
         append("multimaster_lww_dropped", m.coordinator_stats.multimaster_lww_dropped);
         // drakeydb: P7-2 -- the process-wide classic author values, see ClassicProcessWideValues.
-        for (const ClassicCounterValue& value : ClassicProcessWideValues(
-                 ClassicAuthorOverflowTotal(), peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
+        for (const ClassicCounterValue& value :
+             ClassicProcessWideValues(ClassicRreplayDedupedTotal(), ClassicAuthorOverflowTotal(),
+                                      peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
           append(value.name, value.value);
         }
       }
@@ -3218,8 +3219,9 @@ string ServerFamily::FormatInfoMetrics(
         replication_info_cb(summary);
       }
       // drakeydb: P7-2 -- once, after the per-link fields: the values are the process's.
-      for (const ClassicCounterValue& value : ClassicProcessWideValues(
-               ClassicAuthorOverflowTotal(), peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
+      for (const ClassicCounterValue& value :
+           ClassicProcessWideValues(ClassicRreplayDedupedTotal(), ClassicAuthorOverflowTotal(),
+                                    peer_registry_.Size(), ActiveKeyDbMasterSeen())) {
         append(value.name, value.value);
       }
     }

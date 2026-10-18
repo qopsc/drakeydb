@@ -827,8 +827,13 @@ error_code Replica::InitiatePSync() {
       LOG(INFO) << "Peer full sync: merging without flush " << this;
     } else if (slot_range_.has_value()) {
       JournalExecutor{&service_}.FlushSlots(slot_range_.value());
+      // drakeydb: P7-2 -- the watermarks recorded what the dataset just flushed held: a stale one
+      // would drop the envelopes a new master re-delivers (spec D-5, "Reset on a flushing full
+      // sync"). Not on the peer merge above (no flush), nor on +CONTINUE (no sync at all).
+      AuthorDedup::Instance().Clear();
     } else {
       JournalExecutor{&service_}.FlushAll();
+      AuthorDedup::Instance().Clear();
     }
 
     RdbLoadContext load_context;

@@ -537,10 +537,11 @@ void Metrics::Print(uint64_t uptime, const CommandRegistry* registry, DflyCmd* d
     AppendMetricWithoutLabels(StrCat(series.name, "_total"), series.help, series.value,
                               MetricType::COUNTER, &resp->body());
   }
-  // drakeydb: P7-2 -- the process-wide author values: the overflow counter, and the registry size
-  // gauge, which keeps its name.
-  for (const ClassicCounterValue& series : ClassicProcessWideValues(
-           ClassicAuthorOverflowTotal(), peer_registry_size, ActiveKeyDbMasterSeen())) {
+  // drakeydb: P7-2 -- the process-wide author values: the dedup and overflow counters, and the
+  // registry size gauge, which keeps its name.
+  for (const ClassicCounterValue& series :
+       ClassicProcessWideValues(ClassicRreplayDedupedTotal(), ClassicAuthorOverflowTotal(),
+                                peer_registry_size, ActiveKeyDbMasterSeen())) {
     if (series.gauge) {
       AppendMetricWithoutLabels(series.name, series.help, series.value, MetricType::GAUGE,
                                 &resp->body());

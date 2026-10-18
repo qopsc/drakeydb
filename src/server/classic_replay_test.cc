@@ -9,8 +9,11 @@
 #include <absl/strings/str_cat.h>
 #include <absl/strings/substitute.h>
 
+#include <atomic>
+#include <chrono>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -32,6 +35,7 @@
 #include "server/mvcc.h"
 #include "server/namespaces.h"
 #include "server/test_utils.h"
+#include "util/fibers/pool.h"
 
 ABSL_DECLARE_FLAG(bool, active_replica);
 ABSL_DECLARE_FLAG(int32_t, hz);
@@ -601,10 +605,10 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
 
 TEST(ClassicReplayTest, ClassicProcessWideValuesFollowTheRenderPredicate) {
   using Values = vector<tuple<string, uint64_t, bool>>;
-  auto shown = [](uint64_t overflow, size_t registry, bool active_seen) {
+  auto shown = [](uint64_t deduped, uint64_t overflow, size_t registry, bool active_seen) {
     Values out;
     for (const ClassicCounterValue& value :
-         ClassicProcessWideValues(overflow, registry, active_seen)) {
+         ClassicProcessWideValues(deduped, overflow, registry, active_seen)) {
       EXPECT_FALSE(value.help.empty()) << value.name;
       out.emplace_back(string(value.name), value.value, value.gauge);
     }
@@ -612,13 +616,15 @@ TEST(ClassicReplayTest, ClassicProcessWideValuesFollowTheRenderPredicate) {
   };
 
   // Nothing for a node that never met an active KeyDB: a registry of the node itself, no overflow.
-  EXPECT_TRUE(shown(0, 1, false).empty());
-  // Once one has completed a handshake: both, zeros included, the gauge keeping its name.
-  EXPECT_EQ(shown(0, 1, true), (Values{{"multimaster_keydb_author_overflow", 0, false},
-                                       {"multimaster_peer_registry_size", 1, true}}));
-  // Without it, each on its own movement: the counter when nonzero, the gauge past the local node.
-  EXPECT_EQ(shown(3, 1, false), (Values{{"multimaster_keydb_author_overflow", 3, false}}));
-  EXPECT_EQ(shown(0, 5, false), (Values{{"multimaster_peer_registry_size", 5, true}}));
+  EXPECT_TRUE(shown(0, 0, 1, false).empty());
+  // Once one has completed a handshake: all three, zeros included, the gauge keeping its name.
+  EXPECT_EQ(shown(0, 0, 1, true), (Values{{"multimaster_rreplay_deduped", 0, false},
+                                          {"multimaster_keydb_author_overflow", 0, false},
+                                          {"multimaster_peer_registry_size", 1, true}}));
+  // Without it, each on its own movement: a counter when nonzero, the gauge past the local node.
+  EXPECT_EQ(shown(0, 3, 1, false), (Values{{"multimaster_keydb_author_overflow", 3, false}}));
+  EXPECT_EQ(shown(4, 0, 1, false), (Values{{"multimaster_rreplay_deduped", 4, false}}));
+  EXPECT_EQ(shown(0, 0, 5, false), (Values{{"multimaster_peer_registry_size", 5, true}}));
 }
 
 TEST(ClassicReplayTest, NoteClassicLinkUuidChangeFeedsTheLinkAndTheTotals) {
@@ -645,10 +651,35 @@ namespace {
 constexpr string_view kSelfUuid = "00000000-0000-4000-8000-000000000001";
 constexpr string_view kAuthorA = "11111111-1111-4111-8111-111111111111";
 constexpr string_view kAuthorB = "22222222-2222-4222-8222-222222222222";
+constexpr string_view kAuthorC = "33333333-3333-4333-8333-333333333333";
+
+// The uuid of the n-th of many authors (never kSelfUuid's).
+string AuthorN(unsigned n) {
+  return absl::StrCat("00000000-0000-4000-8000-00000000", absl::Dec(n + 1000, absl::kZeroPad4));
+}
+
+// `command` wrapped in one envelope per entry of `layers`, innermost first: (author, mvcc).
+string Nested(const vector<pair<string_view, uint64_t>>& layers, string_view command,
+              string_view db = "0") {
+  string wire(command);
+  for (const auto& [author, mvcc] : layers)
+    wire = Resp({"RREPLAY", author, wire, db, absl::StrCat(mvcc)});
+  return wire;
+}
 
 // `RREPLAY <uuid> <inner> <db> <mvcc>` as a master streams it.
-string Envelope(string_view uuid, string_view inner, string_view db = "0", string_view mvcc = "7") {
-  return Resp({"RREPLAY", uuid, inner, db, mvcc});
+// An `mvcc` left out is a fresh one on every call: the dedup is process-wide, so two envelopes of
+// one author with the same mvcc are one envelope to it. They start far above the explicit mvccs
+// the tests spell out (a few digits): the watermark is monotone, so an explicit mvcc applied after
+// a default one of the same author would be dropped as already applied.
+string FreshMvcc() {
+  static uint64_t next_mvcc = uint64_t{1} << 40;
+  return absl::StrCat(next_mvcc++);
+}
+
+string Envelope(string_view uuid, string_view inner, string_view db = "0", string_view mvcc = "") {
+  const string fresh = FreshMvcc();
+  return Resp({"RREPLAY", uuid, inner, db, mvcc.empty() ? string_view(fresh) : mvcc});
 }
 
 // `levels` envelopes around `command`, innermost first authored by kAuthorA, the others by
@@ -669,10 +700,12 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
   void SetUp() override {
     BaseFamilyTest::SetUp();
     ResetClassicForwardedAuthorsForTest();
+    AuthorDedup::Instance().ClearAllForTest();
   }
 
   void TearDown() override {
     ResetClassicForwardedAuthorsForTest();
+    AuthorDedup::Instance().ClearAllForTest();
     BaseFamilyTest::TearDown();
     absl::SetFlag(&FLAGS_active_replica, false);
   }
@@ -1227,7 +1260,7 @@ TEST_F(ClassicApplyFamilyTest, NestedUnwrapAllowedTo64AndRefuses65th) {
         EXPECT_EQ(link.malformed(), 2u);
 
         // A lower case inner name is an envelope too.
-        string lower = Resp({"rreplay", kAuthorA, Resp({"SET", "lower", "v"}), "0", "7"});
+        string lower = Resp({"rreplay", kAuthorA, Resp({"SET", "lower", "v"}), "0", FreshMvcc()});
         EXPECT_EQ(link.Apply(Envelope(kAuthorB, lower)), EnvelopeResult::kConsumed);
         EXPECT_EQ(link.malformed(), 2u);
       },
@@ -1366,8 +1399,9 @@ TEST_F(ClassicPeerApplyFamilyTest, RestoresRawContextAfterEnvelope) {
         {"keydb-only command", Resp({"PEXPIREMEMBERAT", "k", "m", "1"})},
         {"unknown command", Resp({"NOSUCHCOMMAND", "k"})},
     };
+    uint64_t mvcc = kMvccA;  // one author's: a repeated mvcc would be a duplicate
     for (const auto& [what, command] : exits) {
-      EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "0", to_string(kMvccA))),
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, command, "0", to_string(mvcc++))),
                 EnvelopeResult::kConsumed)
           << what;
       expect_raw(what);
@@ -1678,14 +1712,341 @@ TEST_F(ClassicApplyFamilyTest, RunningFalseDuringFirstDispatchStillConsumesWhole
   OnLink(
       [&](Link& link) {
         // The first dispatch is the SELECT of db 3 and the command is the second.
-        EXPECT_EQ(link.Apply(Nest(3, Resp({"SET", "k", "v"}), "3")), EnvelopeResult::kConsumed);
+        EXPECT_EQ(link.Apply(Nested({{kAuthorA, 9001}, {kAuthorB, 9002}, {kAuthorC, 9003}},
+                                    Resp({"SET", "k", "v"}), "3")),
+                  EnvelopeResult::kConsumed);
         EXPECT_EQ(link.unwrapped(), 3u);
         EXPECT_EQ(link.apply_errors(), 0u);
         EXPECT_EQ(running_calls.load(), 1);
+        // The innermost layer committed its reservation, the two around it advanced.
+        EXPECT_TRUE(AuthorDedup::Instance().IsApplied(kAuthorA, 9001));
+        EXPECT_TRUE(AuthorDedup::Instance().IsApplied(kAuthorB, 9002));
+        EXPECT_TRUE(AuthorDedup::Instance().IsApplied(kAuthorC, 9003));
+        EXPECT_FALSE(AuthorDedup::Instance().IsApplied(kAuthorA, 9002));
       },
       [&running_calls] { return running_calls.fetch_add(1) == 0; });
 
   EXPECT_EQ(Get("k", 3), "v");
+}
+
+// ---- Author dedup (spec D-5) ----
+
+// The watermark of the process: what the envelopes of these tests committed or advanced.
+bool Applied(string_view author, uint64_t mvcc) {
+  return AuthorDedup::Instance().IsApplied(author, mvcc);
+}
+
+// The counter `multimaster_rreplay_deduped`, which only grows: tests read its movement.
+class DedupedCounter {
+ public:
+  uint64_t moved() const {
+    return ClassicRreplayDedupedTotal() - before_;
+  }
+
+ private:
+  uint64_t before_ = ClassicRreplayDedupedTotal();
+};
+
+// An outer layer that wraps a deduped inner is KeyDB parity: the inner rreplay is itself an
+// executed command, so the outer advances; and a later copy of the outer is dropped at its own
+// early-out, before its inner is looked at.
+TEST_F(ClassicApplyFamilyTest, NestedOuterAdvancesWhenInnerDeduped) {
+  OnLink([&](Link& link) {
+    DedupedCounter deduped;
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 100}}, Resp({"INCR", "c"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 0u);
+
+    // The same write, forwarded by B: A's layer is dropped, B's envelope still counts as handled.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 100}, {kAuthorB, 500}}, Resp({"INCR", "c"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 1u);
+    EXPECT_TRUE(Applied(kAuthorB, 500));
+    EXPECT_EQ(link.unwrapped(), 2u);  // B's layer; A's was dropped at its own early-out
+
+    // B's envelope again, wrapping something new: dropped before its inner is parsed.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorC, 7}, {kAuthorB, 500}}, Resp({"INCR", "c"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 2u);
+    EXPECT_FALSE(Applied(kAuthorC, 7));
+    EXPECT_EQ(link.unwrapped(), 2u);  // the dropped layer was not taken apart
+  });
+  EXPECT_EQ(Get("c"), "1");
+}
+
+// A command that is skipped (control, KeyDB-only, unknown) is handled: its author advances, so
+// the same write arriving over another link is not applied afterwards. Nothing was reserved.
+TEST_F(ClassicApplyFamilyTest, AdvancesAfterSkippedInner) {
+  OnLink([&](Link& link) {
+    const vector<pair<string, string>> skipped = {
+        {"control", Resp({"PING"})},
+        {"keydb-only", Resp({"PEXPIREMEMBERAT", "k", "m", "1"})},
+        {"unknown", Resp({"NOSUCHCOMMAND", "k"})},
+    };
+    uint64_t mvcc = 200;
+    for (const auto& [what, command] : skipped) {
+      EXPECT_EQ(link.Apply(Nested({{kAuthorA, ++mvcc}}, command)), EnvelopeResult::kConsumed)
+          << what;
+      EXPECT_TRUE(Applied(kAuthorA, mvcc)) << what;
+      EXPECT_EQ(AuthorDedup::Instance().size(), 1u) << what;
+    }
+    // Inside a forwarded envelope both layers advance.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 300}, {kAuthorB, 301}}, Resp({"PING"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_TRUE(Applied(kAuthorA, 300));
+    EXPECT_TRUE(Applied(kAuthorB, 301));
+
+    // The same mvcc with a write is the same envelope, as far as the watermark can tell.
+    DedupedCounter deduped;
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 201}}, Resp({"SET", "k", "v"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 1u);
+  });
+  EXPECT_EQ(Get("k"), nullopt);
+}
+
+// A malformed envelope, a self-authored one and one whose db could not be selected advance
+// nothing: there is nothing to say was applied.
+TEST_F(ClassicApplyFamilyTest, DoesNotAdvanceWhenMalformedOrSelf) {
+  OnLink([&](Link& link) {
+    const string set = Resp({"SET", "k", "v"});
+    // An inner that is not one command.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, "", "0", "400"})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 1u);
+    EXPECT_FALSE(Applied(kAuthorA, 400));
+    // A bad mvcc.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, set, "0", "-5"})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 2u);
+    EXPECT_FALSE(Applied(kAuthorA, 1));
+    // Self-authored.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kSelfUuid, set, "0", "400"})), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.self_dropped(), 1u);
+    EXPECT_FALSE(Applied(kSelfUuid, 400));
+    EXPECT_EQ(AuthorDedup::Instance().size(), 0u);
+
+    // The same envelope, well formed, still applies.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, set, "0", "400"})), EnvelopeResult::kConsumed);
+    EXPECT_TRUE(Applied(kAuthorA, 400));
+  });
+  EXPECT_EQ(Get("k"), "v");
+}
+
+// The 65th level is malformed and advances nothing itself; the 64 around it did handle it.
+TEST_F(ClassicApplyFamilyTest, Depth65MalformedStillAdvancesOuter) {
+  OnLink([&](Link& link) {
+    vector<pair<string, uint64_t>> owned;
+    for (unsigned level = 65; level >= 1; --level)  // innermost first
+      owned.emplace_back(AuthorN(level), 5000 + level);
+    vector<pair<string_view, uint64_t>> layers;
+    for (const auto& [author, mvcc] : owned)
+      layers.emplace_back(author, mvcc);
+
+    EXPECT_EQ(link.Apply(Nested(layers, Resp({"SET", "deep", "v"}))), EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.malformed(), 1u);
+    EXPECT_FALSE(Applied(AuthorN(65), 5065));
+    for (unsigned level = 1; level <= 64; ++level)
+      EXPECT_TRUE(Applied(AuthorN(level), 5000 + level)) << level;
+  });
+  EXPECT_EQ(Get("deep"), nullopt);
+}
+
+TEST_F(ClassicApplyFamilyTest, RunningFalseBeforeDispatchReturnsNotConsumedNoAdvance) {
+  const string wire = Nested({{kAuthorA, 600}, {kAuthorB, 601}}, Resp({"SET", "k", "v"}));
+  OnLink([&](Link& link) { EXPECT_EQ(link.Apply(wire), EnvelopeResult::kNotConsumed); },
+         [] { return false; });
+  EXPECT_FALSE(Applied(kAuthorA, 600));
+  EXPECT_FALSE(Applied(kAuthorB, 601));
+  EXPECT_EQ(AuthorDedup::Instance().size(), 0u);
+  EXPECT_EQ(Get("k"), nullopt);
+
+  // The link resumes at that envelope, which then applies.
+  OnLink([&](Link& link) { EXPECT_EQ(link.Apply(wire), EnvelopeResult::kConsumed); });
+  EXPECT_EQ(Get("k"), "v");
+  EXPECT_TRUE(Applied(kAuthorA, 600));
+  EXPECT_TRUE(Applied(kAuthorB, 601));
+}
+
+// Another link is mid-dispatch of this author's envelope (it holds the reservation), and this link
+// is cancelled while it waits for it, after it selected db 3: nothing was dispatched or counted and
+// nothing advanced, and the offset stays, so the resumed link reads the bytes again. The selected
+// db has moved, which is harmless: the resumed envelope selects it again, and lands in it.
+TEST_F(ClassicApplyFamilyTest, CancelledReserveAfterSelectIsNotConsumedAndReplaysInTheSameDb) {
+  const string wire = Envelope(kAuthorA, Resp({"SET", "k", "v"}), "3", "700");
+  OnLink([&](Link& link) {
+    AuthorDedup& dedup = AuthorDedup::Instance();
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 700, [] { return true; }), AuthorDedup::Verdict::kApply);
+
+    // Asked once by the stream loop's check, then by the wait for the other link.
+    atomic_int asked = 0;
+    ConnectionContext cntx(nullptr, acl::UserCredentials{});
+    cntx.is_replicating = true;
+    cntx.journal_emulated = true;
+    cntx.skip_acl_validation = true;
+    cntx.ns = &namespaces->GetDefaultNamespace();
+    ClassicLinkStats stats;
+    ClassicApplier cancelled(service_.get(), &cntx, string(kSelfUuid), "test-master:1", &stats,
+                             [&asked] { return asked.fetch_add(1) == 0; });
+    DedupedCounter deduped;
+    Wire parsed = Wire::FromBytes(wire);
+    EXPECT_EQ(cancelled.HandleRreplay(parsed.args), EnvelopeResult::kNotConsumed);
+    EXPECT_EQ(asked.load(), 2);
+    EXPECT_EQ(cntx.conn_state.db_index, 3u);  // selected, allowed
+    EXPECT_EQ(stats.Snapshot().rreplay_unwrapped, 0u);
+    EXPECT_EQ(stats.Snapshot().classic_apply_errors, 0u);
+    EXPECT_EQ(stats.Snapshot().rreplay_malformed, 0u);
+    EXPECT_EQ(deduped.moved(), 0u);
+    EXPECT_FALSE(Applied(kAuthorA, 700));
+
+    dedup.Release(kAuthorA);  // the other link gives up without applying
+    Link fresh(service_.get(), [] { return true; });
+    EXPECT_EQ(fresh.Apply(wire), EnvelopeResult::kConsumed);
+    EXPECT_TRUE(Applied(kAuthorA, 700));
+  });
+  EXPECT_EQ(Get("k", 3), "v");
+  EXPECT_EQ(Get("k", 0), nullopt);
+}
+
+// A command the dispatcher refuses before it runs is consumed and counted, and leaves the watermark
+// alone, so the same envelope arriving again (another link, a partial resync) still applies once.
+TEST_F(ClassicApplyFamilyTest, RejectedDispatchCountsBytesDoesNotAdvance) {
+  OnLink([&](Link& link) {
+    // Wrong arity: rejected by VerifyCommandState, never run.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 800}, {kAuthorB, 801}}, Resp({"SET", "k"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(link.unwrapped(), 2u);
+    EXPECT_FALSE(Applied(kAuthorA, 800));
+    EXPECT_FALSE(Applied(kAuthorB, 801));  // the enclosing layers wait too: the leaf did not run
+    EXPECT_EQ(Get("k"), nullopt);
+
+    // The reservation was released: the well-formed envelope applies, once.
+    DedupedCounter deduped;
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", "800")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_EQ(deduped.moved(), 0u);
+    EXPECT_TRUE(Applied(kAuthorA, 800));
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "w"}), "0", "800")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 1u);
+  });
+  EXPECT_EQ(Get("k"), "v");
+}
+
+// A command that ran and replied an error (WRONGTYPE) is a commit: KeyDB counts it executed too.
+TEST_F(ClassicApplyFamilyTest, ErrorReplyOfARunCommandIsCommitted) {
+  Run({"hset", "h", "f", "v"});
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"INCR", "h"}), "0", "810")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    EXPECT_TRUE(Applied(kAuthorA, 810));
+  });
+}
+
+// The harness stops after HandleRreplay returned, as a link cancelled between the commit and the
+// `repl_offs_ +=` of the stream loop would: the resumed link reads the same bytes again, and they
+// are dropped, not applied twice. Commit/Advance sit inside HandleRreplay, before the count.
+TEST_F(ClassicApplyFamilyTest, ReplayAfterCommitBeforeCountIsDeduped) {
+  // One layer: the leaf's own Commit is all there is to remember it by.
+  const string single = Envelope(kAuthorA, Resp({"INCR", "c"}), "0", "900");
+  // Two: the outer's Advance would drop the replay at its early-out, whatever the leaf did.
+  const string nested = Nested({{kAuthorB, 910}, {kAuthorC, 911}}, Resp({"INCR", "n"}));
+  OnLink([&](Link&) {
+    DedupedCounter deduped;
+    {
+      // Each envelope is applied by a link that then goes away without another call, and is read
+      // again by a new one.
+      Link first(service_.get(), [] { return true; });
+      EXPECT_EQ(first.Apply(single), EnvelopeResult::kConsumed);
+    }
+    Link resumed(service_.get(), [] { return true; });
+    EXPECT_EQ(resumed.Apply(single), EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 1u);
+
+    {
+      Link first(service_.get(), [] { return true; });
+      EXPECT_EQ(first.Apply(nested), EnvelopeResult::kConsumed);
+    }
+    EXPECT_EQ(resumed.Apply(nested), EnvelopeResult::kConsumed);
+    EXPECT_EQ(deduped.moved(), 2u);  // at the outer's early-out
+  });
+  EXPECT_EQ(Get("c"), "1");
+  EXPECT_EQ(Get("n"), "1");
+}
+
+// An envelope without an mvcc is never deduplicated, and advances nothing.
+TEST_F(ClassicApplyFamilyTest, EnvelopeWithoutMvccIsNeverDeduped) {
+  OnLink([&](Link& link) {
+    DedupedCounter deduped;
+    for (int i = 0; i < 3; ++i) {
+      EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"INCR", "c"}), "0"})),
+                EnvelopeResult::kConsumed);
+      EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"INCR", "c"}), "0", "0"})),
+                EnvelopeResult::kConsumed);
+    }
+    EXPECT_EQ(deduped.moved(), 0u);
+    EXPECT_EQ(AuthorDedup::Instance().size(), 0u);
+  });
+  EXPECT_EQ(Get("c"), "6");
+}
+
+// A leaf without an mvcc reserves nothing, so it has nothing to release, whether it ran or was
+// rejected: another link's reservation for the same author survives it.
+TEST_F(ClassicApplyFamilyTest, MvccZeroLeafLeavesAnotherLinksReservationAlone) {
+  OnLink([&](Link& link) {
+    AuthorDedup& dedup = AuthorDedup::Instance();
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 10, [] { return true; }), AuthorDedup::Verdict::kApply);
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"INCR", "c"}), "0", "0"})),
+              EnvelopeResult::kConsumed);
+    // The path that releases is the rejected one (wrong arity): it must not release either.
+    EXPECT_EQ(link.Apply(Resp({"RREPLAY", kAuthorA, Resp({"SET", "k"}), "0", "0"})),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.apply_errors(), 1u);
+    // Still reserved: a second reserver waits, and gives up.
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 10, [] { return false; }), AuthorDedup::Verdict::kCancelled);
+    dedup.Release(kAuthorA);
+  });
+  EXPECT_EQ(Get("c"), "1");
+}
+
+// A leaf whose layer's db could not be selected advances no layer: nothing was applied, so the same
+// envelope on another link (or after a resync) must still get its try (same reasoning as a rejected
+// dispatch). A layer that selected fine and ran its command does advance.
+TEST_F(ClassicApplyFamilyTest, FailedSelectAdvancesNoLayer) {
+  absl::FlagSaver flag_saver;
+  SetTestFlag("cluster_mode", "yes");
+  ResetService();
+  const string config = absl::Substitute(
+      R"json([{"slot_ranges": [{"start": 0, "end": 16383}],
+               "master": {"id": "$0", "ip": "10.0.0.1", "port": 7000, "health": "online"},
+               "replicas": []}])json",
+      Run({"cluster", "myid"}).GetString());
+  ASSERT_EQ(RunPrivileged({"dflycluster", "config", config}), "OK");
+
+  OnLink([&](Link& link) {
+    // Its own db 3 fails.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorA, 1100}}, Resp({"SET", "own", "1"}), "3")),
+              EnvelopeResult::kConsumed);
+    EXPECT_FALSE(Applied(kAuthorA, 1100));
+    // The outer's db 0 selects; the inner's db 3 fails: neither layer advances.
+    EXPECT_EQ(
+        link.Apply(Envelope(kAuthorB, Envelope(kAuthorC, Resp({"SET", "in", "1"}), "3", "1201"),
+                            "0", "1200")),
+        EnvelopeResult::kConsumed);
+    EXPECT_FALSE(Applied(kAuthorC, 1201));
+    EXPECT_FALSE(Applied(kAuthorB, 1200));
+    EXPECT_EQ(link.apply_errors(), 2u);  // the two failed SELECTs
+
+    // Control: db 0 works, and both layers advance.
+    EXPECT_EQ(link.Apply(Nested({{kAuthorC, 1301}, {kAuthorB, 1300}}, Resp({"SET", "ok", "1"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_TRUE(Applied(kAuthorC, 1301));
+    EXPECT_TRUE(Applied(kAuthorB, 1300));
+  });
+  EXPECT_EQ(Get("ok"), "1");
+  EXPECT_EQ(Get("own"), nullopt);
+  EXPECT_EQ(Get("in"), nullopt);
 }
 
 // A command that works on its own connection, dispatched the way the raw path of
@@ -2002,22 +2363,241 @@ TEST_F(ClassicApplyFamilyTest, ReplicatedWatchLeavesNoRegistrationBehind) {
   EXPECT_EQ(Run({"flushdb"}), "OK");
 }
 
+// AuthorDedup's own protocol (spec D-5), on distinct proactor threads: fb2::Mutex's uncontended
+// fast path never suspends, so fibers on one thread would run one after the other.
+class AuthorDedupTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    pp_.reset(util::fb2::Pool::IOUring(16, 2));
+    pp_->Run();
+  }
+  void TearDown() override {
+    pp_->Stop();
+    pp_.reset();
+  }
+
+  using Verdict = AuthorDedup::Verdict;
+
+  // Runs `body` on a fiber of proactor `index`.
+  template <typename F> util::fb2::Fiber On(unsigned index, F body) {
+    return pp_->at(index)->LaunchFiber(util::fb2::Launch::post, std::move(body));
+  }
+
+  static bool Always() {
+    return true;
+  }
+
+  std::unique_ptr<util::ProactorPool> pp_;
+};
+
+// Two links deliver the same envelope at the same moment, and the first one is slow to dispatch
+// (the stub sleeps before it commits): exactly one applies. With a check-only dedup both would.
+// The first link does not start its dispatch's sleep until the second one is about to reserve, so
+// the second always arrives while the first is dispatching.
+TEST_F(AuthorDedupTest, ConcurrentSameEnvelopeAppliesOnce) {
+  AuthorDedup dedup;
+  atomic_int applied = 0, dropped = 0;
+  atomic_bool second_arriving = false;
+  auto link = [&](bool first) {
+    if (!first)
+      second_arriving = true;
+    switch (dedup.Reserve(kAuthorA, 10, Always)) {
+      case Verdict::kApply:
+        applied.fetch_add(1);
+        while (!second_arriving)
+          util::ThisFiber::Yield();
+        util::ThisFiber::SleepFor(10ms);  // the dispatch
+        dedup.Commit(kAuthorA, 10);
+        break;
+      case Verdict::kDrop:
+        dropped.fetch_add(1);
+        break;
+      case Verdict::kCancelled:
+        ADD_FAILURE() << "cancelled";
+    }
+  };
+  auto first = On(0, [&] { link(true); });
+  while (applied.load() == 0)
+    absl::SleepFor(absl::Milliseconds(1));  // the first link holds the reservation
+  auto second = On(1, [&] { link(false); });
+  first.Join();
+  second.Join();
+  EXPECT_EQ(applied.load(), 1);
+  EXPECT_EQ(dropped.load(), 1);
+  EXPECT_TRUE(dedup.IsApplied(kAuthorA, 10));
+}
+
+// The link that held the reservation gave up without applying: the one waiting takes it over.
+TEST_F(AuthorDedupTest, ReleaseLetsSecondLinkApply) {
+  AuthorDedup dedup;
+  atomic_bool reserved = false;
+  auto holder = On(0, [&] {
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 10, Always), Verdict::kApply);
+    reserved = true;
+    util::ThisFiber::SleepFor(20ms);
+    dedup.Release(kAuthorA);
+  });
+  while (!reserved)
+    absl::SleepFor(absl::Milliseconds(1));
+
+  Verdict second_verdict = Verdict::kCancelled;
+  auto second = On(1, [&] { second_verdict = dedup.Reserve(kAuthorA, 10, Always); });
+  holder.Join();
+  second.Join();
+  EXPECT_EQ(second_verdict, Verdict::kApply);
+  EXPECT_FALSE(dedup.IsApplied(kAuthorA, 10));
+  dedup.Commit(kAuthorA, 10);
+  EXPECT_TRUE(dedup.IsApplied(kAuthorA, 10));
+}
+
+// running() turns false while a second link waits: it gives up (kCancelled), the holder's
+// reservation is untouched, and what it waited for is still reservable afterwards.
+TEST_F(AuthorDedupTest, CancelledWaiterReturnsNotConsumed) {
+  AuthorDedup dedup;
+  atomic_bool reserved = false, alive = true;
+  auto holder = On(0, [&] {
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 10, Always), Verdict::kApply);
+    reserved = true;
+    for (int i = 0; alive && i < 3000; ++i)  // bounded: a broken Reserve must not hang the suite
+      util::ThisFiber::SleepFor(1ms);
+  });
+  while (!reserved)
+    absl::SleepFor(absl::Milliseconds(1));
+
+  Verdict waiter = Verdict::kApply;
+  auto second = On(1, [&] {
+    waiter = dedup.Reserve(kAuthorA, 10, [&] {
+      alive = false;  // the link is stopped while it waits; this also frees the holder's loop
+      return false;
+    });
+  });
+  second.Join();
+  holder.Join();
+  EXPECT_EQ(waiter, Verdict::kCancelled);
+  EXPECT_FALSE(dedup.IsApplied(kAuthorA, 10));
+
+  // The holder never committed or released: still reserved, so a third try waits and is cancelled.
+  auto third = On(1, [&] { waiter = dedup.Reserve(kAuthorA, 10, [] { return false; }); });
+  third.Join();
+  EXPECT_EQ(waiter, Verdict::kCancelled);
+  dedup.Release(kAuthorA);
+  auto fourth = On(1, [&] { waiter = dedup.Reserve(kAuthorA, 10, Always); });
+  fourth.Join();
+  EXPECT_EQ(waiter, Verdict::kApply);
+}
+
+TEST_F(AuthorDedupTest, MvccZeroNeverDedupedNeverAdvances) {
+  AuthorDedup dedup;
+  On(0, [&] {
+    for (int i = 0; i < 3; ++i)
+      EXPECT_EQ(dedup.Reserve(kAuthorA, 0, Always), Verdict::kApply);  // not reserved: no waiting
+    dedup.Commit(kAuthorA, 0);
+    dedup.Advance(kAuthorA, 0);
+    EXPECT_FALSE(dedup.IsApplied(kAuthorA, 0));
+    EXPECT_EQ(dedup.size(), 0u);
+
+    // Even where the author has a watermark, 0 is not covered by it.
+    dedup.Advance(kAuthorA, 5);
+    EXPECT_FALSE(dedup.IsApplied(kAuthorA, 0));
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 0, Always), Verdict::kApply);
+  }).Join();
+}
+
+TEST_F(AuthorDedupTest, AdvanceOnlyForward) {
+  AuthorDedup dedup;
+  On(0, [&] {
+    dedup.Advance(kAuthorA, 9);
+    dedup.Advance(kAuthorA, 4);
+    EXPECT_TRUE(dedup.IsApplied(kAuthorA, 9));
+    EXPECT_FALSE(dedup.IsApplied(kAuthorA, 10));
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 8, Always), Verdict::kDrop);
+
+    // A commit below the watermark does not lower it either.
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 12, Always), Verdict::kApply);
+    dedup.Commit(kAuthorA, 12);
+    dedup.Advance(kAuthorA, 11);
+    EXPECT_TRUE(dedup.IsApplied(kAuthorA, 12));
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 11, Always), Verdict::kDrop);
+    EXPECT_FALSE(dedup.IsApplied(kAuthorB, 1));  // another author has its own
+  }).Join();
+}
+
+// At the bound the idle entry that was seen longest ago goes; one with a reservation never does,
+// even when it is the oldest.
+TEST_F(AuthorDedupTest, EvictionSkipsInflight) {
+  uint64_t now = 0;
+  AuthorDedup dedup(3, [&now] { return now; });
+  On(0, [&] {
+    now = 1;
+    ASSERT_EQ(dedup.Reserve(kAuthorA, 5, Always), Verdict::kApply);  // oldest, and reserved
+    now = 2;
+    dedup.Advance(kAuthorB, 5);  // the oldest idle one
+    now = 3;
+    dedup.Advance(kAuthorC, 5);
+    EXPECT_EQ(dedup.size(), 3u);
+
+    now = 4;
+    dedup.Advance(AuthorN(4), 5);  // over the bound: B goes
+    EXPECT_EQ(dedup.size(), 3u);
+    EXPECT_FALSE(dedup.IsApplied(kAuthorB, 5));
+    EXPECT_TRUE(dedup.IsApplied(kAuthorC, 5));
+    EXPECT_TRUE(dedup.IsApplied(AuthorN(4), 5));
+    // A's reservation survived: a second reserver waits, and gives up.
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 6, [] { return false; }), Verdict::kCancelled);
+
+    // Every entry reserved: nothing can go, the map exceeds the bound rather than drop one.
+    ASSERT_EQ(dedup.Reserve(kAuthorC, 6, Always), Verdict::kApply);
+    ASSERT_EQ(dedup.Reserve(AuthorN(4), 6, Always), Verdict::kApply);
+    now = 5;
+    dedup.Advance(AuthorN(5), 1);
+    EXPECT_EQ(dedup.size(), 4u);
+    EXPECT_TRUE(dedup.IsApplied(AuthorN(5), 1));
+    // The next insert evicts the only idle entry, and again no reservation.
+    now = 6;
+    dedup.Advance(AuthorN(6), 1);
+    EXPECT_EQ(dedup.size(), 4u);
+    EXPECT_FALSE(dedup.IsApplied(AuthorN(5), 1));
+    EXPECT_TRUE(dedup.IsApplied(AuthorN(6), 1));
+    EXPECT_EQ(dedup.Reserve(kAuthorC, 7, [] { return false; }), Verdict::kCancelled);
+  }).Join();
+}
+
+// A flushing full sync forgets what the old dataset held, but not a reservation another link has
+// in flight.
+TEST_F(AuthorDedupTest, ClearResetsAppliedKeepsInflight) {
+  AuthorDedup dedup;
+  On(0, [&] {
+    dedup.Advance(kAuthorA, 5);
+    ASSERT_EQ(dedup.Reserve(kAuthorB, 7, Always), Verdict::kApply);
+    dedup.Clear();
+    EXPECT_FALSE(dedup.IsApplied(kAuthorA, 5));
+    EXPECT_EQ(dedup.size(), 1u);
+    EXPECT_EQ(dedup.Reserve(kAuthorB, 7, [] { return false; }), Verdict::kCancelled);  // kept
+
+    dedup.Commit(kAuthorB, 7);
+    EXPECT_TRUE(dedup.IsApplied(kAuthorB, 7));
+    EXPECT_EQ(dedup.Reserve(kAuthorA, 5, Always), Verdict::kApply);  // A starts again
+    dedup.Release(kAuthorA);
+  }).Join();
+}
+
 // ClassicAuthorMap on a registry in a running service: the registrations it makes on every proactor
 // are what the tests read back. The set of authors counted against the cap is process-wide, so each
 // test starts and ends with it empty.
 class ClassicAuthorMapTest : public BaseFamilyTest {
  protected:
   static constexpr string_view kLinkUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-  static constexpr string_view kAuthorC = "33333333-3333-4333-8333-333333333333";
   static constexpr string_view kAuthorD = "44444444-4444-4444-8444-444444444444";
 
   void SetUp() override {
     BaseFamilyTest::SetUp();
     ResetClassicForwardedAuthorsForTest();
+    AuthorDedup::Instance().ClearAllForTest();
   }
 
   void TearDown() override {
     ResetClassicForwardedAuthorsForTest();
+    AuthorDedup::Instance().ClearAllForTest();
     BaseFamilyTest::TearDown();
   }
 
@@ -2029,6 +2609,30 @@ class ClassicAuthorMapTest : public BaseFamilyTest {
     }
     PeerRegistry registry;
     uint32_t link_idx = 0;
+  };
+
+  // A peer-mode applier over `node`'s registry, on the apply context of ConsumeRedisStream.
+  struct PeerApplier {
+    PeerApplier(Service* service, Registry* node, function<bool()> running)
+        : cntx(nullptr, acl::UserCredentials{}) {
+      cntx.is_replicating = true;
+      cntx.journal_emulated = true;
+      cntx.skip_acl_validation = true;
+      cntx.ns = &namespaces->GetDefaultNamespace();
+      cntx.repl_origin_idx = node->link_idx;
+      applier = make_unique<ClassicApplier>(
+          service, &cntx, string(kSelfUuid), "test-master:1", &stats, std::move(running),
+          ClassicAuthorMap(&node->registry, string(kLinkUuid), node->link_idx));
+    }
+
+    EnvelopeResult Apply(string_view wire) {
+      Wire parsed = Wire::FromBytes(wire);
+      return applier->HandleRreplay(parsed.args);
+    }
+
+    ConnectionContext cntx;
+    ClassicLinkStats stats;
+    unique_ptr<ClassicApplier> applier;
   };
 
   // Runs `body` on a fiber of proactor 0, where the replication fiber would run.
@@ -2191,6 +2795,81 @@ TEST_F(ClassicAuthorMapTest, AnotherLinksOwnUuidDoesNotConsumeTheCap) {
     EXPECT_EQ(map.IdxFor(kAuthorB), node.link_idx);
     EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 1u);
   });
+}
+
+// A duplicate of an author the cap refused still drops: the watermark is keyed by uuid, not by the
+// registry slot the author did or did not get.
+TEST_F(ClassicAuthorMapTest, DedupStillWorksForOverCapAuthor) {
+  absl::SetFlag(&FLAGS_classic_author_cap, 0);
+  OnFiber([&] {
+    Registry node;
+    ConnectionContext cntx(nullptr, acl::UserCredentials{});
+    cntx.is_replicating = true;
+    cntx.journal_emulated = true;
+    cntx.skip_acl_validation = true;
+    cntx.ns = &namespaces->GetDefaultNamespace();
+    cntx.repl_origin_idx = node.link_idx;
+    ClassicLinkStats stats;
+    ClassicApplier applier(
+        service_.get(), &cntx, string(kSelfUuid), "test-master:1", &stats, [] { return true; },
+        ClassicAuthorMap(&node.registry, string(kLinkUuid), node.link_idx));
+
+    const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+    const uint64_t deduped_before = ClassicRreplayDedupedTotal();
+    const string wire = Resp({"RREPLAY", kAuthorA, Resp({"INCR", "c"}), "0", "1000"});
+    for (int i = 0; i < 3; ++i) {
+      Wire parsed = Wire::FromBytes(wire);
+      EXPECT_EQ(applier.HandleRreplay(parsed.args), EnvelopeResult::kConsumed);
+    }
+    EXPECT_EQ(ClassicAuthorOverflowTotal() - overflow_before, 1u);  // resolved once, then dropped
+    EXPECT_EQ(ClassicRreplayDedupedTotal() - deduped_before, 2u);
+    EXPECT_TRUE(AuthorDedup::Instance().IsApplied(kAuthorA, 1000));
+    EXPECT_FALSE(node.registry.FindIdx(kAuthorA).has_value());  // it never had a slot
+  });
+  EXPECT_EQ(Run({"get", "c"}), "1");
+}
+
+// A reservation held by another link is met before the author is resolved, so an envelope that
+// is cancelled or dropped there costs no registry slot and counts no overflow, whether the cap
+// would refuse the author (0) or admit it.
+TEST_F(ClassicAuthorMapTest, ReservedAuthorCostsNoSlotAndNoOverflow) {
+  for (const uint32_t cap : {0u, 4096u}) {
+    absl::SetFlag(&FLAGS_classic_author_cap, cap);
+    ResetClassicForwardedAuthorsForTest();
+    AuthorDedup::Instance().ClearAllForTest();
+    const string wire = Resp({"RREPLAY", kAuthorA, Resp({"INCR", "c"}), "0", "3000"});
+
+    OnFiber([&] {
+      Registry node;
+      AuthorDedup& dedup = AuthorDedup::Instance();
+      ASSERT_EQ(dedup.Reserve(kAuthorA, 3000, [] { return true; }), AuthorDedup::Verdict::kApply);
+      const uint64_t overflow_before = ClassicAuthorOverflowTotal();
+      const size_t size_before = node.registry.Size();
+      auto unchanged = [&](string_view what) {
+        EXPECT_EQ(ClassicAuthorOverflowTotal(), overflow_before) << what << " cap " << cap;
+        EXPECT_EQ(node.registry.Size(), size_before) << what << " cap " << cap;
+        EXPECT_FALSE(node.registry.FindIdx(kAuthorA).has_value()) << what << " cap " << cap;
+      };
+
+      // Cancelled while it waits for the other link.
+      atomic_int asked = 0;
+      PeerApplier cancelled(service_.get(), &node, [&asked] { return asked.fetch_add(1) == 0; });
+      EXPECT_EQ(cancelled.Apply(wire), EnvelopeResult::kNotConsumed);
+      unchanged("cancelled");
+
+      // A live link waits, the other one commits: the leaf is dropped.
+      PeerApplier live(service_.get(), &node, [] { return true; });
+      const uint64_t deduped_before = ClassicRreplayDedupedTotal();
+      auto committer = pp_->at(1)->LaunchFiber([&dedup] {
+        util::ThisFiber::SleepFor(30ms);
+        dedup.Commit(kAuthorA, 3000);
+      });
+      EXPECT_EQ(live.Apply(wire), EnvelopeResult::kConsumed);
+      committer.Join();
+      EXPECT_EQ(ClassicRreplayDedupedTotal() - deduped_before, 1u) << "cap " << cap;
+      unchanged("dropped");
+    });
+  }
 }
 
 TEST_F(ClassicAuthorMapTest, NullRegistryTurnsStampingOff) {

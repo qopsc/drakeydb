@@ -11,9 +11,12 @@
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
+#include <absl/time/clock.h>
+#include <absl/time/time.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 
 #include "base/logging.h"
@@ -39,6 +42,7 @@ ABSL_FLAG(uint32_t, classic_author_cap, 4096,
 namespace dfly {
 
 using namespace std;
+using namespace std::chrono_literals;
 
 CapaReply ParseCapaReply(string_view simple_string) {
   CapaReply reply;
@@ -130,6 +134,9 @@ atomic<bool> active_keydb_master_seen{false};
 
 // Resolutions of a forwarded author that --classic_author_cap refused, process-wide.
 atomic<uint64_t> author_overflow{0};
+
+// Envelopes dropped by AuthorDedup, process-wide.
+atomic<uint64_t> rreplay_deduped{0};
 
 // The forwarded authors counted against --classic_author_cap: process-wide, because the registry
 // slots they take are. A fiber mutex whose critical section never yields.
@@ -282,9 +289,16 @@ vector<ClassicCounterValue> ClassicTotalSeries(const ClassicLinkCounts& totals,
   return CounterValues(totals, active_master_seen);
 }
 
-vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t overflow, size_t registry_size,
+vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t deduped, uint64_t overflow,
+                                                     size_t registry_size,
                                                      bool active_master_seen) {
   vector<ClassicCounterValue> out;
+  if (active_master_seen || deduped != 0) {
+    out.push_back({"multimaster_rreplay_deduped",
+                   "RREPLAY envelopes dropped because their author's mvcc was already applied "
+                   "here (a mesh delivering the same write over more than one link, or a replay).",
+                   deduped, false});
+  }
   if (active_master_seen || overflow != 0) {
     out.push_back({"multimaster_keydb_author_overflow",
                    "Envelopes whose forwarded author --classic_author_cap refused, one per "
@@ -297,6 +311,10 @@ vector<ClassicCounterValue> ClassicProcessWideValues(uint64_t overflow, size_t r
                    true});
   }
   return out;
+}
+
+uint64_t ClassicRreplayDedupedTotal() {
+  return rreplay_deduped.load(memory_order_relaxed);
 }
 
 uint64_t ClassicAuthorOverflowTotal() {
@@ -343,6 +361,125 @@ uint32_t ClassicAuthorMap::IdxFor(string_view uuid) {
       [idx, hash](unsigned, auto*) { MvccStamper::tlocal()->RegisterOriginHash(idx, hash); });
   resolved_.emplace(uuid, idx);
   return idx;
+}
+
+AuthorDedup::AuthorDedup(size_t max_entries, function<uint64_t()> now_ms)
+    : max_entries_(max_entries), now_ms_(std::move(now_ms)) {
+}
+
+AuthorDedup& AuthorDedup::Instance() {
+  static AuthorDedup dedup;
+  return dedup;
+}
+
+uint64_t AuthorDedup::NowMs() const {
+  if (now_ms_)
+    return now_ms_();
+  return static_cast<uint64_t>(absl::ToUnixMillis(absl::Now()));
+}
+
+AuthorDedup::Entry& AuthorDedup::EntryLocked(string_view uuid) {
+  if (auto it = entries_.find(uuid); it != entries_.end())
+    return it->second;
+
+  if (entries_.size() >= max_entries_) {
+    auto oldest = entries_.end();
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      if (it->second.inflight == 0 &&
+          (oldest == entries_.end() || it->second.last_seen_ms < oldest->second.last_seen_ms)) {
+        oldest = it;
+      }
+    }
+    // Every entry reserved: the map exceeds the bound until one of them commits.
+    if (oldest != entries_.end())
+      entries_.erase(oldest);
+  }
+  return entries_[string(uuid)];
+}
+
+AuthorDedup::Verdict AuthorDedup::Reserve(string_view uuid, uint64_t mvcc,
+                                          const function<bool()>& running) {
+  if (mvcc == 0)
+    return Verdict::kApply;
+
+  std::unique_lock lk(mu_);
+  for (;;) {
+    // Looked up afresh on every pass: the map may have rehashed or lost this entry while we waited.
+    Entry& entry = EntryLocked(uuid);
+    entry.last_seen_ms = NowMs();
+    if (entry.applied >= mvcc)
+      return Verdict::kDrop;
+    if (entry.inflight == 0) {
+      entry.inflight = mvcc;
+      return Verdict::kApply;
+    }
+
+    cv_.wait_for(lk, 100ms);
+    // running() is the caller's: not under the leaf lock.
+    lk.unlock();
+    const bool alive = running();
+    lk.lock();
+    if (!alive)
+      return Verdict::kCancelled;
+  }
+}
+
+void AuthorDedup::Commit(string_view uuid, uint64_t mvcc) {
+  if (mvcc == 0)
+    return;
+  util::fb2::LockGuard lk(mu_);
+  Entry& entry = EntryLocked(uuid);
+  entry.inflight = 0;
+  entry.applied = max(entry.applied, mvcc);
+  entry.last_seen_ms = NowMs();
+  cv_.notify_all();
+}
+
+void AuthorDedup::Release(string_view uuid) {
+  util::fb2::LockGuard lk(mu_);
+  if (auto it = entries_.find(uuid); it != entries_.end())
+    it->second.inflight = 0;
+  cv_.notify_all();
+}
+
+void AuthorDedup::Advance(string_view uuid, uint64_t mvcc) {
+  if (mvcc == 0)
+    return;
+  util::fb2::LockGuard lk(mu_);
+  Entry& entry = EntryLocked(uuid);
+  entry.applied = max(entry.applied, mvcc);
+  entry.last_seen_ms = NowMs();
+}
+
+bool AuthorDedup::IsApplied(string_view uuid, uint64_t mvcc) {
+  if (mvcc == 0)
+    return false;
+  util::fb2::LockGuard lk(mu_);
+  auto it = entries_.find(uuid);
+  return it != entries_.end() && it->second.applied >= mvcc;
+}
+
+void AuthorDedup::Clear() {
+  util::fb2::LockGuard lk(mu_);
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (it->second.inflight == 0) {
+      entries_.erase(it++);
+    } else {
+      it->second.applied = 0;
+      ++it;
+    }
+  }
+}
+
+void AuthorDedup::ClearAllForTest() {
+  util::fb2::LockGuard lk(mu_);
+  entries_.clear();
+  cv_.notify_all();
+}
+
+size_t AuthorDedup::size() {
+  util::fb2::LockGuard lk(mu_);
+  return entries_.size();
 }
 
 bool ClassicApplier::SkipKeyDbOnly(const facade::RespVec& args) {
@@ -395,12 +532,19 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
   // command then has no db to run in and is skipped.
   bool db_selected = true;
   uint64_t layers = 0;
+  // The enclosing layers of the one being looked at that took their inner command apart, outermost
+  // first: each advances its author's watermark when its inner was handled (spec D-5). The layer at
+  // hand is `env`; the leaf commits its own reservation, and `env` advances only for a skipped one.
+  vector<pair<string, uint64_t>> outers;
+  bool advance = true;
+  bool leaf_skipped = false;
+  RreplayEnvelope env;
 
   for (;; ++depth) {
     // KeyDB's order (replicaReplayCommand): validate the layer, select its db, look at its author,
     // count its nesting. Its mvcc is validated after the db is selected, so a bad one leaves the db
     // selected.
-    RreplayEnvelope env;
+    env = RreplayEnvelope{};
     const RreplayParse parse = ParseRreplayEnvelope(*current, &env);
 
     if (parse == RreplayParse::kOk || parse == RreplayParse::kBadMvcc) {
@@ -428,6 +572,12 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
       break;
     }
 
+    // A read only: two links can pass it together, the leaf's reservation is what closes that.
+    if (dedup_.IsApplied(env.uuid, env.mvcc)) {
+      rreplay_deduped.fetch_add(1, memory_order_relaxed);
+      break;
+    }
+
     if (!ParseSingleCommand(env.inner, &inner_args)) {
       NoteMalformed("the inner command is not exactly one command", depth);
       break;
@@ -435,11 +585,38 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
     ++layers;
 
     if (!IsRreplay(inner_args[0])) {
-      if (db_selected)
-        ApplyCommand(inner_args, env.uuid, env.mvcc);
+      if (!db_selected) {
+        advance = false;
+        break;
+      }
+      switch (ApplyCommand(inner_args, env.uuid, env.mvcc)) {
+        case Leaf::kCancelled:
+          // Nothing dispatched, nothing counted, nothing advanced: the link resumes at this
+          // envelope.
+          return EnvelopeResult::kNotConsumed;
+        case Leaf::kRejected:
+          advance = false;
+          break;
+        case Leaf::kSkipped:
+          leaf_skipped = true;
+          break;
+        case Leaf::kApplied:
+        case Leaf::kDeduped:
+          break;
+      }
       break;
     }
+    outers.emplace_back(std::move(env.uuid), env.mvcc);
     current = &inner_args;
+  }
+
+  // Before the caller counts the envelope's bytes (Replica::ConsumeRedisStream), so that a resume
+  // offset never covers an envelope whose watermark was not recorded.
+  if (advance) {
+    for (const auto& [uuid, mvcc] : outers)
+      dedup_.Advance(uuid, mvcc);
+    if (leaf_skipped)
+      dedup_.Advance(env.uuid, env.mvcc);
   }
 
   Count(&ClassicLinkStats::rreplay_unwrapped, layers);
@@ -494,12 +671,42 @@ class CommandScope {
   uint32_t link_origin_idx_;
 };
 
+// The leaf's reservation in AuthorDedup: whatever way the leaf is left, it is committed or
+// released, so another link waiting on the author never waits for nothing. An mvcc of 0 reserves
+// nothing.
+class Reservation {
+ public:
+  Reservation(AuthorDedup* dedup, string_view uuid, uint64_t mvcc)
+      : dedup_(dedup), uuid_(uuid), mvcc_(mvcc), held_(mvcc != 0) {
+  }
+  ~Reservation() {
+    if (held_)
+      dedup_->Release(uuid_);
+  }
+
+  Reservation(const Reservation&) = delete;
+  Reservation& operator=(const Reservation&) = delete;
+
+  void Commit() {
+    if (held_)
+      dedup_->Commit(uuid_, mvcc_);
+    held_ = false;
+  }
+
+ private:
+  AuthorDedup* dedup_;
+  string_view uuid_;  // the innermost envelope's, which outlives the leaf
+  uint64_t mvcc_;
+  bool held_;
+};
+
 }  // namespace
 
-void ClassicApplier::ApplyCommand(const facade::RespVec& args, string_view author, uint64_t mvcc) {
+ClassicApplier::Leaf ClassicApplier::ApplyCommand(const facade::RespVec& args, string_view author,
+                                                  uint64_t mvcc) {
   const string_view name = args[0].GetView();
   if (IsControlCommand(name) || SkipKeyDbOnly(args))
-    return;
+    return Leaf::kSkipped;
 
   CommandScope scope(cntx_, link_origin_idx_);
 
@@ -516,20 +723,41 @@ void ClassicApplier::ApplyCommand(const facade::RespVec& args, string_view autho
                              << " that this server has no command for: "
                              << absl::CHexEscape(name.substr(0, 32))
                              << "; the drops are counted in classic_unknown_cmds_dropped";
-    return;
+    return Leaf::kSkipped;
   }
+
+  // Only a command that is dispatched reserves its author's mvcc (spec D-5), and a duplicate or a
+  // cancelled one costs nothing else: no registry slot, no overflow count.
+  switch (dedup_.Reserve(author, mvcc, running_)) {
+    case AuthorDedup::Verdict::kDrop:
+      rreplay_deduped.fetch_add(1, memory_order_relaxed);
+      return Leaf::kDeduped;
+    case AuthorDedup::Verdict::kCancelled:
+      return Leaf::kCancelled;
+    case AuthorDedup::Verdict::kApply:
+      break;
+  }
+  Reservation reservation(&dedup_, author, mvcc);
+
   // Only a command that is dispatched resolves its author (a skipped one costs no registry slot),
   // so the cap counts dispatched commands. `author` is never this node's own: HandleRreplay dropped
   // those.
   if (authors_.stamping())
     scope.Stamp(mvcc, authors_.IdxFor(author));
-  if (optional<string> error = Dispatch(&cmd); error)
+  bool ran = true;
+  if (optional<string> error = Dispatch(&cmd, &ran); error)
     NoteApplyError(name, *error);
+  if (!ran)
+    return Leaf::kRejected;  // released by the guard
+  reservation.Commit();
+  return Leaf::kApplied;
 }
 
-optional<string> ClassicApplier::Dispatch(CommandContext* cmd) {
+optional<string> ClassicApplier::Dispatch(CommandContext* cmd, bool* ran) {
   facade::DispatchResult result =
       service_->DispatchCommand(facade::ParsedArgs{*cmd}, cmd, facade::AsyncPreference::ONLY_SYNC);
+  if (ran)
+    *ran = result == facade::DispatchResult::OK;
   facade::CapturingReplyBuilder::Payload reply = reply_->Take();
   if (auto error = facade::CapturingReplyBuilder::TryExtractError(reply); error)
     return string(error->first);
