@@ -32,6 +32,7 @@
 #include "server/multimaster_lww.h"
 #include "server/mvcc.h"
 #include "server/node_identity.h"
+#include "server/rdb_extensions.h"
 #include "util/fibers/synchronization.h"
 
 ABSL_FLAG(uint32_t, classic_author_cap, 4096,
@@ -109,14 +110,19 @@ constexpr ClassicCounterDef kClassicCounters[] = {
      "RREPLAY envelopes authored by this node that came back around a mesh, dropped.",
      &ClassicLinkStats::rreplay_self_dropped, &ClassicLinkCounts::rreplay_self_dropped},
     {"keydb_cmds_dropped",
-     "KeyDB-only commands (member expiry, KEYDB.CRON, ...) dropped on classic links.",
+     "KeyDB-only commands (member expiry, KEYDB.CRON, KEYDB.MVCCRESTORE of a cron job, ...) "
+     "dropped on classic links.",
      &ClassicLinkStats::keydb_cmds_dropped, &ClassicLinkCounts::keydb_cmds_dropped},
+    {"keydb_mvccrestore_failed",
+     "KEYDB.MVCCRESTORE commands (a key of a KeyDB resync) that could not be applied.",
+     &ClassicLinkStats::keydb_mvccrestore_failed, &ClassicLinkCounts::keydb_mvccrestore_failed},
     {"classic_unknown_cmds_dropped",
      "Commands inside RREPLAY envelopes this server has no command for, dropped.",
      &ClassicLinkStats::classic_unknown_cmds_dropped,
      &ClassicLinkCounts::classic_unknown_cmds_dropped},
     {"classic_apply_errors",
-     "Commands inside RREPLAY envelopes that did not apply: rejected, or replied an error.",
+     "Commands inside RREPLAY envelopes that did not apply: rejected, or replied an error "
+     "(KEYDB.MVCCRESTORE failures are counted apart).",
      &ClassicLinkStats::classic_apply_errors, &ClassicLinkCounts::classic_apply_errors},
     {"classic_link_uuid_changes",
      "Completed handshakes of a classic link whose master presented a different uuid than the "
@@ -324,6 +330,73 @@ bool ClassicApplyRewrites(cmn::BackedArguments* args) {
   }
 
   return false;
+}
+
+namespace {
+
+// KeyDB's `<expire>` is a signed 64-bit decimal. Leading zeros and `-0` are accepted here (and by
+// ParseUnsignedDecimal), where KeyDB's string2ll refuses them: input it never emits, and the error
+// is toward applying.
+bool ParseSignedDecimal(string_view text, int64_t* value) {
+  string_view digits = text;
+  if (absl::ConsumePrefix(&digits, "-") && digits.empty())
+    return false;
+  if (digits.empty() || !all_of(digits.begin(), digits.end(), absl::ascii_isdigit))
+    return false;
+  return absl::SimpleAtoi(text, value);
+}
+
+constexpr size_t kDumpFooterSize = sizeof(uint64_t) + sizeof(uint16_t);  // version and crc
+constexpr uint8_t kKeyDbCronType = 64;                                   // RDB_TYPE_CRON
+
+}  // namespace
+
+bool IsMvccRestore(string_view name) {
+  return absl::EqualsIgnoreCase(name, "KEYDB.MVCCRESTORE");
+}
+
+MvccRestoreParse TranslateMvccRestore(cmn::BackedArguments* args, uint64_t* own_mvcc) {
+  *own_mvcc = 0;
+  if (args->size() != 5)
+    return MvccRestoreParse::kBadArity;
+
+  uint64_t mvcc = 0;
+  if (!ParseUnsignedDecimal(args->at(2), &mvcc))
+    return MvccRestoreParse::kBadMvcc;
+  int64_t expire = 0;
+  if (!ParseSignedDecimal(args->at(3), &expire))
+    return MvccRestoreParse::kBadExpire;
+
+  // The length and version checks are GetRdbVersion's (generic_family.cc, anonymous there, so
+  // repeated); RESTORE rejects them itself. The type byte is the one RESTORE only learns after
+  // OpRestore deleted the resident key.
+  const string_view payload = args->at(4);
+  if (payload.size() <= kDumpFooterSize)
+    return MvccRestoreParse::kBadPayload;
+  const auto* footer =
+      reinterpret_cast<const uint8_t*>(payload.data()) + (payload.size() - kDumpFooterSize);
+  if (static_cast<uint16_t>(footer[1] << 8 | footer[0]) > RDB_VERSION)
+    return MvccRestoreParse::kBadPayload;
+  const uint8_t type = static_cast<uint8_t>(payload.front());
+  if (type == kKeyDbCronType)
+    return MvccRestoreParse::kCronPayload;
+  if (!rdbIsObjectTypeDF(type))
+    return MvccRestoreParse::kBadPayload;
+
+  // KeyDB sends INVALID_EXPIRE (LLONG_MAX) for a key without a TTL; ABSTTL would take it as a
+  // deadline 8.5 years out. Its 0 is a deadline at the epoch, whereas RESTORE's 0 means no TTL.
+  int64_t ttl = expire;
+  if (expire < 0 || expire == numeric_limits<int64_t>::max())
+    ttl = 0;
+  else if (expire == 0)
+    ttl = 1;
+
+  const vector<string> rewritten{"RESTORE",       string(args->at(1)), absl::StrCat(ttl),
+                                 string(payload), "REPLACE",           "ABSTTL"};
+  args->Assign(rewritten.begin(), rewritten.end(), rewritten.size());
+  constexpr uint64_t kMvccInvalid = uint64_t{1} << 63;  // OBJ_MVCC_INVALID
+  *own_mvcc = (mvcc == 0 || (mvcc & kMvccInvalid) != 0) ? 0 : mvcc;
+  return MvccRestoreParse::kOk;
 }
 
 ClassicLinkCounts ClassicLinkStats::Snapshot() const {
@@ -798,10 +871,21 @@ ClassicApplier::Leaf ClassicApplier::ApplyCommand(const facade::RespVec& args, s
   CommandContext cmd;
   cmd.Init(reply_.get(), cntx_);
   facade::FillBackedArgs(args, &cmd);
+
+  // KEYDB.MVCCRESTORE becomes a RESTORE (spec D-7a) before the lookup below, which would find no
+  // command for it. One that cannot be translated is consumed, advancing the watermark only, like a
+  // skipped command. `own_mvcc` is what the restored key is stamped with in peer mode.
+  const bool mvccrestore = IsMvccRestore(name);
+  uint64_t own_mvcc = 0;
+  if (mvccrestore) {
+    if (!NoteMvccRestore(&cmd, &own_mvcc))
+      return Leaf::kSkipped;
+  }
+
   // The dispatcher would reject a command it has no entry for as an unknown one, into the error
   // builder and upstream's `unknown_` accounting. Inside an envelope it is a command of a KeyDB
-  // (KEYDB.MVCCRESTORE until P7-2 applies it, or one a newer KeyDB added), so it is counted on its
-  // own. The lookup is the dispatcher's, which reads `ACL <sub>` as one name.
+  // (one a newer KeyDB added), so it is counted on its own. The lookup is the dispatcher's, which
+  // reads `ACL <sub>` as one name.
   if (service_->mutable_registry()->FindExtended(facade::ParsedArgs{cmd}).first == nullptr) {
     Count(&ClassicLinkStats::classic_unknown_cmds_dropped);
     LOG_EVERY_T(WARNING, 60) << "Dropping a command of an RREPLAY envelope from " << link_
@@ -835,7 +919,7 @@ ClassicApplier::Leaf ClassicApplier::ApplyCommand(const facade::RespVec& args, s
   // so the cap counts dispatched commands. `author` is never this node's own: HandleRreplay dropped
   // those.
   if (authors_.stamping())
-    scope.Stamp(mvcc, authors_.IdxFor(author));
+    scope.Stamp(own_mvcc != 0 ? own_mvcc : mvcc, authors_.IdxFor(author));
   // A script's inner commands share one stamp; a single-shard script runs them through a
   // SQUASHED_STUB, where the guard cannot compare per command (the RunSquashedMultiCb tripwire),
   // so an EVAL is stamped, never vetoed. KeyDB 6.3.4 never sends the _RO variants, but the prefix
@@ -843,8 +927,12 @@ ClassicApplier::Leaf ClassicApplier::ApplyCommand(const facade::RespVec& args, s
   if (absl::StartsWithIgnoreCase(name, "EVAL"))
     scope.Unguard();
   bool ran = true;
-  if (optional<string> error = Dispatch(&cmd, &ran); error)
-    NoteApplyError(name, *error);
+  if (optional<string> error = Dispatch(&cmd, &ran); error) {
+    if (mvccrestore)
+      NoteMvccRestoreFailed(args[1].GetView(), *error);
+    else
+      NoteApplyError(name, *error);
+  }
   if (!ran)
     return Leaf::kRejected;  // released by the guard
   reservation.Commit();
@@ -890,6 +978,41 @@ void ClassicApplier::NoteMalformed(string_view why, unsigned depth) {
   Count(&ClassicLinkStats::rreplay_malformed);
   LOG_EVERY_T(WARNING, 60) << "Skipping a malformed RREPLAY envelope from " << link_
                            << " (nesting level " << depth << "): " << why;
+}
+
+bool ClassicApplier::NoteMvccRestore(CommandContext* cmd, uint64_t* own_mvcc) {
+  const MvccRestoreParse parse = TranslateMvccRestore(cmd, own_mvcc);
+  if (parse == MvccRestoreParse::kOk)
+    return true;
+
+  // A failure leaves `cmd` unchanged, so the key is still there to name.
+  const string key(cmd->size() > 1 ? cmd->at(1) : string_view{});
+
+  if (parse == MvccRestoreParse::kCronPayload) {
+    Count(&ClassicLinkStats::keydb_cmds_dropped);
+    LOG_EVERY_T(WARNING, 60) << "Dropping a KEYDB.MVCCRESTORE of " << link_ << " for key "
+                             << absl::CHexEscape(key.substr(0, 32))
+                             << ": its value is a KeyDB cron job; the drops are counted in "
+                                "keydb_cmds_dropped";
+    return false;
+  }
+
+  string_view why = "the payload is not one RESTORE would load";
+  if (parse == MvccRestoreParse::kBadArity)
+    why = "it does not have exactly five arguments";
+  else if (parse == MvccRestoreParse::kBadMvcc)
+    why = "the mvcc is not an unsigned number";
+  else if (parse == MvccRestoreParse::kBadExpire)
+    why = "the expire is not a signed number";
+  NoteMvccRestoreFailed(key, why);
+  return false;
+}
+
+void ClassicApplier::NoteMvccRestoreFailed(string_view key, string_view why) {
+  Count(&ClassicLinkStats::keydb_mvccrestore_failed);
+  LOG_EVERY_T(WARNING, 60) << "A KEYDB.MVCCRESTORE of " << link_ << " for key "
+                           << absl::CHexEscape(key.substr(0, 32)) << " was not applied: " << why
+                           << "; the failures are counted in keydb_mvccrestore_failed";
 }
 
 void ClassicApplier::NoteApplyError(string_view command, string_view error) {

@@ -13,8 +13,9 @@ table, printed by the script, replaces the ones below.
 | --- | --- | --- |
 | `keydb_v6.3.4_rreplay_stream.bin` | 1953 | One active KeyDB (`active-replica yes`, `multi-master yes`) and its own writes |
 | `keydb_v6.3.4_rreplay_nested_stream.bin` | 1944 | KeyDB A replicating from KeyDB B (A forwards: `multi-master-no-forward no`), seen by A's replica |
+| `keydb_v6.3.4_mvccrestore_stream.bin` | 774 | Active KeyDB X, with a raw replica attached, merge-syncing from active KeyDB Z (a TTL'd key, a TTL-less key, a hash): three `KEYDB.MVCCRESTORE` envelopes (plan task 2.6). Recorded by `tests/dragonfly/tools/capture_keydb_mvccrestore.py` |
 
-Both files are the stream only: the handshake and the RDB payload before it are not part of them. The
+The files are the stream only: the handshake and the RDB payload before it are not part of them. The
 files hold plain ASCII, but are binary to git (`.gitattributes` here): no line ending conversion.
 
 ## What the replica saw before the stream
@@ -115,3 +116,20 @@ Segment 1 (228 bytes) shows the nesting; the inner envelope is 127 bytes, the by
 ```
 "*5\r\n$7\r\nRREPLAY\r\n$36\r\n3e4efc2d-a9f9-4a1e-90b7-ebd4171606de\r\n$127\r\n*5\r\n$7\r\nRREPLAY\r\n$36\r\n307ea48c-fc10-47a1-91bb-263276269153\r\n$27\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n\r\n$1\r\n0\r\n$19\r\n1878060940078874625\r\n\r\n$1\r\n0\r\n$19\r\n1878060940079923202\r\n"
 ```
+
+## `keydb_v6.3.4_mvccrestore_stream.bin`
+
+Three RREPLAY envelopes (X's uuid, db 0), one `KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>`
+per key X loaded from Z's RDB, in the order X loaded them. The envelope's mvcc is a fresh tick of X;
+the command's own `<mvcc>` is the key's, older. Each payload is KeyDB's DUMP form: type byte, value,
+an `mvcc-tstamp` aux, then the 10-byte footer (version 9).
+
+| # | Offset | Length | Key | `<expire>` |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 259 | `plain_key` (string) | `9223372036854775807` (INVALID_EXPIRE, no TTL) |
+| 1 | 259 | 266 | `hash` | `9223372036854775807` |
+| 2 | 525 | 249 | `ttl_key` (string) | `1792352643265` (an absolute ms deadline, `PX 3600000` at capture) |
+
+The frame order follows KeyDB's dict order and differs between captures (the table is for this
+file); the lengths and offsets change with it. `classic_replay_test`'s
+`GoldenKeyDbMvccRestoreEnvelopesApply` embeds the payloads of `plain_key` and `hash` by content.

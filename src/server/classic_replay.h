@@ -99,12 +99,33 @@ bool IsKeyDbOnlyCommand(const facade::RespVec& args);
 // Returns whether it changed anything.
 bool ClassicApplyRewrites(cmn::BackedArguments* args);
 
+enum class MvccRestoreParse { kOk, kBadArity, kBadMvcc, kBadExpire, kBadPayload, kCronPayload };
+
+// Rewrites `args`, a `KEYDB.MVCCRESTORE key <mvcc> <expire> <DUMP payload>` of an RREPLAY envelope,
+// in place to `RESTORE key <ttl> <payload> REPLACE ABSTTL` and returns kOk (spec D-7a). `*own_mvcc`
+// is the command's own `<mvcc>`, the key's mvcc as its sender holds it, or 0 when that is unusable
+// (0, or bit 63 set: a key KeyDB synced from plain Redis); the caller then stamps with the
+// envelope's. `<expire>`: negative or LLONG_MAX (KeyDB's INVALID_EXPIRE, "no TTL") becomes 0, 0
+// (a deadline at the epoch) becomes 1, anything else is an absolute ms deadline and stays.
+//
+// Any other result leaves `args` as it was: kBadArity (not five arguments), kBadMvcc, kBadExpire,
+// kBadPayload (what a replicated-apply RESTORE would not load: not longer than the 10-byte footer,
+// a footer version above RDB_VERSION, a first byte outside the object types; the CRC is not
+// checked), and kCronPayload (first byte 64, a KeyDB cron job, which cannot be represented here and
+// is a drop, not a failure). The type byte is what keeps a resident key from being deleted by a
+// REPLACE that then fails to parse (ISSUE-REGISTER D-31).
+MvccRestoreParse TranslateMvccRestore(cmn::BackedArguments* args, uint64_t* own_mvcc);
+
+// Whether `name` is KEYDB.MVCCRESTORE (without case).
+bool IsMvccRestore(std::string_view name);
+
 // Counters of one classic link. Relaxed atomics: the replication fiber bumps them, an INFO fiber
 // on another thread reads them. Every bump also feeds the process-wide totals (ClassicTotals).
 struct ClassicLinkStats {
   // Envelope layers (a forwarded envelope is two) that parsed, were not the node's own, and whose
   // inner command was taken apart: the layer's command was applied, skipped as a control or
-  // KeyDB-only command, dropped as unknown, or rejected by the dispatcher.
+  // KeyDB-only command, dropped as unknown, skipped as an untranslatable KEYDB.MVCCRESTORE, or
+  // rejected by the dispatcher.
   std::atomic<uint64_t> rreplay_unwrapped{0};
   // Envelope layers that were not well formed (RreplayParse), whose inner bytes were not exactly
   // one command, or that nested deeper than ClassicApplier::kMaxNesting. Skipped, never a
@@ -112,14 +133,21 @@ struct ClassicLinkStats {
   std::atomic<uint64_t> rreplay_malformed{0};
   // Envelopes authored by this node, which came back around a mesh; dropped.
   std::atomic<uint64_t> rreplay_self_dropped{0};
-  // KeyDB-only commands (IsKeyDbOnlyCommand), skipped, on the raw stream and inside envelopes.
+  // KeyDB-only commands (IsKeyDbOnlyCommand), skipped, on the raw stream and inside envelopes, and
+  // KEYDB.MVCCRESTOREs of a KeyDB cron job, which cannot be represented here.
   std::atomic<uint64_t> keydb_cmds_dropped{0};
+  // KEYDB.MVCCRESTORE commands that were not applied: rejected by TranslateMvccRestore (a bad
+  // argument, a payload RESTORE would not load), or the translated RESTORE replied an error. The
+  // envelope is consumed. A KeyDB cron job in the payload is a keydb_cmds_dropped, not one of
+  // these.
+  std::atomic<uint64_t> keydb_mvccrestore_failed{0};
   // Commands inside an envelope that this server has no command for, skipped before dispatch. Raw
   // commands of the stream are not counted here: an unknown raw command keeps upstream's
   // accounting (the `unknown_` lines of INFO commandstats).
   std::atomic<uint64_t> classic_unknown_cmds_dropped{0};
   // Inner commands that did not apply: the dispatcher rejected them before they ran (wrong arity,
   // out of memory, ...) or they ran and replied an error (WRONGTYPE after a divergence, ...).
+  // Except a KEYDB.MVCCRESTORE, whose failures are keydb_mvccrestore_failed.
   std::atomic<uint64_t> classic_apply_errors{0};
   // Completed handshakes of the link whose master presented a different uuid than the previous
   // completed one did: a KeyDB restart (it mints a new uuid at every start), which is a new author
@@ -393,7 +421,8 @@ class ClassicApplier {
 
   // What became of the innermost command of an envelope tree (the leaf).
   enum class Leaf {
-    kSkipped,    // a control, KeyDB-only or unknown command: handled, nothing dispatched
+    kSkipped,    // a control, KeyDB-only, unknown or untranslatable KEYDB.MVCCRESTORE command:
+                 // handled, nothing dispatched
     kApplied,    // dispatched and ran (it may have replied an error): its mvcc is committed
     kDeduped,    // the author's watermark already covered it
     kRejected,   // the dispatch result was not OK (refused before it ran, or it reported OOM):
@@ -403,7 +432,9 @@ class ClassicApplier {
 
   // Runs the unwrapped command, `args[0]` of which is a string, in the db the context has
   // selected. Control commands and KeyDB-only ones are skipped, and so is a command this server
-  // has none for (counted, and not dispatched into the error builder). `author` (normalized) and
+  // has none for (counted, and not dispatched into the error builder) and a KEYDB.MVCCRESTORE that
+  // cannot be translated (counted). A translatable one is rewritten to a RESTORE and dispatched
+  // like any other command. `author` (normalized) and
   // `mvcc` belong to the innermost envelope, the one the command came out of: a dispatched command
   // runs under that author's reservation in AuthorDedup (spec D-5).
   Leaf ApplyCommand(const facade::RespVec& args, std::string_view author, uint64_t mvcc);
@@ -417,6 +448,12 @@ class ClassicApplier {
   // exist on every shard, as JournalExecutor::SelectDb does); later uses only set the index. False
   // if that SELECT failed (counted): the selected db is then unchanged.
   bool SelectDb(DbIndex db);
+
+  // Translates `cmd`, a KEYDB.MVCCRESTORE, in place (TranslateMvccRestore). False if it must not be
+  // dispatched: a failure is counted in keydb_mvccrestore_failed, a cron payload in
+  // keydb_cmds_dropped, both warned about.
+  bool NoteMvccRestore(CommandContext* cmd, uint64_t* own_mvcc);
+  void NoteMvccRestoreFailed(std::string_view key, std::string_view why);
 
   void NoteMalformed(std::string_view why, unsigned depth);
   void NoteApplyError(std::string_view command, std::string_view error);

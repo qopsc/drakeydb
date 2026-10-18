@@ -18,6 +18,7 @@ struct ClassicLinkCounts {
   uint64_t rreplay_malformed = 0;
   uint64_t rreplay_self_dropped = 0;
   uint64_t keydb_cmds_dropped = 0;
+  uint64_t keydb_mvccrestore_failed = 0;
   uint64_t classic_unknown_cmds_dropped = 0;
   uint64_t classic_apply_errors = 0;
   uint64_t classic_link_uuid_changes = 0;

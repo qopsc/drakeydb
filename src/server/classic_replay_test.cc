@@ -29,6 +29,7 @@
 #include "facade/facade_test.h"
 #include "facade/redis_parser.h"
 #include "facade/reply_capture.h"
+#include "redis/rdb.h"
 #include "server/command_registry.h"
 #include "server/common.h"
 #include "server/conn_context.h"
@@ -642,8 +643,150 @@ TEST(ClassicReplayTest, ClassicApplyRewritesLeavesOtherCommandsAlone) {
 
 namespace {
 
+// A DUMP-shaped payload: the type byte, `body` filler bytes and the 10-byte footer (version, then
+// a CRC that nothing here checks).
+string FakeDump(uint8_t type, uint16_t version, size_t body = 4) {
+  string out(1, static_cast<char>(type));
+  out.append(body, 'x');
+  out.push_back(static_cast<char>(version & 0xff));
+  out.push_back(static_cast<char>(version >> 8));
+  out.append(8, '\0');
+  return out;
+}
+
+// The watermark of the process: what the envelopes of these tests committed or advanced.
+bool Applied(string_view author, uint64_t mvcc) {
+  return AuthorDedup::Instance().IsApplied(author, mvcc);
+}
+
+struct Translated {
+  MvccRestoreParse parse;
+  vector<string> words;
+  uint64_t own_mvcc;
+};
+
+// `KEYDB.MVCCRESTORE words...` after TranslateMvccRestore.
+Translated Translate(vector<string> words) {
+  cmn::BackedArguments args;
+  args.Assign(words.begin(), words.end(), words.size());
+  Translated out;
+  out.own_mvcc = 12345;  // set by the call even on a failure
+  out.parse = TranslateMvccRestore(&args, &out.own_mvcc);
+  for (size_t i = 0; i < args.size(); ++i)
+    out.words.emplace_back(args.at(i));
+  return out;
+}
+
+}  // namespace
+
+TEST(ClassicReplayTest, TranslateMvccRestoreMapsExpire) {
+  const string dump = FakeDump(0, 9);
+  const vector<pair<string, string>> cases = {
+      {"-1", "0"},
+      {"-7", "0"},
+      {"-9223372036854775808", "0"},
+      {"9223372036854775807", "0"},
+      {"0", "1"},
+      {"1", "1"},
+      {"1791058571443", "1791058571443"},
+      {"9223372036854775806", "9223372036854775806"},
+  };
+  for (const auto& [expire, ttl] : cases) {
+    Translated t = Translate({"KEYDB.MVCCRESTORE", "k", "500", expire, dump});
+    ASSERT_EQ(t.parse, MvccRestoreParse::kOk) << expire;
+    EXPECT_EQ(t.words, (vector<string>{"RESTORE", "k", ttl, dump, "REPLACE", "ABSTTL"})) << expire;
+  }
+}
+
+TEST(ClassicReplayTest, TranslateMvccRestoreExtractsOwnMvcc) {
+  const string dump = FakeDump(0, 9);
+  const uint64_t valid = (uint64_t{1700000000000} << 20) | 7;
+  Translated t = Translate({"KEYDB.MVCCRESTORE", "k", to_string(valid), "-1", dump});
+  EXPECT_EQ(t.parse, MvccRestoreParse::kOk);
+  EXPECT_EQ(t.own_mvcc, valid);
+
+  // Unusable ones: still kOk, the caller falls back to the envelope's.
+  for (string_view unusable :
+       {"0", "9223372036854775808", "18446744073709551615", "9223372036854775809"}) {
+    t = Translate({"KEYDB.MVCCRESTORE", "k", string(unusable), "-1", dump});
+    EXPECT_EQ(t.parse, MvccRestoreParse::kOk) << unusable;
+    EXPECT_EQ(t.own_mvcc, 0u) << unusable;
+    EXPECT_EQ(t.words[0], "RESTORE");
+  }
+}
+
+TEST(ClassicReplayTest, TranslateMvccRestoreRejectsMalformed) {
+  const string dump = FakeDump(0, 9);
+  const vector<string> original = {"KEYDB.MVCCRESTORE", "k", "500", "-1", dump};
+  struct Case {
+    vector<string> words;
+    MvccRestoreParse parse;
+  };
+  const vector<Case> cases = {
+      {{"KEYDB.MVCCRESTORE", "k", "500", "-1"}, MvccRestoreParse::kBadArity},
+      {{"KEYDB.MVCCRESTORE", "k", "500", "-1", dump, "extra"}, MvccRestoreParse::kBadArity},
+      {{"KEYDB.MVCCRESTORE"}, MvccRestoreParse::kBadArity},
+      {{"KEYDB.MVCCRESTORE", "k", "-5", "-1", dump}, MvccRestoreParse::kBadMvcc},
+      {{"KEYDB.MVCCRESTORE", "k", "abc", "-1", dump}, MvccRestoreParse::kBadMvcc},
+      {{"KEYDB.MVCCRESTORE", "k", "18446744073709551616", "-1", dump}, MvccRestoreParse::kBadMvcc},
+      {{"KEYDB.MVCCRESTORE", "k", "", "-1", dump}, MvccRestoreParse::kBadMvcc},
+      {{"KEYDB.MVCCRESTORE", "k", "500", "abc", dump}, MvccRestoreParse::kBadExpire},
+      {{"KEYDB.MVCCRESTORE", "k", "500", "9223372036854775808", dump},
+       MvccRestoreParse::kBadExpire},
+      {{"KEYDB.MVCCRESTORE", "k", "500", "-", dump}, MvccRestoreParse::kBadExpire},
+      {{"KEYDB.MVCCRESTORE", "k", "500", "", dump}, MvccRestoreParse::kBadExpire},
+  };
+  for (const Case& c : cases) {
+    Translated t = Translate(c.words);
+    EXPECT_EQ(t.parse, c.parse) << absl::StrJoin(c.words, " ");
+    EXPECT_EQ(t.words, c.words);  // untouched
+    EXPECT_EQ(t.own_mvcc, 0u);
+  }
+  EXPECT_EQ(Translate(original).parse, MvccRestoreParse::kOk);
+}
+
+TEST(ClassicReplayTest, TranslateMvccRestoreRejectsUnloadablePayload) {
+  const vector<pair<string, string>> payloads = {
+      {"empty", ""},
+      {"shorter than the footer", string(5, 'x')},
+      {"exactly the footer", FakeDump(0, 9, 0).substr(1)},
+      {"exactly 10 bytes", string(10, '\0')},
+      {"one byte over the footer, version too new", FakeDump(0, RDB_VERSION + 1, 0)},
+      {"version too new", FakeDump(0, RDB_VERSION + 1)},
+      {"version 0xFFFF", FakeDump(0, 0xFFFF)},
+      {"type 99", FakeDump(99, 9)},
+      {"type 255", FakeDump(255, 9)},
+  };
+  for (const auto& [what, payload] : payloads) {
+    Translated t = Translate({"KEYDB.MVCCRESTORE", "k", "500", "-1", payload});
+    EXPECT_EQ(t.parse, MvccRestoreParse::kBadPayload) << what;
+  }
+  // The newest version RESTORE accepts, and one byte of value.
+  EXPECT_EQ(Translate({"KEYDB.MVCCRESTORE", "k", "500", "-1", FakeDump(0, RDB_VERSION, 0)}).parse,
+            MvccRestoreParse::kOk);
+}
+
+TEST(ClassicReplayTest, TranslateMvccRestoreClassifiesCronPayloadAsDrop) {
+  Translated t = Translate({"KEYDB.MVCCRESTORE", "k", "500", "-1", FakeDump(64, 9)});
+  EXPECT_EQ(t.parse, MvccRestoreParse::kCronPayload);
+  EXPECT_EQ(t.words[0], "KEYDB.MVCCRESTORE");
+}
+
+TEST(ClassicReplayTest, TranslateMvccRestoreOutputIsByteExact) {
+  string payload = FakeDump(0, 9, 0);
+  payload.insert(1, string_view("a\r\nb\0c\r\n", 8));
+  Translated t =
+      Translate({"KEYDB.MVCCRESTORE", "a key with space", "500", "1791058571443", payload});
+  ASSERT_EQ(t.parse, MvccRestoreParse::kOk);
+  EXPECT_EQ(t.words, (vector<string>{"RESTORE", "a key with space", "1791058571443", payload,
+                                     "REPLACE", "ABSTTL"}));
+}
+
+namespace {
+
 ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, uint64_t keydb,
-                         uint64_t unknown, uint64_t errors, uint64_t uuid_changes = 0) {
+                         uint64_t unknown, uint64_t errors, uint64_t uuid_changes = 0,
+                         uint64_t mvccrestore_failed = 0) {
   ClassicLinkCounts counts;
   counts.rreplay_unwrapped = unwrapped;
   counts.rreplay_malformed = malformed;
@@ -652,6 +795,7 @@ ClassicLinkCounts Counts(uint64_t unwrapped, uint64_t malformed, uint64_t self, 
   counts.classic_unknown_cmds_dropped = unknown;
   counts.classic_apply_errors = errors;
   counts.classic_link_uuid_changes = uuid_changes;
+  counts.keydb_mvccrestore_failed = mvccrestore_failed;
   return counts;
 }
 
@@ -679,17 +823,18 @@ TEST(ClassicReplayTest, ClassicLinkFieldsFollowTheRenderPredicate) {
   using Fields = vector<pair<string, uint64_t>>;
 
   // An active KeyDB master: every counter, in the order of spec D-13, zeros included.
-  ReplicaSummary active = ClassicLink(true, Counts(7, 0, 1, 2, 3, 4, 5));
+  ReplicaSummary active = ClassicLink(true, Counts(7, 0, 1, 2, 3, 4, 5, 6));
   EXPECT_TRUE(ClassicLinkShown(active));
   EXPECT_EQ(NamesAndValues(ClassicLinkFields(active)), (Fields{{"rreplay_unwrapped", 7},
                                                                {"rreplay_malformed", 0},
                                                                {"rreplay_self_dropped", 1},
                                                                {"keydb_cmds_dropped", 2},
+                                                               {"keydb_mvccrestore_failed", 6},
                                                                {"classic_unknown_cmds_dropped", 3},
                                                                {"classic_apply_errors", 4},
                                                                {"classic_link_uuid_changes", 5}}));
   EXPECT_EQ(NamesAndValues(ClassicLinkFields(ClassicLink(true, Counts(0, 0, 0, 0, 0, 0)))).size(),
-            7u);
+            8u);
 
   // Any other master with every counter zero: nothing.
   ReplicaSummary stock = ClassicLink(false, Counts(0, 0, 0, 0, 0, 0));
@@ -704,6 +849,9 @@ TEST(ClassicReplayTest, ClassicLinkFieldsFollowTheRenderPredicate) {
   moved = ClassicLink(false, Counts(0, 2, 0, 0, 0, 9));
   EXPECT_EQ(NamesAndValues(ClassicLinkFields(moved)),
             (Fields{{"rreplay_malformed", 2}, {"classic_apply_errors", 9}}));
+  moved = ClassicLink(false, Counts(0, 0, 0, 0, 0, 0, 0, 4));
+  EXPECT_TRUE(ClassicLinkShown(moved));
+  EXPECT_EQ(NamesAndValues(ClassicLinkFields(moved)), (Fields{{"keydb_mvccrestore_failed", 4}}));
 
   // A link that is not classic (a DFLY master) shows nothing, whatever its summary holds.
   ReplicaSummary dfly = active;
@@ -723,7 +871,7 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
   using Fields = vector<pair<string, uint64_t>>;
 
   EXPECT_TRUE(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), false).empty());
-  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), true)).size(), 7u);
+  EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(0, 0, 0, 0, 0, 0), true)).size(), 8u);
   EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), false)),
             (Fields{{"rreplay_unwrapped", 5}, {"classic_unknown_cmds_dropped", 2}}));
   EXPECT_EQ(NamesAndValues(ClassicTotalSeries(Counts(5, 0, 0, 0, 2, 0), true)),
@@ -731,6 +879,7 @@ TEST(ClassicReplayTest, ClassicTotalSeriesFollowTheRenderPredicate) {
                     {"rreplay_malformed", 0},
                     {"rreplay_self_dropped", 0},
                     {"keydb_cmds_dropped", 0},
+                    {"keydb_mvccrestore_failed", 0},
                     {"classic_unknown_cmds_dropped", 2},
                     {"classic_apply_errors", 0},
                     {"classic_link_uuid_changes", 0}}));
@@ -877,6 +1026,9 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
     uint64_t unknown_dropped() const {
       return stats.classic_unknown_cmds_dropped.load();
     }
+    uint64_t mvccrestore_failed() const {
+      return stats.keydb_mvccrestore_failed.load();
+    }
 
     ConnectionContext cntx;
     ClassicLinkStats stats;
@@ -902,6 +1054,15 @@ class ClassicApplyFamilyTest : public BaseFamilyTest {
       cmd_cntx->SendOk();
     };
     std::move(*service_->mutable_registry()->Find(name)).SetHandler(handler);
+  }
+
+  // The DUMP payload of a string key holding `value`, which is not left behind.
+  string DumpOfString(string_view value) {
+    Run({"set", "dump:src", value});
+    RespExpr dump = Run({"dump", "dump:src"});
+    string out(dump.GetView());
+    Run({"del", "dump:src"});
+    return out;
   }
 
   // The value of `key` in `db`, or nullopt.
@@ -994,6 +1155,9 @@ class ClassicPeerApplyFamilyTest : public ClassicApplyFamilyTest {
     uint64_t unknown_dropped() const {
       return stats.classic_unknown_cmds_dropped.load();
     }
+    uint64_t mvccrestore_failed() const {
+      return stats.keydb_mvccrestore_failed.load();
+    }
 
     ConnectionContext cntx;
     uint32_t link_idx;
@@ -1033,6 +1197,14 @@ class ClassicPeerApplyFamilyTest : public ClassicApplyFamilyTest {
     static uint64_t counter = 0;
     const uint64_t ms = static_cast<uint64_t>(absl::ToUnixMillis(absl::Now())) + 3'600'000;
     return (ms << 20) | ++counter;
+  }
+
+  // multimaster_lww_dropped, summed over the shards (it is a counter of each shard's thread).
+  uint64_t LwwDropped() {
+    atomic_uint64_t total = 0;
+    shard_set->RunBriefInParallel(
+        [&](EngineShard*) { total += ServerState::tlocal()->stats.multimaster_lww_dropped; });
+    return total;
   }
 
   optional<MvccStamp> StampOf(string_view key) {
@@ -1716,6 +1888,97 @@ TEST_F(ClassicPeerApplyFamilyTest, EvalAppliesEvenWhenLocalIsNewer) {
   EXPECT_EQ(Run({"get", "e"}), "from-script");
 }
 
+// The restored key is stamped with the command's own mvcc, not the envelope's (a fresh tick of the
+// resync), and with the envelope author's hash (spec D-7a).
+TEST_F(ClassicPeerApplyFamilyTest, MvccRestoreStampsOwnMvccWithAuthorHash) {
+  const string dump = DumpOfString("v");
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", dump}),
+                                  "0", "900")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    optional<MvccStamp> stamp = StampOf("k");
+    ASSERT_TRUE(stamp);
+    EXPECT_EQ(stamp->Mvcc(), 500u);
+    EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kAuthorA));
+    // The dedup watermark is the envelope's.
+    EXPECT_TRUE(Applied(kAuthorA, 900));
+    EXPECT_FALSE(Applied(kAuthorA, 901));
+  });
+}
+
+TEST_F(ClassicPeerApplyFamilyTest, MvccRestoreFallsBackToEnvelopeMvccWhenOwnInvalid) {
+  const string dump = DumpOfString("v");
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(link.Apply(Envelope(
+                  kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "18446744073709551615", "-1", dump}),
+                  "0", "900")),
+              EnvelopeResult::kConsumed);
+    optional<MvccStamp> stamp = StampOf("k");
+    ASSERT_TRUE(stamp);
+    EXPECT_EQ(stamp->Mvcc(), 900u);
+    EXPECT_EQ(stamp->origin_hash, NodeUuidHash(kAuthorA));
+  });
+}
+
+// Every unusable own mvcc falls back to the envelope's; each case has an envelope mvcc of its own,
+// as the watermark of an author is monotone.
+TEST_F(ClassicPeerApplyFamilyTest, MvccRestoreFallbackUnderEveryUnusableOwnMvcc) {
+  const string dump = DumpOfString("v");
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    unsigned n = 0;
+    for (string_view own : {"0", "9223372036854775808", "18446744073709551615"}) {
+      const string key = absl::StrCat("k", n);
+      const uint64_t envelope_mvcc = 900 + 10 * n++;
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", key, own, "-1", dump}),
+                                    "0", to_string(envelope_mvcc))),
+                EnvelopeResult::kConsumed);
+      optional<MvccStamp> stamp = StampOf(key);
+      ASSERT_TRUE(stamp) << own;
+      EXPECT_EQ(stamp->Mvcc(), envelope_mvcc) << own;
+    }
+  });
+}
+
+TEST_F(ClassicPeerApplyFamilyTest, StaleMvccRestoreLosesToNewerLocalWrite) {
+  const string dump = DumpOfString("from-keydb");
+  Run({"set", "k", "local"});
+  const optional<MvccStamp> local = StampOf("k");
+  ASSERT_TRUE(local);
+  const uint64_t dropped_before = LwwDropped();
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    // The envelope is a fresh tick of the resync, newer than the local write; the key's own mvcc
+    // is the old one that must decide.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA,
+                                  Resp({"KEYDB.MVCCRESTORE", "k", to_string(kMvccA), "-1", dump}),
+                                  "0", to_string(FutureMvcc()))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "local");
+  EXPECT_EQ(StampOf("k"), local);
+  EXPECT_EQ(LwwDropped() - dropped_before, 1u);
+}
+
+TEST_F(ClassicPeerApplyFamilyTest, NewerMvccRestoreWinsOverOlderLocalWrite) {
+  const string dump = DumpOfString("from-keydb");
+  Run({"set", "k", "local"});
+  const uint64_t own = FutureMvcc();
+  const uint64_t dropped_before = LwwDropped();
+  OnPeerLink([&](PeerNode&, PeerLink& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", to_string(own), "-1", dump}),
+                            "0", "900")),
+        EnvelopeResult::kConsumed);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "from-keydb");
+  optional<MvccStamp> stamp = StampOf("k");
+  ASSERT_TRUE(stamp);
+  EXPECT_EQ(stamp->Mvcc(), own);
+  EXPECT_EQ(LwwDropped(), dropped_before);
+}
+
 // With --multi_master_stream_lww=false the link is not guarded: arrival order wins, stale or not.
 TEST_F(ClassicPeerApplyFamilyTest, GuardOffAppliesInArrivalOrder) {
   absl::FlagSaver saver;
@@ -1851,21 +2114,190 @@ TEST_F(ClassicApplyFamilyTest, UnknownInnerCommandCountedNotDispatched) {
   EXPECT_EQ(Get("k"), "v");
 }
 
-// KEYDB.MVCCRESTORE is data, not a KeyDB-only command to drop (decision 22): Task 2.6 of P7-2
-// translates and applies it. Until then drakeydb does not know it, and it is counted as an unknown
-// command, never in keydb_cmds_dropped, whose operators would read it as a loss they accepted.
-TEST_F(ClassicApplyFamilyTest, KeyDbMvccRestoreCountedUnknownUntilItIsApplied) {
+// KEYDB.MVCCRESTORE is data, not a KeyDB-only command to drop (decision 22): it is translated to a
+// RESTORE ... REPLACE ABSTTL and applied, in an envelope. (A raw one is not: spec D-7a, pinned by
+// test_scripted_stock_master_raw_keydb_only_command_shows_only_that_counter.)
+TEST_F(ClassicApplyFamilyTest, MvccRestoreIsTranslatedAndApplied) {
+  const string dump = DumpOfString("restored");
   OnLink([&](Link& link) {
     EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "1878060925646274561",
-                                                  "-1", "not a dump payload"}))),
+                                                  "9223372036854775807", dump}))),
               EnvelopeResult::kConsumed);
-    EXPECT_EQ(link.unknown_dropped(), 1u);
+    EXPECT_EQ(link.unknown_dropped(), 0u);
     EXPECT_EQ(link.keydb_dropped(), 0u);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
     EXPECT_EQ(link.apply_errors(), 0u);
     EXPECT_EQ(link.unwrapped(), 1u);
   });
 
+  EXPECT_EQ(Run({"get", "k"}), "restored");
+}
+
+// A plain replica applies the restore verbatim: no guard, no stamp, whatever the key held. A raw
+// KEYDB.MVCCRESTORE is not translated at all (spec D-7a); the raw-path pytest pins that.
+TEST_F(ClassicApplyFamilyTest, PlainApplierAppliesMvccRestoreVerbatimUnstamped) {
+  const string dump = DumpOfString("from-keydb");
+  Run({"set", "k", "newer-local"});
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", dump}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "k"}), "from-keydb");
+
+  // The context at dispatch time: it is reset when the applier returns, so only the handler can
+  // see whether the command ran stamped. RESTORE's handler is swapped, so this goes last.
+  atomic_int calls = 0;
+  atomic<uint64_t> seen_mvcc = 12345;
+  auto handler = [&](facade::CmdArgParser, CommandContext* cmd_cntx) {
+    calls.fetch_add(1);
+    seen_mvcc = cmd_cntx->server_conn_cntx()->repl_mvcc;
+    cmd_cntx->SendOk();
+  };
+  std::move(*service_->mutable_registry()->Find("RESTORE")).SetHandler(handler);
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", dump}))),
+              EnvelopeResult::kConsumed);
+  });
+  EXPECT_EQ(calls.load(), 1);
+  EXPECT_EQ(seen_mvcc.load(), 0u);
+}
+
+// KeyDB's INVALID_EXPIRE is "no TTL"; passed through to ABSTTL it would be a deadline 8.5 years
+// out.
+TEST_F(ClassicApplyFamilyTest, NoTtlRestoreHasNoTtl) {
+  const string dump = DumpOfString("v");
+  OnLink([&](Link& link) {
+    for (string_view expire : {"9223372036854775807", "-1"}) {
+      EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", absl::StrCat("k", expire),
+                                                    "500", expire, dump}))),
+                EnvelopeResult::kConsumed);
+      EXPECT_EQ(CheckedInt({"pttl", absl::StrCat("k", expire)}), -1) << expire;
+    }
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+  });
+}
+
+// Two of the three envelopes a real KeyDB v6.3.4 sent for a merge full sync
+// (tests/dragonfly/data/keydb_v6.3.4_mvccrestore_stream.bin, the frames of `plain_key` and `hash`;
+// their position in the file follows KeyDB's dict order). KeyDB's own DUMP
+// payloads end in an `mvcc-tstamp` aux before the footer; drakeydb's RESTORE must take them, and
+// the envelope's own mvcc is not the key's.
+TEST_F(ClassicApplyFamilyTest, GoldenKeyDbMvccRestoreEnvelopesApply) {
+  const string plain_payload(
+      "\000\013plain-value\372\013mvcc-"
+      "tstamp\0231879414190390640643\011\000M\264\210Z\233\333A\202",
+      56);
+  const string hash_payload(
+      "\r\027\027\000\000\000\024\000\000\000\004\000\000\002f1\004\362\002\002f2\004\363\377\372"
+      "\013"
+      "mvcc-tstamp\0231879414190390640644\011\000\347E\275\355+#S\000",
+      68);
+  constexpr string_view kX = "9193f791-7934-457c-b3fb-03ff1eeb9810";
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kX,
+                                  Resp({"KEYDB.MVCCRESTORE", "plain_key", "1879414190390640643",
+                                        "9223372036854775807", plain_payload}),
+                                  "0", "1879414190994620416")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kX,
+                                  Resp({"KEYDB.MVCCRESTORE", "hash", "1879414190390640644",
+                                        "9223372036854775807", hash_payload}),
+                                  "0", "1879414190994620417")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+  });
+  EXPECT_EQ(Run({"get", "plain_key"}), "plain-value");
+  EXPECT_EQ(CheckedInt({"pttl", "plain_key"}), -1);
+  EXPECT_EQ(Run({"hget", "hash", "f1"}), "1");
+  EXPECT_EQ(Run({"hget", "hash", "f2"}), "2");
+}
+
+TEST_F(ClassicApplyFamilyTest, AbsoluteTtlRestoredAsDeadline) {
+  const string dump = DumpOfString("v");
+  const int64_t deadline = absl::ToUnixMillis(absl::Now()) + 3'600'000;
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(
+                  kAuthorA, Resp({"KEYDB.MVCCRESTORE", "t", "500", to_string(deadline), dump}))),
+              EnvelopeResult::kConsumed);
+    // KeyDB's 0 is a deadline at the epoch: the key is born expired.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "z", "500", "0", dump}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+  });
+  const int64_t pttl = CheckedInt({"pttl", "t"});
+  EXPECT_GT(pttl, 3'500'000);
+  EXPECT_LE(pttl, 3'601'000);  // PTTL rounds up
+  EXPECT_EQ(Run({"exists", "z"}), 0);
+}
+
+// The D-31 contract: a payload RESTORE cannot load never erases a resident key (REPLACE deletes
+// before it parses), the failure is counted, and the envelope is consumed with its mvcc recorded.
+TEST_F(ClassicApplyFamilyTest, BadPayloadLeavesResidentKeyCountsAndAdvancesWatermark) {
+  Run({"set", "k", "good"});
+  OnLink([&](Link& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(
+            kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", FakeDump(99, 9)}), "0", "810")),
+        EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 1u);
+    EXPECT_EQ(link.keydb_dropped(), 0u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.unknown_dropped(), 0u);
+    EXPECT_EQ(link.unwrapped(), 1u);
+    EXPECT_TRUE(Applied(kAuthorA, 810));
+  });
+  EXPECT_EQ(Run({"get", "k"}), "good");
+}
+
+// A KeyDB cron job cannot be represented: a drop like KEYDB.CRON, not a failure.
+TEST_F(ClassicApplyFamilyTest, CronPayloadDroppedCountedAsKeydbCmdsDropped) {
+  Run({"set", "k", "good"});
+  OnLink([&](Link& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(
+            kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", FakeDump(64, 9)}), "0", "820")),
+        EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.keydb_dropped(), 1u);
+    EXPECT_EQ(link.mvccrestore_failed(), 0u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.unknown_dropped(), 0u);
+    EXPECT_TRUE(Applied(kAuthorA, 820));
+  });
+  EXPECT_EQ(Run({"get", "k"}), "good");
+}
+
+// Malformed arguments are skipped and counted as failures too.
+TEST_F(ClassicApplyFamilyTest, MalformedMvccRestoreIsCountedAndConsumed) {
+  const string dump = DumpOfString("v");
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1"}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "x", "-1", dump}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "5", "y", dump}))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 3u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_EQ(link.unknown_dropped(), 0u);
+  });
   EXPECT_EQ(CheckedInt({"dbsize"}), 0);
+}
+
+// A payload that passes the pre-checks and fails inside the loader: the dispatched RESTORE replies
+// an error, which counts as a failed MVCCRESTORE and not as an apply error (spec D-7a). The
+// envelope still commits its mvcc.
+TEST_F(ClassicApplyFamilyTest, LoaderFailureCountsAsMvccRestoreFailedNotApplyError) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(
+        link.Apply(Envelope(kAuthorA, Resp({"KEYDB.MVCCRESTORE", "k", "500", "-1", FakeDump(0, 9)}),
+                            "0", "830")),
+        EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.mvccrestore_failed(), 1u);
+    EXPECT_EQ(link.apply_errors(), 0u);
+    EXPECT_TRUE(Applied(kAuthorA, 830));
+  });
 }
 
 // KeyDB selects the db of a layer before it knows what the layer holds, and so does the applier:
@@ -2014,11 +2446,6 @@ TEST_F(ClassicApplyFamilyTest, RunningFalseDuringFirstDispatchStillConsumesWhole
 }
 
 // ---- Author dedup (spec D-5) ----
-
-// The watermark of the process: what the envelopes of these tests committed or advanced.
-bool Applied(string_view author, uint64_t mvcc) {
-  return AuthorDedup::Instance().IsApplied(author, mvcc);
-}
 
 // The counter `multimaster_rreplay_deduped`, which only grows: tests read its movement.
 class DedupedCounter {

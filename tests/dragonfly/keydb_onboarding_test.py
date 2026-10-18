@@ -2586,6 +2586,7 @@ CLASSIC_COUNTERS = [
     "rreplay_malformed",
     "rreplay_self_dropped",
     "keydb_cmds_dropped",
+    "keydb_mvccrestore_failed",
     "classic_unknown_cmds_dropped",
     "classic_apply_errors",
     "classic_link_uuid_changes",
@@ -2859,6 +2860,160 @@ async def test_keydb_write_stamped_with_author_hash(
         assert own not in from_b | from_a, (own, from_b, from_a)
 
 
+MVCCRESTORE_BULK_KEYS = 2000
+
+
+@pytest.mark.keydb
+async def test_keydb_mvccrestore_from_keydb_mesh_merge_applies(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """A KeyDB mesh resync loses no key (decision 22). KeyDB A holds the data, KeyDB B starts empty
+    with an --active_replica node D and a plain node D2 replicating from it. After D wrote `stale`,
+    B becomes a replica of A: a merge full sync, in which B emits one `KEYDB.MVCCRESTORE` per key to
+    D and D2 (B was empty, so every key they hold came through it).
+
+    Both nodes end with all of A's keys, a real remaining TTL on `ttl_key` and none on `plain_key`
+    (KeyDB's INVALID_EXPIRE must not become a far deadline). The restore of `stale` carries A's old
+    mvcc, so on D, where the local write is newer, it loses (`multimaster_lww_dropped`), and on the
+    plain D2 it applies verbatim.
+
+    Falsifying: stamping with the envelope's mvcc (a fresh tick) makes D take "from-A"; not mapping
+    INVALID_EXPIRE leaves `plain_key` with a PTTL near 268435454996; with the hook skipped the
+    command is unknown and D and D2 stay empty.
+    """
+    flags = dict(active_replica=True, multi_master=True, no_forward=False)
+    a = keydb_server_factory(**flags)
+    b = keydb_server_factory(**flags)
+
+    async with a.client() as ka, b.client() as kb:
+        await ka.set("stale", "from-A")
+        pipe = ka.pipeline(transaction=False)
+        for i in range(MVCCRESTORE_BULK_KEYS):
+            pipe.set(f"bulk:{i}", f"value-{i}")
+        await pipe.execute()
+        await ka.set("ttl_key", "ttl-value", px=3_600_000)
+        await ka.set("plain_key", "plain-value")
+        await ka.hset("hash", mapping={"f1": "1", "f2": "2"})
+        await ka.rpush("list", "a", "b", "c")
+        expected_keys = MVCCRESTORE_BULK_KEYS + 5
+
+        d = df_factory.create(proactor_threads=2, dir=str(tmp_path / "d"), active_replica="true")
+        d2 = df_factory.create(proactor_threads=2, dir=str(tmp_path / "d2"))
+        d.start()
+        d2.start()
+        async with d.client() as cd, d2.client() as cd2:
+            assert await cd.execute_command(f"REPLICAOF localhost {b.port}") == "OK"
+            assert await cd2.execute_command(f"REPLICAOF localhost {b.port}") == "OK"
+            await wait_for_peer_link(cd)
+            await wait_available_async(cd2)
+            assert await cd.dbsize() == 0 and await cd2.dbsize() == 0
+
+            await asyncio.sleep(0.05)
+            assert await cd.set("stale", "newer-on-D")
+
+            started = time.monotonic()
+            assert await kb.execute_command("REPLICAOF", "localhost", a.port) == "OK"
+
+            @assert_eventually(timeout=SYNC_WAIT_TIMEOUT_S)
+            @retry_while_loading
+            async def arrived():
+                for c in (cd, cd2):
+                    assert await c.dbsize() == expected_keys, await c.dbsize()
+
+            await arrived()
+            logging.info(
+                "KEYDB.MVCCRESTORE mesh merge of %d keys reached D and D2 in %.2f s",
+                expected_keys,
+                time.monotonic() - started,
+            )
+
+            for c, stale in ((cd, "newer-on-D"), (cd2, "from-A")):
+                values = await c.mget([f"bulk:{i}" for i in range(MVCCRESTORE_BULK_KEYS)])
+                assert values == [f"value-{i}" for i in range(MVCCRESTORE_BULK_KEYS)]
+                assert await c.get("ttl_key") == "ttl-value"
+                assert 3_000_000 <= await c.pttl("ttl_key") <= 3_600_000
+                assert await c.get("plain_key") == "plain-value"
+                assert await c.pttl("plain_key") == -1
+                assert await c.hgetall("hash") == {"f1": "1", "f2": "2"}
+                assert await c.lrange("list", 0, -1) == ["a", "b", "c"]
+                assert await c.get("stale") == stale
+
+            info_d = await cd.info("replication")
+            assert int(info_d["multimaster_lww_dropped"]) >= 1, info_d
+            for c, peer_mode in ((cd, True), (cd2, False)):
+                info = await c.info("replication")
+                fields = classic_fields(info, peer_mode)
+                assert fields["keydb_mvccrestore_failed"] == 0, info
+                assert fields["classic_unknown_cmds_dropped"] == 0, info
+                assert fields["classic_apply_errors"] == 0, info
+
+
+async def test_keydb_mvccrestore_unloadable_payload_skipped_and_counted(
+    df_factory: DflyInstanceFactory, tmp_path
+):
+    """A `KEYDB.MVCCRESTORE` that cannot be applied is skipped, counted and consumed, and the stream
+    goes on. After `SET k good`: a payload of KeyDB's cron type (64) with footer version 9 (a KeyDB-
+    only value, a `keydb_cmds_dropped`), a footer version 0xFFFF, a four-argument command and a
+    type-99 payload with a valid footer (three `keydb_mvccrestore_failed`), then `SET after 1`.
+    `k` survives (D-31: the type check runs before RESTORE could delete it), the link stays up and
+    the offsets are exact.
+
+    Falsifying: `k == good` and `after == 1` hold without the feature (the unknown-command path
+    skips them too), so the counters are what pins it: unknown commands count instead (4 and 0
+    failed), a type-64 counted as a failure gives 0 and 4, and without the type check the type-99
+    payload would reach RESTORE and erase `k`.
+    """
+
+    peer_mode = False
+
+    def footer(version):
+        return version.to_bytes(2, "little") + bytes(8)
+
+    cron = b"\x40" + b"xxxx" + footer(9)
+    future_version = b"\x00" + b"xxxx" + footer(0xFFFF)
+    unknown_type = b"\x63" + b"xxxx" + footer(9)
+    stream = b"".join(
+        [
+            rreplay("SET", "k", "good", mvcc=1),
+            rreplay("KEYDB.MVCCRESTORE", "k", 500, -1, cron, mvcc=2),
+            rreplay("KEYDB.MVCCRESTORE", "k", 500, -1, future_version, mvcc=3),
+            rreplay("KEYDB.MVCCRESTORE", "k", 500, -1, mvcc=4),
+            rreplay("KEYDB.MVCCRESTORE", "k", 500, -1, unknown_type, mvcc=5),
+            rreplay("SET", "after", 1, mvcc=6),
+        ]
+    )
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def applied():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            assert await c.get("after") == "1"
+
+        await applied()
+        assert await c.get("k") == "good"
+        assert await c.dbsize() == 2
+        expected = SYNC_OFFSET + len(stream)
+        settled = await master.wait_for_settled_ack(since=len(master.ack_offsets))
+        assert settled == expected, master.ack_offsets
+        assert master.connection_count == 1, "the replica reconnected"
+
+        info = await c.info("replication")
+        assert info["master_link_status"] == "up", info
+        fields = classic_fields(info, peer_mode)
+        assert fields["keydb_cmds_dropped"] == 1, info
+        assert fields["keydb_mvccrestore_failed"] == 3, info
+        assert fields["classic_unknown_cmds_dropped"] == 0, info
+        assert fields["classic_apply_errors"] == 0, info
+        assert fields["rreplay_unwrapped"] == 6, info
+        series = classic_series(await node.metrics())
+        assert series["keydb_mvccrestore_failed"] == 3, series
+        assert series["keydb_cmds_dropped"] == 1, series
+
+
 PIPELINED_INCRS = 2000
 
 
@@ -3114,15 +3269,15 @@ async def test_scripted_active_master_exact_classic_counters(
 ):
     """The exact counters of a master that says `active-replica`, in INFO and /metrics, for a
     stream with every outcome: an applied envelope, a member-expiry envelope and a raw one (both
-    KeyDB-only), an unknown command and a `KEYDB.MVCCRESTORE` (which is applied only from P7-2: it
-    is an unknown command here, never a KeyDB-only one, decision 22), a wrong-arity `SET`, a
-    malformed envelope, and a raw command.
+    KeyDB-only), an unknown command and a `KEYDB.MVCCRESTORE` (applied, decision 22: this one has a
+    payload RESTORE cannot load, so it is a `keydb_mvccrestore_failed`, never a KeyDB-only drop or
+    an unknown command), a wrong-arity `SET`, a malformed envelope, and a raw command.
 
     5 envelopes were taken apart (the malformed one was not), so rreplay_unwrapped is 5, and the
     link is shown whole, zeros included.
 
     Falsifying: a KeyDB-only check that also took KEYDB.MVCCRESTORE puts it in keydb_cmds_dropped
-    (3, with unknown 1); one that took nothing leaves keydb_cmds_dropped 0 and unknown 3.
+    (3, with failed 0); skipping the hook leaves it unknown (unknown 2, failed 0).
     """
     stream = b"".join(
         [
@@ -3162,7 +3317,8 @@ async def test_scripted_active_master_exact_classic_counters(
             "rreplay_malformed": 1,
             "rreplay_self_dropped": 0,
             "keydb_cmds_dropped": 2,
-            "classic_unknown_cmds_dropped": 2,
+            "keydb_mvccrestore_failed": 1,
+            "classic_unknown_cmds_dropped": 1,
             "classic_apply_errors": 1,
             "classic_link_uuid_changes": 0,
         }, info
@@ -3174,7 +3330,8 @@ async def test_scripted_active_master_exact_classic_counters(
             "rreplay_malformed": 1,
             "rreplay_self_dropped": 0,
             "keydb_cmds_dropped": 2,
-            "classic_unknown_cmds_dropped": 2,
+            "keydb_mvccrestore_failed": 1,
+            "classic_unknown_cmds_dropped": 1,
             "classic_apply_errors": 1,
             "classic_link_uuid_changes": 0,
         }
@@ -3326,7 +3483,8 @@ async def test_scripted_stock_master_raw_keydb_only_command_shows_only_that_coun
     /metrics only that series: nothing else of a stock master's INFO changes.
 
     An unknown raw command is not this task's to count: it stays on upstream's accounting, so
-    `classic_unknown_cmds_dropped` stays out of both.
+    `classic_unknown_cmds_dropped` stays out of both. A raw `KEYDB.MVCCRESTORE` is one of them: it is
+    applied only inside an envelope, so `k2` is absent and `keydb_mvccrestore_failed` stays out too.
 
     Falsifying: without the raw-path check the command reaches the dispatcher (an unknown
     command), `keydb_cmds_dropped` stays 0 and no field is shown.
@@ -3336,6 +3494,9 @@ async def test_scripted_stock_master_raw_keydb_only_command_shows_only_that_coun
         + resp_command("PEXPIREMEMBERAT", "s", "m", 1791058571443)
         + resp_command("NOSUCHRAWCMD", "x")
         + resp_command("pexpirememberat", "s", "m", 1791058571443)
+        # A raw KEYDB.MVCCRESTORE is never translated (spec D-7a): a loadable payload, and still
+        # an unknown command, outside the classic counters.
+        + resp_command("KEYDB.MVCCRESTORE", "k2", 500, -1, b"\x00\x01v" + bytes([9, 0]) + bytes(8))
         + resp_command("SET", "b", 2)
     )
     async with FakeClassicMaster() as master:
@@ -3360,6 +3521,8 @@ async def test_scripted_stock_master_raw_keydb_only_command_shows_only_that_coun
         assert classic_series(await node.metrics()) == {"keydb_cmds_dropped": 2}
         stats = await c.info("commandstats")
         assert any(name.lower() == "unknown_nosuchrawcmd" for name in stats), stats
+        assert any(name.lower() == "unknown_keydb.mvccrestore" for name in stats), stats
+        assert await c.exists("k2") == 0
 
 
 async def write_and_wait(master_client, c):
