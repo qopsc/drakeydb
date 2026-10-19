@@ -5,6 +5,7 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -349,6 +350,30 @@ enum class EnvelopeResult {
   kNotConsumed,
 };
 
+// A KeyDB peer's clock skew from the stamps of its envelopes (spec D-13), as KeyDB's REPLCONF UUID
+// reply carries no clock. An envelope minted at KeyDB's `ms << 20 | counter` mvcc says what the
+// peer's clock read when it was written, so `(mvcc >> 20) - now_ms` is a sample of peer - local;
+// the stream's lag only lowers it, so each sample is a lower bound on the true skew and the
+// estimate is the largest of the last kWindow samples (the least aged one). Samples are taken at
+// most once per kMinIntervalMs. Pure: the caller passes the clock.
+class ClockSkewSampler {
+ public:
+  static constexpr size_t kWindow = 60;
+  static constexpr uint64_t kMinIntervalMs = 1000;
+
+  // Takes the sample of `mvcc` (nonzero) at local time `now_ms` unless one was taken less than
+  // kMinIntervalMs ago. True if it was taken.
+  bool Sample(uint64_t mvcc, uint64_t now_ms);
+
+  // The largest of the retained samples, 0 before the first.
+  int64_t EstimateMs() const;
+
+ private:
+  std::array<int64_t, kWindow> ring_{};
+  size_t taken_ = 0;  // samples taken so far; the slot of the next is taken_ % kWindow
+  uint64_t last_ms_ = 0;
+};
+
 // Applies the RREPLAY envelopes of a classic link's stream, one command at a time. Socket-free:
 // Replica::ConsumeRedisStream feeds it the parsed `RREPLAY ...` command and owns the offsets.
 //
@@ -381,9 +406,11 @@ class ClassicApplier {
   // built with a registry (a peer-mode link, see ClassicAuthorMap): then each dispatched command
   // runs with the mvcc of its innermost envelope and that envelope's author as the origin
   // (spec D-4). The link's origin index is the one `cntx` holds when the applier is built.
+  // `on_skew` (may be empty) is handed the clock-skew estimate whenever a depth-1 envelope with a
+  // stamp took a new sample (ClockSkewSampler).
   ClassicApplier(Service* service, ConnectionContext* cntx, std::string self_uuid, std::string link,
                  ClassicLinkStats* stats, std::function<bool()> running,
-                 ClassicAuthorMap authors = {});
+                 ClassicAuthorMap authors = {}, std::function<void(int64_t)> on_skew = {});
   ~ClassicApplier();
 
   ClassicApplier(const ClassicApplier&) = delete;
@@ -391,6 +418,10 @@ class ClassicApplier {
 
   ClassicAuthorMap& authors() {
     return authors_;
+  }
+
+  const ClockSkewSampler& skew() const {
+    return skew_;
   }
 
   // Whether a command of the stream is an envelope (a case-insensitive RREPLAY).
@@ -468,6 +499,8 @@ class ClassicApplier {
   ClassicLinkStats* stats_;
   std::function<bool()> running_;
   ClassicAuthorMap authors_;
+  std::function<void(int64_t)> on_skew_;
+  ClockSkewSampler skew_;
   AuthorDedup& dedup_ = AuthorDedup::Instance();
   // What the context's repl_origin_idx was when the applier was built (the link's own origin,
   // set by ConsumeRedisStream): where ApplyCommand's scope puts it back. In production it equals

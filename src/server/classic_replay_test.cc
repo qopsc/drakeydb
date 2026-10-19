@@ -3893,4 +3893,86 @@ TEST_F(ReplicaActiveExpiryTest, MoversAndStoresSeeTheDueSourceAsMissing) {
   EXPECT_EQ(CheckedInt({"exists", "union:over_dst"}), 0);
 }
 
+// An mvcc of KeyDB's layout (`ms << 20 | counter`) minted `ahead_ms` after the local clock.
+string MvccAhead(int64_t ahead_ms) {
+  return to_string(((GetCurrentTimeMs() + ahead_ms) << 20) | 1);
+}
+
+TEST(ClockSkewSamplerTest, SamplesMillisecondsAtMostOncePerSecond) {
+  ClockSkewSampler s;
+  EXPECT_EQ(s.EstimateMs(), 0);
+  const uint64_t t = 1'700'000'000'000;
+  EXPECT_TRUE(s.Sample(((t + 5000) << 20) | 7, t));
+  EXPECT_EQ(s.EstimateMs(), 5000);
+  // Inside the second: not taken, even a larger one.
+  EXPECT_FALSE(s.Sample(((t + 9000) << 20) | 7, t + 999));
+  EXPECT_EQ(s.EstimateMs(), 5000);
+  EXPECT_TRUE(s.Sample(((t + 1000) << 20) | 7, t + 1000));  // the max stays
+  EXPECT_EQ(s.EstimateMs(), 5000);
+  // A clock that went backwards samples again.
+  EXPECT_TRUE(s.Sample(((t + 8000) << 20) | 7, t - 5));
+  EXPECT_EQ(s.EstimateMs(), 8005);
+}
+
+TEST(ClockSkewSamplerTest, EstimateIsMaxOfLastSixty) {
+  ClockSkewSampler s;
+  const uint64_t t = 1'700'000'000'000;
+  // One high sample, then 59 low ones: it is still in the window.
+  EXPECT_TRUE(s.Sample(((t + 3000) << 20) | 1, t));
+  for (uint64_t i = 1; i < ClockSkewSampler::kWindow; ++i) {
+    uint64_t now = t + i * 1000;
+    EXPECT_TRUE(s.Sample(((now - 40) << 20) | 1, now));
+  }
+  EXPECT_EQ(s.EstimateMs(), 3000);
+  // The 61st sample pushes the high one out: the estimate is the max of the rest (negative).
+  uint64_t now = t + ClockSkewSampler::kWindow * 1000;
+  EXPECT_TRUE(s.Sample(((now - 90) << 20) | 1, now));
+  EXPECT_EQ(s.EstimateMs(), -40);
+}
+
+TEST_F(ClassicApplyFamilyTest, SkewSampleUsesMvccMilliseconds) {
+  OnLink([&](Link& link) {
+    EXPECT_EQ(link.applier.skew().EstimateMs(), 0);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", MvccAhead(5000))),
+              EnvelopeResult::kConsumed);
+    // Applied at or after the minting: the sample is a little under +5000, never a million times
+    // it.
+    EXPECT_GT(link.applier.skew().EstimateMs(), 4000);
+    EXPECT_LE(link.applier.skew().EstimateMs(), 5000);
+  });
+}
+
+TEST_F(ClassicApplyFamilyTest, SkewSampleIgnoresNestedAndZeroMvcc) {
+  OnLink([&](Link& link) {
+    // The outer layer is current; the inner one claims +5000 and is not looked at.
+    const string inner = Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", MvccAhead(5000));
+    EXPECT_EQ(link.Apply(Envelope(kAuthorB, inner, "0", MvccAhead(0))), EnvelopeResult::kConsumed);
+    EXPECT_GE(link.applier.skew().EstimateMs(), -100);
+    EXPECT_LE(link.applier.skew().EstimateMs(), 100);
+  });
+  OnLink([&](Link& link) {
+    // A zero mvcc is malformed and is no sample; a depth-2 call is nested whatever it holds.
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", "0")),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.applier.skew().EstimateMs(), 0);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "k", "v"}), "0", MvccAhead(5000)), 2),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.applier.skew().EstimateMs(), 0);
+  });
+}
+
+TEST_F(ClassicApplyFamilyTest, SkewEstimateIsMaxOfWindow) {
+  OnLink([&](Link& link) {
+    // A second envelope inside the same second is not a new sample (the window itself is
+    // table-driven in ClockSkewSamplerTest).
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "a", "1"}), "0", MvccAhead(3000))),
+              EnvelopeResult::kConsumed);
+    const int64_t first = link.applier.skew().EstimateMs();
+    EXPECT_GT(first, 2000);
+    EXPECT_EQ(link.Apply(Envelope(kAuthorA, Resp({"SET", "b", "1"}), "0", MvccAhead(9000))),
+              EnvelopeResult::kConsumed);
+    EXPECT_EQ(link.applier.skew().EstimateMs(), first) << "sampled twice within a second";
+  });
+}
+
 }  // namespace dfly

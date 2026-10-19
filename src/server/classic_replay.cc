@@ -651,7 +651,7 @@ void ClassicApplier::Count(atomic<uint64_t> ClassicLinkStats::*counter, uint64_t
 
 ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string self_uuid,
                                string link, ClassicLinkStats* stats, function<bool()> running,
-                               ClassicAuthorMap authors)
+                               ClassicAuthorMap authors, function<void(int64_t)> on_skew)
     : service_(service),
       cntx_(cntx),
       self_uuid_(std::move(self_uuid)),
@@ -659,11 +659,30 @@ ClassicApplier::ClassicApplier(Service* service, ConnectionContext* cntx, string
       stats_(stats),
       running_(std::move(running)),
       authors_(std::move(authors)),
+      on_skew_(std::move(on_skew)),
       link_origin_idx_(cntx->repl_origin_idx),
       reply_(make_unique<facade::CapturingReplyBuilder>(facade::ReplyMode::ONLY_ERR)) {
 }
 
 ClassicApplier::~ClassicApplier() = default;
+
+bool ClockSkewSampler::Sample(uint64_t mvcc, uint64_t now_ms) {
+  // A clock that went backwards takes a sample rather than waiting out the gap.
+  if (taken_ > 0 && now_ms >= last_ms_ && now_ms - last_ms_ < kMinIntervalMs)
+    return false;
+  // mvcc >> 20 < 2^44 and now_ms is a wall clock, so the difference fits an int64_t.
+  ring_[taken_ % kWindow] = static_cast<int64_t>(mvcc >> 20) - static_cast<int64_t>(now_ms);
+  ++taken_;
+  last_ms_ = now_ms;
+  return true;
+}
+
+int64_t ClockSkewSampler::EstimateMs() const {
+  const size_t n = std::min(taken_, kWindow);
+  if (n == 0)
+    return 0;
+  return *std::max_element(ring_.begin(), ring_.begin() + n);
+}
 
 bool ClassicApplier::IsRreplay(const facade::RespExpr& name) {
   return name.type == facade::RespExpr::STRING && absl::EqualsIgnoreCase(name.GetView(), "RREPLAY");
@@ -721,6 +740,11 @@ EnvelopeResult ClassicApplier::HandleRreplay(const facade::RespVec& args, unsign
       NoteMalformed(absl::StrCat("nested deeper than ", kMaxNesting, " envelopes"), depth);
       break;
     }
+
+    // The one clock sample of the tree: its outermost layer, once it parsed, the link is running
+    // and it is not our own. Nested layers and an envelope without a stamp do not sample.
+    if (depth == 1 && env.mvcc != 0 && skew_.Sample(env.mvcc, GetCurrentTimeMs()) && on_skew_)
+      on_skew_(skew_.EstimateMs());
 
     // A read only: two links can pass it together, the leaf's reservation is what closes that.
     if (dedup_.IsApplied(env.uuid, env.mvcc)) {

@@ -5373,3 +5373,65 @@ async def test_wait_drained_counts_a_replica_without_an_offset_as_not_drained():
     catching_up = ScriptedInfo({"slave_repl_offset": 90}, {"slave_repl_offset": 100})
     drained = await wait_drained(master, catching_up, time.monotonic(), give_up_s=5)
     assert drained is not None and drained < 1
+
+
+def minted_ahead(ms):
+    """A KeyDB-layout mvcc (`ms << 20 | counter`) minted `ms` after this host's clock."""
+    return ((int(time.time() * 1000) + ms) << 20) | 1
+
+
+async def test_keydb_clock_skew_estimate_from_envelopes(df_factory: DflyInstanceFactory, tmp_path):
+    """A KeyDB peer's `REPLCONF UUID` reply has no clock, so its skew is estimated from the mvcc of
+    its envelopes, `(mvcc >> 20) - now`. A fake master streams an envelope minted 60 s ahead: the
+    peer line shows `clock_skew_ms` about +60000 and the skew warning is logged. (Only a peer line
+    shows the field; a plain replica's INFO has none, so the link is a peer-mode one.)
+
+    Falsifying: reading `mvcc` instead of `mvcc >> 20` gives a skew a million times too large;
+    without the feature the field stays 0.
+    """
+    stream = rreplay("SET", "k", "v", mvcc=minted_ahead(60_000))
+    async with FakeClassicMaster() as master:
+        master.script_capa_reply(b"+OK active-replica\r\n")
+        master.script_uuid(SCRIPTED_PEER_UUID)
+        master.script_psync(diskless_full_sync(offset=SYNC_OFFSET, tail=EOF_TOKEN + stream))
+        node, c = await attach_scripted_master(df_factory, tmp_path, master, peer_mode=True)
+
+        @assert_eventually(times=100)
+        @retry_while_loading
+        async def sampled():
+            assert node.proc.poll() is None, f"the replica process died with {node.proc.poll()}"
+            info = await c.info("replication")
+            skew = int(info["master0"]["clock_skew_ms"])
+            assert 55_000 <= skew <= 60_000, info
+
+        await sampled()
+
+    node.stop()
+    assert node.find_in_logs(r"clock differs by \d+ ms")
+
+
+@pytest.mark.keydb
+async def test_keydb_clock_skew_estimate_against_real_keydb(
+    df_factory: DflyInstanceFactory, keydb_server_factory, tmp_path
+):
+    """Against a real KeyDB on the same host the estimate is about 0: never ahead by more than the
+    stream's jitter, and behind by at most the lag of a sample."""
+    keydb = keydb_server_factory(active_replica=True, multi_master=True, no_forward=False)
+    node = df_factory.create(proactor_threads=2, dir=str(tmp_path / "df"), active_replica="true")
+    node.start()
+    async with keydb.client() as k, node.client() as c:
+        assert await c.execute_command(f"REPLICAOF localhost {keydb.port}") == "OK"
+        await wait_for_peer_link(c)
+        for i in range(5):
+            await k.set(f"skew:{i}", i)
+            await asyncio.sleep(0.3)
+
+        @assert_eventually(timeout=SYNC_WAIT_TIMEOUT_S)
+        @retry_while_loading
+        async def sampled():
+            assert await c.get("skew:4") == "4"
+            skew = int((await c.info("replication"))["master0"]["clock_skew_ms"])
+            assert -2000 < skew <= 100, skew
+            assert skew != 0
+
+        await sampled()

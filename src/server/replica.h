@@ -300,6 +300,10 @@ class Replica : ProtocolClient {
   // replication fiber running Greet().
   std::atomic<int64_t> clock_skew_ms_{0};
 
+  // Publishes a skew estimate into clock_skew_ms_ and warns if it is concerning: the one place
+  // that does, for Greet()'s handshake echo and a classic link's envelope samples alike.
+  void PublishClockSkew(int64_t skew_ms);
+
   // drakeydb: P7 -- true iff the master answered a `REPLCONF capa` of this connection's Greet()
   // with the `active-replica` word (an active KeyDB does). Cleared at the top of every Greet().
   // Not atomic: Greet() runs from Replica::Start in the REPLICAOF caller's fiber, on this

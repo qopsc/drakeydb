@@ -397,6 +397,19 @@ void Replica::MainReplicationFb(std::optional<LastMasterSyncData> last_master_sy
   VLOG(1) << "Main replication fiber finished";
 }
 
+void Replica::PublishClockSkew(int64_t skew_ms) {
+  clock_skew_ms_.store(skew_ms, std::memory_order_relaxed);
+  // drakeydb: P4-0 -- Greet() re-runs on every reconnect attempt (see the LOG_FIRST_N /
+  // LOG_EVERY_T neighbors above/below for the same concern); a genuinely skewed peer on a
+  // flapping link must not log unboundedly.
+  if (IsClockSkewConcerning(skew_ms)) {
+    LOG_EVERY_T(WARNING, 60)
+        << "Peer " << master_context_.master_node_uuid << " clock differs by " << skew_ms
+        << " ms (threshold " << kClockSkewWarnMs
+        << " ms). Last-write-wins resolution degrades with clock skew; check NTP.";
+  }
+}
+
 error_code Replica::Greet() {
   // A reconnect attempt represents a new observation window. Clear the previous connection's
   // skew before the first operation can fail so INFO never reports data from an older handshake.
@@ -509,16 +522,7 @@ error_code Replica::Greet() {
       const int64_t skew_ms =
           ComputeClockSkewMs(static_cast<int64_t>(GetCurrentTimeMs()),
                              static_cast<int64_t>(master_context_.master_clock_ms));
-      clock_skew_ms_.store(skew_ms, std::memory_order_relaxed);
-      // drakeydb: P4-0 -- Greet() re-runs on every reconnect attempt (see the LOG_FIRST_N /
-      // LOG_EVERY_T neighbors above/below for the same concern); a genuinely skewed peer on a
-      // flapping link must not log unboundedly.
-      if (IsClockSkewConcerning(skew_ms)) {
-        LOG_EVERY_T(WARNING, 60)
-            << "Peer " << master_context_.master_node_uuid << " clock differs by " << skew_ms
-            << " ms (threshold " << kClockSkewWarnMs
-            << " ms). Last-write-wins resolution degrades with clock skew; check NTP.";
-      }
+      PublishClockSkew(skew_ms);
     }
   }
 
@@ -1238,7 +1242,8 @@ error_code Replica::ConsumeRedisStream() {
       &service_, &conn_context, service_.server_family().node_uuid(), server().Description(),
       &classic_stats_, [this] { return exec_st_.IsRunning(); },
       ClassicAuthorMap(peer_mode_ ? peer_mode_->registry : nullptr,
-                       master_context_.master_node_uuid, peer_origin_idx_));
+                       master_context_.master_node_uuid, peer_origin_idx_),
+      [this](int64_t skew_ms) { PublishClockSkew(skew_ms); });
   ResetParser(RedisParser::Mode::SERVER);
 
   // Master waits for this command in order to start sending replication stream.
