@@ -75,7 +75,7 @@ jobs:
       # explicit restore here and the explicit save right after the build below.
       - name: Restore KeyDB
         id: keydb-cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           # Workspace relative: actions/cache runs inside the container, where host paths do not exist.
           path: keydb-bin/keydb-server
@@ -111,7 +111,7 @@ jobs:
 
       - name: Save KeyDB
         if: steps.keydb-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: keydb-bin/keydb-server
           key: ${{ steps.keydb-key.outputs.key }}
